@@ -1,0 +1,1 @@
+ALTER TABLE public.profiles ADD COLUMN is_official boolean NOT NULL DEFAULT false;

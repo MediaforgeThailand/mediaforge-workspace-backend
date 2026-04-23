@@ -1,0 +1,10 @@
+{
+  "test": {
+    "include": ["."],
+    "exclude": ["_shared"]
+  },
+  "compilerOptions": {
+    "strict": true,
+    "lib": ["deno.ns", "deno.unstable"]
+  }
+}

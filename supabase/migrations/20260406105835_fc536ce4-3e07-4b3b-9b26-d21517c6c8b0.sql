@@ -1,0 +1,2 @@
+INSERT INTO public.credit_costs (feature, model, label, cost, pricing_type, duration_seconds, has_audio)
+VALUES ('generate_freepik_video', 'kling-v2-6-motion-std', 'Kling 2.6 Motion Std /s', 1, 'per_second', NULL, false);

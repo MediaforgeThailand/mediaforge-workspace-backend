@@ -1,0 +1,1 @@
+DELETE FROM public.subscription_plans WHERE target = 'creator';

@@ -1,0 +1,121 @@
+project_id = "yonnvlhgwdxkuirhdfaz"
+
+[functions.admin-login]
+verify_jwt = false
+
+[functions.admin-api]
+verify_jwt = false
+
+[functions.execute-pipeline-step]
+verify_jwt = false
+
+[functions.erp-bridge]
+verify_jwt = false
+
+[functions.erp-affiliate-bridge]
+verify_jwt = false
+
+[functions.track-click]
+verify_jwt = false
+
+[functions.merge-audio-video]
+verify_jwt = false
+
+[functions.retry-worker]
+verify_jwt = false
+
+[functions.send-email]
+verify_jwt = false
+
+[functions.flows-bridge]
+verify_jwt = false
+
+[functions.erp-admin-api]
+verify_jwt = false
+
+[functions.erp-stripe-webhook]
+verify_jwt = false
+
+[functions.generate-stripe-link]
+verify_jwt = false
+
+[functions.get-payment-code]
+verify_jwt = false
+
+[functions.backfill-embeddings]
+verify_jwt = false
+
+[functions.create-checkout]
+verify_jwt = false
+
+[functions.create-promptpay-intent]
+verify_jwt = false
+
+[functions.create-topup]
+verify_jwt = false
+
+[functions.customer-portal]
+verify_jwt = false
+
+[functions.freepik-stock]
+verify_jwt = false
+
+[functions.generate-embedding]
+verify_jwt = false
+
+[functions.generate-video]
+verify_jwt = false
+
+[functions.get-stripe-key]
+verify_jwt = false
+
+[functions.phone-otp-send]
+verify_jwt = false
+
+[functions.phone-otp-verify]
+verify_jwt = false
+
+[functions.quote-flow]
+verify_jwt = false
+
+[functions.redeem-code]
+verify_jwt = false
+
+[functions.redeem-demo]
+verify_jwt = false
+
+[functions.sweep-stuck-runs]
+verify_jwt = false
+
+[functions.remove-background]
+verify_jwt = false
+
+[functions.run-flow]
+verify_jwt = false
+
+[functions.run-flow-init]
+verify_jwt = false
+
+[functions.run-flow-status]
+verify_jwt = false
+
+[functions.stripe-webhook]
+verify_jwt = false
+
+[functions.submit-flow-for-review]
+verify_jwt = false
+
+[functions.submit-flow-review]
+verify_jwt = false
+
+[functions.test-refund-flow]
+verify_jwt = false
+
+[functions.text-to-speech]
+verify_jwt = false
+
+[functions.auth-email-hook]
+verify_jwt = false
+
+[functions.process-email-queue]
+verify_jwt = false

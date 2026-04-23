@@ -1,0 +1,1 @@
+ALTER TABLE public.user_personas ADD COLUMN survey_skipped_at date DEFAULT NULL;

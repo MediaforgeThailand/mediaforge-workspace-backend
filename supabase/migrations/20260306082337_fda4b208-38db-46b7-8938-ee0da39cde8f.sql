@@ -1,0 +1,1 @@
+ALTER TABLE public.flows ADD COLUMN IF NOT EXISTS performance_bonus_percent numeric NOT NULL DEFAULT 0;
