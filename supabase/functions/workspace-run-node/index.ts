@@ -1,0 +1,3057 @@
+/// <reference lib="deno.ns" />
+/// <reference lib="dom" />
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { refundCreditsAtomic } from "../_shared/pricing.ts";
+import { logApiUsage } from "../_shared/posthogCapture.ts";
+import {
+  executeWithInlineBudget,
+  INLINE_BUDGET_ATTEMPTS,
+  enqueueRetryJob,
+  classifyError,
+  TOTAL_MAX_RETRIES,
+} from "../_shared/providerRetry.ts";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, x-cron-secret, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
+};
+
+/* ═══════════════════════════════════════════════════════════
+   Helpers (duplicated from run-flow-init — shared module would be ideal)
+   ═══════════════════════════════════════════════════════════ */
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function fetchImageBuffer(url: string): Promise<Uint8Array> {
+  if (url.startsWith("data:")) {
+    const match = url.match(/^data:[^;]+;base64,(.+)$/);
+    if (match) {
+      const bin = atob(match[1]);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    }
+    throw new Error("Invalid data URI");
+  }
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to download image: ${res.status}`);
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+async function imageUrlToBase64(url: string): Promise<string> {
+  return bytesToBase64(await fetchImageBuffer(url));
+}
+
+/* ─── Image dimension extraction (lightweight header parsing) ─── */
+
+interface ImageDimensions { width: number; height: number }
+
+function extractImageDimensions(buf: Uint8Array): ImageDimensions | null {
+  try {
+    // PNG: bytes 0-7 = signature, IHDR at byte 8
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) {
+      const width = (buf[16] << 24) | (buf[17] << 16) | (buf[18] << 8) | buf[19];
+      const height = (buf[20] << 24) | (buf[21] << 16) | (buf[22] << 8) | buf[23];
+      return { width, height };
+    }
+    // JPEG: scan for SOF marker
+    if (buf[0] === 0xFF && buf[1] === 0xD8) {
+      let offset = 2;
+      while (offset < buf.length - 8) {
+        if (buf[offset] !== 0xFF) { offset++; continue; }
+        const marker = buf[offset + 1];
+        if (marker >= 0xC0 && marker <= 0xC3 && marker !== 0xC1) {
+          const height = (buf[offset + 5] << 8) | buf[offset + 6];
+          const width = (buf[offset + 7] << 8) | buf[offset + 8];
+          return { width, height };
+        }
+        const segLen = (buf[offset + 2] << 8) | buf[offset + 3];
+        offset += 2 + segLen;
+      }
+    }
+    // WebP
+    if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) {
+      if (buf[12] === 0x56 && buf[13] === 0x50 && buf[14] === 0x38 && buf[15] === 0x20) {
+        const width = ((buf[26] | (buf[27] << 8)) & 0x3FFF);
+        const height = ((buf[28] | (buf[29] << 8)) & 0x3FFF);
+        return { width, height };
+      }
+      if (buf[12] === 0x56 && buf[13] === 0x50 && buf[14] === 0x38 && buf[15] === 0x4C) {
+        const b0 = buf[21], b1 = buf[22], b2 = buf[23], b3 = buf[24];
+        const width = 1 + (((b1 & 0x3F) << 8) | b0);
+        const height = 1 + (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 >> 6) & 0x03));
+        return { width, height };
+      }
+    }
+  } catch (e) {
+    console.warn("[aspect-ratio] Header parse error:", e);
+  }
+  return null;
+}
+
+/* ─── Closest aspect ratio matching ─── */
+
+const KLING_SUPPORTED_RATIOS: Array<{ label: string; value: number }> = [
+  { label: "16:9", value: 16 / 9 },
+  { label: "9:16", value: 9 / 16 },
+  { label: "1:1",  value: 1 },
+];
+
+function findClosestAspectRatio(width: number, height: number): string {
+  const actual = width / height;
+  let bestLabel = "16:9";
+  let bestDiff = Infinity;
+  for (const r of KLING_SUPPORTED_RATIOS) {
+    const diff = Math.abs(actual - r.value);
+    if (diff < bestDiff) { bestDiff = diff; bestLabel = r.label; }
+  }
+  console.log(`[aspect-ratio] Image ${width}×${height} (ratio=${actual.toFixed(4)}) → matched "${bestLabel}" (diff=${bestDiff.toFixed(4)})`);
+  return bestLabel;
+}
+
+async function generateKlingJWT(accessKeyId: string, secretKey: string): Promise<string> {
+  const header = { alg: "HS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+  const payload = { iss: accessKeyId, exp: now + 1800, nbf: now - 5, iat: now };
+  const encoder = new TextEncoder();
+  const headerB64 = btoa(JSON.stringify(header)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  const payloadB64 = btoa(JSON.stringify(payload)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secretKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(signingInput));
+  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  return `${signingInput}.${sigB64}`;
+}
+
+/* ─── Model mappings ─── */
+
+const KLING_MODEL_MAP: Record<string, { model: string; mode: string; isMotion?: boolean; isOmni?: boolean }> = {
+  "kling-v1-pro":             { model: "kling-v1",          mode: "pro" },
+  "kling-v1-5-pro":           { model: "kling-v1-5",        mode: "pro" },
+  "kling-v1-6-pro":           { model: "kling-v1-6",        mode: "pro" },
+  "kling-v2-master":          { model: "kling-v2-master",    mode: "pro" },
+  "kling-v2-1-pro":           { model: "kling-v2-1",        mode: "pro" },
+  "kling-v2-1-master":        { model: "kling-v2-1-master",  mode: "pro" },
+  "kling-v2-5-turbo":         { model: "kling-v2-5-turbo",  mode: "pro" },
+  "kling-v2-6-pro":           { model: "kling-v2-6",        mode: "pro" },
+  "kling-v2-6-motion-pro":    { model: "kling-v2-6",        mode: "pro", isMotion: true },
+  "kling-v3-pro":             { model: "kling-v3",          mode: "pro" },
+  "kling-v3-motion-pro":      { model: "kling-v3",          mode: "pro", isMotion: true },
+  
+  "kling-v3-omni":            { model: "kling-v3-omni",     mode: "pro", isOmni: true },
+};
+
+const BANANA_MODEL_MAP: Record<string, string> = {
+  "nano-banana-pro": "nano-banana-pro",
+  "nano-banana-2":   "nano-banana-2",
+};
+
+/* ═══════════════════════════════════════════════════════════
+   HANDLE NORMALIZATION SCHEMA
+   Maps UI targetHandle names → standardized internal param keys
+   per provider. This is the SINGLE SOURCE OF TRUTH for edge mapping.
+   Adding a new provider? Just add a new entry here.
+   ═══════════════════════════════════════════════════════════ */
+
+type DataType = "image" | "video" | "text";
+
+interface HandleDef {
+  internal_key: string;   // The standardized key the executor reads
+  data_type: DataType;    // Expected data type for validation
+}
+
+const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
+  kling: {
+    start_frame:   { internal_key: "image_url",       data_type: "image" },
+    ref_image:     { internal_key: "ref_image_url",   data_type: "image" },
+    image_input:   { internal_key: "image_url",       data_type: "image" },
+    image:         { internal_key: "image_url",       data_type: "image" },
+    end_frame:     { internal_key: "image_tail_url",  data_type: "image" },
+    ref_video:     { internal_key: "video_url",       data_type: "video" },
+    // Kling Omni v3 only — accepts objects, not URL strings. Marked
+    // "text" so validateEdgeValue skips the URL regex check; the V2
+    // handler then passes the object/array through verbatim.
+    elements:      { internal_key: "elements",        data_type: "text" },
+  },
+  kling_extension: {
+    start_frame:   { internal_key: "image_url",      data_type: "image" },
+    ref_image:     { internal_key: "image_url",      data_type: "image" },
+    image_input:   { internal_key: "image_url",      data_type: "image" },
+    image:         { internal_key: "image_url",      data_type: "image" },
+    ref_video:     { internal_key: "video_url",      data_type: "video" },
+  },
+  motion_control: {
+    start_frame:   { internal_key: "image_url",      data_type: "image" },
+    ref_image:     { internal_key: "image_url",      data_type: "image" },
+    image_input:   { internal_key: "image_url",      data_type: "image" },
+    image:         { internal_key: "image_url",      data_type: "image" },
+  },
+  banana: {
+    ref_image:     { internal_key: "image_url",      data_type: "image" },
+    image_input:   { internal_key: "image_url",      data_type: "image" },
+    image:         { internal_key: "image_url",      data_type: "image" },
+    context_text:  { internal_key: "context_text",   data_type: "text" },
+  },
+  // Mirror banana: gpt-image-2 reads the same param keys (image_url +
+  // mention_image_urls), built up by the V2 entry handler from
+  // edgeImageUrls. Without this entry normalizeHandle returns null
+  // and ref values get parked under the raw `ref_image` key, where
+  // executeOpenAIImage2 never finds them — same bug fixed in the
+  // main project's execute-pipeline-step HANDLE_SCHEMA.
+  openai: {
+    ref_image:     { internal_key: "image_url",      data_type: "image" },
+    image_input:   { internal_key: "image_url",      data_type: "image" },
+    image:         { internal_key: "image_url",      data_type: "image" },
+  },
+  chat_ai: {
+    context_text:  { internal_key: "context_text",   data_type: "text" },
+    image_input:   { internal_key: "image_url",      data_type: "image" },
+  },
+  remove_bg: {
+    image:         { internal_key: "image_url",      data_type: "image" },
+    image_input:   { internal_key: "image_url",      data_type: "image" },
+    ref_image:     { internal_key: "image_url",      data_type: "image" },
+  },
+  merge_audio: {
+    video:         { internal_key: "video_url",      data_type: "video" },
+    audio:         { internal_key: "audio_url",      data_type: "text" }, // 'text' = pass-through URL string
+  },
+  video_understanding: {
+    video:         { internal_key: "video_url",      data_type: "video" },
+    ref_video:     { internal_key: "video_url",      data_type: "video" },
+  },
+};
+
+/** Resolve a targetHandle to the correct internal param key for a given provider */
+function normalizeHandle(provider: string, targetHandle: string): HandleDef | null {
+  const providerSchema = HANDLE_SCHEMA[provider];
+  if (!providerSchema) return null;
+  return providerSchema[targetHandle] ?? null;
+}
+
+/* ─── URL validation helper ─── */
+const VALID_URL_REGEX = /^(https?:\/\/|data:)/i;
+
+function isValidMediaUrl(value: string): boolean {
+  return VALID_URL_REGEX.test(value);
+}
+
+function validateEdgeValue(value: string, expectedType: DataType, targetHandle: string): void {
+  if (expectedType === "text") return; // text can be anything
+  // For image/video, must be a URL or data URI
+  if (!isValidMediaUrl(value)) {
+    throw new Error(
+      `Invalid input: Expected a ${expectedType} URL for handle "${targetHandle}", but received non-URL data. ` +
+      `Value starts with: "${value.substring(0, 50)}..."`
+    );
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Provider Executors
+   ═══════════════════════════════════════════════════════════ */
+
+interface ProviderResult {
+  task_id?: string;
+  result_url?: string;
+  /** Structured outputs dict — each key is a named output handle */
+  outputs: Record<string, string>;
+  output_type: "video_url" | "image_url" | "text";
+  provider_meta?: Record<string, unknown>;
+}
+
+/**
+ * Extract end frame from a video URL.
+ * TODO: Implement actual frame extraction (FFmpeg or provider API).
+ * For now returns cover_image if available, otherwise null.
+ */
+function extractEndFrame(_videoUrl: string, coverImage?: string): string | null {
+  if (coverImage) return coverImage;
+  // TODO: Implement actual frame extraction via FFmpeg or external service
+  return null;
+}
+
+async function executeKling(
+  params: Record<string, unknown>,
+  supabaseClient: ReturnType<typeof createClient>,
+  mentioned: MentionedAssetSrv[] = [],
+): Promise<ProviderResult> {
+  // Accept several common naming variants — workspace dev was set up
+  // by hand and the secret names sometimes drift from the live project.
+  const KLING_ACCESS_KEY_ID =
+    Deno.env.get("KLING_ACCESS_KEY_ID") ??
+    Deno.env.get("KLING_AK") ??
+    Deno.env.get("KLING_ACCESS_KEY");
+  const KLING_SECRET_KEY =
+    Deno.env.get("KLING_SECRET_KEY") ??
+    Deno.env.get("KLING_SK") ??
+    Deno.env.get("KLING_SECRET");
+  if (!KLING_ACCESS_KEY_ID || !KLING_SECRET_KEY) {
+    throw new Error(
+      "Kling credentials missing — set KLING_ACCESS_KEY_ID + KLING_SECRET_KEY in Supabase project secrets (workspace dev)."
+    );
+  }
+
+  const modelSlug = String(params.model_name ?? params.model ?? "kling-v2-6-pro");
+  const mapping = KLING_MODEL_MAP[modelSlug];
+  if (!mapping) throw new Error(`Unknown Kling model: ${modelSlug}`);
+
+  const jwtToken = await generateKlingJWT(KLING_ACCESS_KEY_ID, KLING_SECRET_KEY);
+
+  // ── Omni models: separate endpoint & array-based payload ──
+  if (mapping.isOmni) {
+    return await executeKlingOmni(params, mapping, modelSlug, jwtToken, supabaseClient, mentioned);
+  }
+
+  // ── Non-Omni paths (Standard I2V/T2V, Motion Control) don't have an
+  //    array-indexed image_list, so positional `@Element{N}`/`@Image{N}`
+  //    syntax doesn't apply. Strip raw `@[Label](nodeId)` and plain
+  //    `@<label>` tokens to bare label so the model just reads natural
+  //    language. Same behaviour the old `rewriteMentionsInline` had
+  //    for non-OpenAI providers, kept here so the V2 dispatcher can
+  //    safely skip its generic rewrite for the entire kling family.
+  for (const [key, val] of Object.entries(params)) {
+    if (typeof val !== "string" || !val.includes("@")) continue;
+    let out = val.replace(/@\[([^\]]+)\]\(([^)]+)\)/g, (_full, label) => label);
+    out = out.replace(/@([^\s@[]+)/g, (full, name) => {
+      const hit = mentioned.find(
+        (m) => m.label === name && m.kind !== "element",
+      );
+      return hit ? name : full;
+    });
+    params[key] = out;
+  }
+
+  // ── Motion Control: completely separate endpoint & payload ──
+  if (mapping.isMotion) {
+    return await executeKlingMotionControl(params, mapping, modelSlug, jwtToken);
+  }
+
+  // ── Standard Image-to-Video / Text-to-Video ──
+  return await executeKlingStandard(params, mapping, modelSlug, jwtToken);
+}
+
+/**
+ * Poll a Kling task until it completes. Workspace V2 runs inline so the
+ * caller is waiting on an open HTTP request — we burn wall-clock here
+ * instead of returning a half-formed result the frontend has to babysit.
+ *
+ * `endpointBase` MUST be the same URL as the POST that created the task,
+ * e.g. ".../v1/videos/omni-video" → poll at ".../v1/videos/omni-video/{id}".
+ *
+ * Supabase Edge Functions cap CPU/wall-clock around 400s; we stop at 320s
+ * to leave room for the response trip back. Most Kling jobs land in 30-90s.
+ */
+async function pollKlingVideo(
+  taskId: string,
+  jwtToken: string,
+  endpointBase: string,
+  opts: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
+): Promise<{ url: string; raw: Record<string, unknown> }> {
+  const timeoutMs = opts.timeoutMs ?? 320_000;
+  const intervalMs = opts.intervalMs ?? 5_000;
+  const label = opts.label ?? "kling";
+  const url = `${endpointBase}/${encodeURIComponent(taskId)}`;
+  const started = Date.now();
+  let attempt = 0;
+
+  while (true) {
+    attempt += 1;
+    const elapsed = Date.now() - started;
+    if (elapsed > timeoutMs) {
+      throw new Error(
+        `[${label}] Polling timed out after ${Math.round(elapsed / 1000)}s (task_id=${taskId}). ` +
+          `Job may still complete on Kling's side — check the dashboard.`,
+      );
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${jwtToken}` },
+      });
+    } catch (netErr) {
+      console.warn(`[${label}] poll attempt ${attempt} network error, retrying:`, netErr);
+      await new Promise((r) => setTimeout(r, intervalMs));
+      continue;
+    }
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      // 5xx / transient — keep polling. 4xx — give up.
+      if (res.status >= 500) {
+        console.warn(`[${label}] poll attempt ${attempt} HTTP ${res.status}: ${errText.substring(0, 200)}`);
+        await new Promise((r) => setTimeout(r, intervalMs));
+        continue;
+      }
+      throw new Error(`[${label}] Status check failed (HTTP ${res.status}): ${errText.substring(0, 200)}`);
+    }
+
+    let payload: Record<string, unknown>;
+    try {
+      payload = await res.json();
+    } catch {
+      console.warn(`[${label}] poll attempt ${attempt} unparseable JSON, retrying`);
+      await new Promise((r) => setTimeout(r, intervalMs));
+      continue;
+    }
+
+    const data = (payload?.data ?? {}) as Record<string, unknown>;
+    const status = String(data.task_status ?? "").toLowerCase();
+    const statusMsg = String(data.task_status_msg ?? payload?.message ?? "");
+
+    if (status === "succeed" || status === "success") {
+      const taskResult = (data.task_result ?? {}) as Record<string, unknown>;
+      const videos = Array.isArray(taskResult.videos) ? (taskResult.videos as Array<Record<string, unknown>>) : [];
+      const videoUrl = videos.length > 0 ? String(videos[0]?.url ?? "") : "";
+      if (!videoUrl) {
+        throw new Error(`[${label}] Task succeeded but response had no video URL (task_id=${taskId})`);
+      }
+      console.log(`[${label}] Task ${taskId} succeeded after ${Math.round(elapsed / 1000)}s (${attempt} polls)`);
+      return { url: videoUrl, raw: payload };
+    }
+
+    if (status === "failed" || status === "fail") {
+      throw new Error(`[${label}] Task failed: ${statusMsg || "no detail"} (task_id=${taskId})`);
+    }
+
+    // submitted / processing / queued → keep waiting
+    if (attempt === 1 || attempt % 6 === 0) {
+      console.log(`[${label}] Task ${taskId} status=${status || "(empty)"} elapsed=${Math.round(elapsed / 1000)}s`);
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
+/**
+ * Motion Control endpoint: POST /v1/videos/motion-control
+ * Requires image_url + video_url. Duration is auto-determined by the video.
+ * Does NOT accept duration or aspect_ratio params.
+ */
+async function executeKlingMotionControl(
+  params: Record<string, unknown>,
+  mapping: { model: string; mode: string },
+  modelSlug: string,
+  jwtToken: string,
+): Promise<ProviderResult> {
+  const ENDPOINT = "https://api.klingai.com/v1/videos/motion-control";
+
+  const rawImageUrl = params.image_url as string | undefined;
+  const rawVideoUrl = params.video_url as string | undefined;
+
+  if (!rawImageUrl) throw new Error("Motion Control requires an image_url (reference image)");
+  if (!rawVideoUrl) throw new Error("Motion Control requires a video_url (reference video that dictates motion & duration)");
+
+  // Convert image to base64 for reliability (same pattern as standard I2V)
+  let imagePayload: string = rawImageUrl;
+  try {
+    const imageBytes = await fetchImageBuffer(rawImageUrl);
+    imagePayload = bytesToBase64(imageBytes);
+    console.log(`[kling-motion] Converted image_url to base64 (${Math.round(imagePayload.length / 1024)}KB)`);
+  } catch (convErr) {
+    console.error(`[kling-motion] image fetch failed, using raw URL:`, convErr);
+  }
+
+  const keepOriginalSound = String(params.keep_original_sound ?? "no");
+  const characterOrientation = String(params.character_orientation ?? "image");
+
+  const body: Record<string, unknown> = {
+    model_name: mapping.model,
+    mode: mapping.mode,
+    image_url: imagePayload,
+    video_url: rawVideoUrl,
+    keep_original_sound: keepOriginalSound,
+    character_orientation: characterOrientation,
+  };
+
+  // Prompt is optional for motion control
+  const prompt = String(params.prompt ?? "").trim();
+  if (prompt) body.prompt = prompt;
+
+  console.log(`[kling-motion] POST ${ENDPOINT} model=${mapping.model} mode=${mapping.mode} orientation=${characterOrientation}`);
+
+  const res = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${jwtToken}` },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error(`[kling-motion] API HTTP ${res.status}: ${errText.substring(0, 500)}`);
+    if (res.status === 402 || res.status === 429 || /account balance not enough|insufficient balance|quota exceeded|billing/i.test(errText)) {
+      throw new Error("PROVIDER_BILLING_ERROR");
+    }
+    throw new Error(`Kling Motion API error (HTTP ${res.status}): ${errText.substring(0, 200)}`);
+  }
+
+  let result: Record<string, unknown>;
+  try {
+    result = await res.json();
+  } catch {
+    const text = await res.text().catch(() => "");
+    console.error(`[kling-motion] Failed to parse JSON: ${text.substring(0, 500)}`);
+    throw new Error("Kling Motion API returned invalid JSON response");
+  }
+
+  const message = String(result?.message ?? "Kling Motion API error");
+  if (result?.code !== 0) {
+    if (/account balance not enough|insufficient balance|quota exceeded|billing/i.test(message)) {
+      throw new Error("PROVIDER_BILLING_ERROR");
+    }
+    throw new Error(message || "Kling Motion API error");
+  }
+
+  const taskId = String((result?.data as Record<string, unknown>)?.task_id ?? "");
+  if (!taskId) {
+    throw new Error("Kling Motion API did not return a task_id");
+  }
+
+  // Async — frontend polls via action="poll_kling" until task succeeds.
+  return {
+    task_id: taskId,
+    outputs: {
+      output_video: "",
+      output_start_frame: rawImageUrl || "",
+      output_end_frame: "",
+    },
+    output_type: "video_url",
+    provider_meta: {
+      model: modelSlug,
+      mode: mapping.mode,
+      is_motion_control: true,
+      poll_endpoint: ENDPOINT,
+    },
+  };
+}
+
+/**
+ * Standard I2V / T2V endpoints
+ */
+async function executeKlingStandard(
+  params: Record<string, unknown>,
+  mapping: { model: string; mode: string },
+  modelSlug: string,
+  jwtToken: string,
+): Promise<ProviderResult> {
+  const finalPrompt = String(params.prompt ?? "");
+
+  const rawImageUrl = params.image_url as string | undefined;
+  const endpoint = rawImageUrl
+    ? "https://api.klingai.com/v1/videos/image2video"
+    : "https://api.klingai.com/v1/videos/text2video";
+
+  // Fetch image buffer once — reused for base64 AND dimension extraction
+  let imageBytes: Uint8Array | undefined;
+  let imageBase64: string | undefined;
+  if (rawImageUrl) {
+    try {
+      imageBytes = await fetchImageBuffer(rawImageUrl);
+      imageBase64 = bytesToBase64(imageBytes);
+      console.log(`[kling] Converted image_url to base64 (${Math.round(imageBase64.length / 1024)}KB)`);
+    } catch (convErr) {
+      console.error(`[kling] image fetch failed, using raw URL:`, convErr);
+    }
+  }
+
+  const rawTailUrl = params.image_tail_url as string | undefined;
+  let tailImageBase64: string | undefined;
+  if (rawTailUrl) {
+    try {
+      tailImageBase64 = await imageUrlToBase64(rawTailUrl);
+    } catch (tailErr) {
+      console.error(`[kling] tail image base64 conversion failed:`, tailErr);
+    }
+  }
+
+  // ── Runtime aspect ratio resolution ──
+  const rawAspect = params.aspect_ratio as string | undefined;
+  let resolvedAspect: string;
+  if (!rawAspect || rawAspect === "Auto") {
+    if (imageBytes) {
+      const dims = extractImageDimensions(imageBytes);
+      if (dims) {
+        resolvedAspect = findClosestAspectRatio(dims.width, dims.height);
+      } else {
+        console.warn("[aspect-ratio] Could not parse image dimensions, falling back to 16:9");
+        resolvedAspect = "16:9";
+      }
+    } else {
+      resolvedAspect = "16:9";
+    }
+  } else {
+    resolvedAspect = rawAspect;
+  }
+
+  const initialMode = String((params.mode as string) ?? mapping.mode).toLowerCase() === "std" ? "std" : "pro";
+
+  const body: Record<string, unknown> = {
+    model_name: mapping.model,
+    mode: initialMode,
+    prompt: finalPrompt,
+    duration: String(params.duration ?? 5),
+    aspect_ratio: resolvedAspect,
+  };
+
+  // Strip any data-URI prefix from base64 strings (Kling rejects prefixed base64)
+  const stripBase64Prefix = (b64: string) => b64.replace(/^data:image\/\w+;base64,/, "");
+
+  if (imageBase64) body.image = stripBase64Prefix(imageBase64);
+  else if (rawImageUrl) body.image = rawImageUrl;
+  if (rawTailUrl) body.image_tail = tailImageBase64 ? stripBase64Prefix(tailImageBase64) : rawTailUrl;
+  if (params.negative_prompt) body.negative_prompt = params.negative_prompt;
+  // ── Native audio toggle ──
+  // Kling 2.6 / 3.0 standard image2video / text2video accept the
+  // `enable_audio` boolean (per Kling's native API + every wrapper
+  // surfacing the v2.6 native-audio feature). The earlier code sent
+  // `sound: true` here — that's the OMNI endpoint's field name and
+  // is silently dropped by Standard, so audio never generated.
+  // Omni keeps using `sound: "on"|"off"` in executeKlingOmni below.
+  if (params.has_audio === "true" || params.has_audio === true) {
+    body.enable_audio = true;
+  }
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${jwtToken}` },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error(`[kling] API HTTP ${res.status}: ${errText.substring(0, 500)}`);
+    if (res.status === 402 || res.status === 429 || /account balance not enough|insufficient balance|quota exceeded|billing/i.test(errText)) {
+      throw new Error("PROVIDER_BILLING_ERROR");
+    }
+    throw new Error(`Kling API error (HTTP ${res.status}): ${errText.substring(0, 200)}`);
+  }
+
+  let result: Record<string, unknown>;
+  try {
+    result = await res.json();
+  } catch {
+    const text = await res.text().catch(() => "");
+    console.error(`[kling] Failed to parse JSON response: ${text.substring(0, 500)}`);
+    throw new Error("Kling API returned invalid JSON response");
+  }
+
+  const message = String(result?.message ?? "Kling API error");
+  if (result?.code !== 0) {
+    if (/account balance not enough|insufficient balance|quota exceeded|billing/i.test(message)) {
+      throw new Error("PROVIDER_BILLING_ERROR");
+    }
+    throw new Error(message || "Kling API error");
+  }
+
+  const taskId = String((result?.data as Record<string, unknown>)?.task_id ?? "");
+  if (!taskId) {
+    throw new Error("Kling API did not return a task_id");
+  }
+
+  // Async — frontend polls via action="poll_kling" until task succeeds.
+  return {
+    task_id: taskId,
+    outputs: {
+      output_video: "",
+      output_start_frame: rawImageUrl || "",
+      output_end_frame: "",
+    },
+    output_type: "video_url",
+    provider_meta: {
+      model: modelSlug,
+      mode: initialMode,
+      is_image2video: !!rawImageUrl,
+      aspect_ratio: resolvedAspect,
+      poll_endpoint: endpoint,
+    },
+  };
+}
+
+/**
+ * Omni Video endpoint: POST /v1/videos/omni-video
+ * Supports image_list (array), video_list (array), flexible duration (3-15s),
+ * multi_shot director mode, and combined audio controls.
+ */
+async function executeKlingOmni(
+  params: Record<string, unknown>,
+  mapping: { model: string; mode: string },
+  modelSlug: string,
+  jwtToken: string,
+  supabaseClient: ReturnType<typeof createClient>,
+  mentioned: MentionedAssetSrv[] = [],
+): Promise<ProviderResult> {
+  const ENDPOINT = "https://api.klingai.com/v1/videos/omni-video";
+
+  const duration = parseInt(String(params.duration ?? 5), 10) || 5;
+  const prompt = String(params.prompt ?? "").trim();
+  const negativePrompt = String(params.negative_prompt ?? "").trim();
+
+  // ── Build image_list array ──
+  // Kling API spec: each item uses key `image_url` (NOT `url`)
+  const imageList: Array<Record<string, string>> = [];
+
+  const rawImageUrl = params.image_url as string | undefined;
+  let startFrameBytes: Uint8Array | undefined;
+  if (rawImageUrl) {
+    let imagePayload = rawImageUrl;
+    try {
+      startFrameBytes = await fetchImageBuffer(rawImageUrl);
+      imagePayload = bytesToBase64(startFrameBytes);
+      console.log(`[kling-omni] Converted start_frame to base64 (${Math.round(imagePayload.length / 1024)}KB)`);
+    } catch (convErr) {
+      console.error(`[kling-omni] start_frame fetch failed, using raw URL:`, convErr);
+    }
+    imageList.push({ image_url: imagePayload, type: "first_frame" });
+  }
+
+  const rawTailUrl = params.image_tail_url as string | undefined;
+  if (rawTailUrl) {
+    let tailPayload = rawTailUrl;
+    try {
+      tailPayload = await imageUrlToBase64(rawTailUrl);
+    } catch (convErr) {
+      console.error(`[kling-omni] end_frame fetch failed:`, convErr);
+    }
+    imageList.push({ image_url: tailPayload, type: "end_frame" });
+  }
+
+  // Additional ref_image (no type constraint — general reference)
+  const refImageUrl = params.ref_image_url as string | undefined;
+  if (refImageUrl) {
+    let refPayload = refImageUrl;
+    try {
+      const refBytes = await fetchImageBuffer(refImageUrl);
+      refPayload = bytesToBase64(refBytes);
+      console.log(`[kling-omni] Converted ref_image to base64 (${Math.round(refPayload.length / 1024)}KB)`);
+    } catch (convErr) {
+      console.error(`[kling-omni] ref_image fetch failed:`, convErr);
+    }
+    imageList.push({ image_url: refPayload });
+  }
+
+  // ── Build video_list array ──
+  // Kling API spec: each item uses key `video_url` (NOT `url`),
+  // plus `refer_type` (feature|base) and `keep_original_sound` (yes|no) inside the item.
+  const videoList: Array<Record<string, string>> = [];
+  const rawVideoUrl = params.video_url as string | undefined;
+  if (rawVideoUrl) {
+    const referType = String(params.refer_type ?? "base"); // base = video edit, feature = video reference
+    const keepSound = String(params.keep_original_sound ?? "no");
+    videoList.push({ video_url: rawVideoUrl, refer_type: referType, keep_original_sound: keepSound });
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // Kling Omni positional-mention rewrite
+  // ─────────────────────────────────────────────────────────────────
+  // Kling docs ([Freepik / Scenario]) say prompts reference attached
+  // refs by 1-based index, NOT by the user-typed name:
+  //   • elements[]    →  `@Element1`, `@Element2`, …
+  //   • image_list[]  →  `@Image1`,   `@Image2`,   …
+  //   • video_list[0] →  `@Video`
+  //
+  // The frontend ships every `@<chip>` it found as a `mentioned_assets`
+  // entry tagged `kind: "asset" | "element"`. Below we:
+  //   1. Pre-load elements that were wired through the explicit
+  //      `elements` port (params.elements) so their indices come first.
+  //   2. Walk mentions, dedupe against what's already wired (by URL for
+  //      images, by brand_element_id|name for elements), and append.
+  //   3. Stash a `nodeId → @Token` map so the prompt rewrite can pick
+  //      the right anchor for each `@[Label](nodeId)` token.
+  //
+  // Order matters — `@Image1` is whatever sits at image_list[0], which
+  // is the start_frame if one was wired. The rewrite below is the only
+  // place that decides the mapping; the executor used to call the
+  // legacy `resolveMentionsInPrompt`, which is DB-bound and silently
+  // failed in V2. Removed in this pass.
+
+  type MentionTarget = { kind: "element" | "image" | "video"; idx: number };
+
+  // Track raw image-list source URLs (parallel to imageList[].image_url
+  // which is base64 by now) so we can dedupe mentions against entries
+  // that were already added via explicit edges.
+  const imageSourceUrls: Array<string | undefined> = [];
+  if (rawImageUrl) imageSourceUrls.push(rawImageUrl);
+  if (rawTailUrl) imageSourceUrls.push(rawTailUrl);
+  if (refImageUrl) imageSourceUrls.push(refImageUrl);
+
+  type ElementEntry = {
+    name: string;
+    reference_image_urls: string[];
+    frontal_image_url?: string;
+    brand_element_id?: string;
+  };
+  const elementsPool: ElementEntry[] = [];
+  const rawElementsParam = params.elements;
+  if (Array.isArray(rawElementsParam)) {
+    for (const e of rawElementsParam) {
+      if (!e || typeof e !== "object") continue;
+      const ee = e as Record<string, unknown>;
+      const name = String(ee.name ?? "element");
+      const refs = Array.isArray(ee.reference_image_urls)
+        ? (ee.reference_image_urls as unknown[]).filter(
+            (u): u is string => typeof u === "string" && !!u,
+          )
+        : [];
+      const frontal = typeof ee.frontal_image_url === "string" ? ee.frontal_image_url : undefined;
+      const beId = typeof ee.brand_element_id === "string" ? ee.brand_element_id : undefined;
+      if (refs.length === 0 && !frontal) continue;
+      elementsPool.push({
+        name,
+        reference_image_urls: refs,
+        frontal_image_url: frontal,
+        brand_element_id: beId,
+      });
+    }
+  }
+
+  const mentionByNodeId = new Map<string, MentionTarget>();
+  const mentionByLabel = new Map<string, MentionTarget>();
+  const newImageMentionUrls: string[] = [];
+
+  for (const m of mentioned) {
+    if (m.kind === "element" && (m.reference_image_urls?.length || m.frontal_image_url)) {
+      // Dedupe against pool by brand_element_id (saved elements wired
+      // via Asset Panel) or by name (creator-mode elements).
+      const elName = m.name ?? m.label ?? "element";
+      const existingIdx = elementsPool.findIndex(
+        (e) =>
+          (m.brand_element_id && e.brand_element_id === m.brand_element_id) ||
+          e.name === elName,
+      );
+      let idx: number;
+      if (existingIdx >= 0) {
+        idx = existingIdx;
+      } else {
+        elementsPool.push({
+          name: elName,
+          reference_image_urls: m.reference_image_urls ?? [],
+          frontal_image_url: m.frontal_image_url,
+          brand_element_id: m.brand_element_id,
+        });
+        idx = elementsPool.length - 1;
+      }
+      const tgt: MentionTarget = { kind: "element", idx };
+      if (m.nodeId) mentionByNodeId.set(m.nodeId, tgt);
+      if (m.label) mentionByLabel.set(m.label, tgt);
+      continue;
+    }
+    if (m.kind !== "asset") continue;
+    if (m.fieldType === "image" && typeof m.url === "string" && m.url) {
+      const existingIdx = imageSourceUrls.indexOf(m.url);
+      let idx: number;
+      if (existingIdx >= 0) {
+        idx = existingIdx;
+      } else {
+        imageSourceUrls.push(m.url);
+        newImageMentionUrls.push(m.url);
+        idx = imageSourceUrls.length - 1;
+      }
+      const tgt: MentionTarget = { kind: "image", idx };
+      if (m.nodeId) mentionByNodeId.set(m.nodeId, tgt);
+      if (m.label) mentionByLabel.set(m.label, tgt);
+      continue;
+    }
+    if (m.fieldType === "video" && typeof m.url === "string" && m.url) {
+      // Kling Omni accepts at most one video. If a video was already
+      // wired through `ref_video`, the mention reuses index 0; else we
+      // push the mention's URL as the sole entry.
+      if (videoList.length === 0) {
+        videoList.push({
+          video_url: m.url,
+          refer_type: "feature",
+          keep_original_sound: "no",
+        });
+      }
+      const tgt: MentionTarget = { kind: "video", idx: 0 };
+      if (m.nodeId) mentionByNodeId.set(m.nodeId, tgt);
+      if (m.label) mentionByLabel.set(m.label, tgt);
+    }
+  }
+
+  // Base64-encode mention images and append to image_list (no `type`
+  // field — these are generic refs, not first/end frames).
+  for (const url of newImageMentionUrls) {
+    let payload = url;
+    try {
+      const bytes = await fetchImageBuffer(url);
+      payload = bytesToBase64(bytes);
+    } catch (err) {
+      console.warn(`[kling-omni] mention image base64 failed, using URL:`, err);
+    }
+    imageList.push({ image_url: payload });
+    console.log(
+      `[kling-omni] Appended mention image #${imageList.length} → @Image${imageSourceUrls.indexOf(url) + 1}`,
+    );
+  }
+
+  /** Replace `@[Label](nodeId)` (and plain `@<label>` fallbacks) with
+   *  Kling positional anchors. Unresolved mentions strip down to the
+   *  bare label so the prompt stays grammatical. */
+  const rewriteKlingTokens = (s: string): string => {
+    if (!s || !s.includes("@")) return s;
+    let out = s.replace(/@\[([^\]]+)\]\(([^)]+)\)/g, (_full, label: string, nodeId: string) => {
+      const t = mentionByNodeId.get(nodeId);
+      if (!t) return label;
+      if (t.kind === "element") return `@Element${t.idx + 1}`;
+      if (t.kind === "image") return `@Image${t.idx + 1}`;
+      return `@Video`;
+    });
+    out = out.replace(/@([^\s@[]+)/g, (full: string, name: string) => {
+      const t = mentionByLabel.get(name);
+      if (!t) return full;
+      if (t.kind === "element") return `@Element${t.idx + 1}`;
+      if (t.kind === "image") return `@Image${t.idx + 1}`;
+      return `@Video`;
+    });
+    return out;
+  };
+
+  // ── Aspect ratio resolution (reuse startFrameBytes from above) ──
+  const rawAspect = params.aspect_ratio as string | undefined;
+  let resolvedAspect: string;
+  if (!rawAspect || rawAspect === "Auto") {
+    if (startFrameBytes) {
+      const dims = extractImageDimensions(startFrameBytes);
+      resolvedAspect = dims ? findClosestAspectRatio(dims.width, dims.height) : "16:9";
+    } else {
+      resolvedAspect = "16:9";
+    }
+  } else {
+    resolvedAspect = rawAspect;
+  }
+
+  // ── Build body ──
+  const body: Record<string, unknown> = {
+    model_name: mapping.model,
+    mode: mapping.mode,
+    duration: String(duration),
+    aspect_ratio: resolvedAspect,
+  };
+
+  // Audio (Kling spec: sound = "on" | "off", string enum — NOT boolean)
+  // When a reference video is present, sound MUST be "off".
+  const wantsSound = params.has_audio === "true" || params.has_audio === true;
+  body.sound = (wantsSound && videoList.length === 0) ? "on" : "off";
+
+  // Note: keep_original_sound is a per-video field already set inside video_list above.
+  // Do NOT set it at the top level — Kling rejects unknown root params.
+
+  // ── Multi-shot director mode — resolve @mentions and #textvars per scene ──
+  const isMultiShot = params.multi_shot === "true" || params.multi_shot === true;
+  if (isMultiShot && params.multi_prompt) {
+    body.multi_shot = true;
+    body.shot_type = "customize";
+
+    let shots: Array<{ prompt: string; duration: number }>;
+    if (typeof params.multi_prompt === "string") {
+      try {
+        shots = JSON.parse(params.multi_prompt);
+      } catch {
+        throw new Error("multi_prompt must be a valid JSON array of {prompt, duration} objects");
+      }
+    } else {
+      shots = params.multi_prompt as Array<{ prompt: string; duration: number }>;
+    }
+
+    // Validate total duration
+    const totalShotDuration = shots.reduce((sum, s) => sum + (Number(s.duration) || 0), 0);
+    if (totalShotDuration !== duration) {
+      console.warn(`[kling-omni] Shot durations sum (${totalShotDuration}) ≠ total duration (${duration}). API may reject.`);
+    }
+
+    // Each scene prompt is rewritten through the Kling positional
+    // helper built above — `@[Label](nodeId)` → `@Element1` /
+    // `@Image1` / `@Video` based on the per-mention position map.
+    // Note: `#[Label](nodeId)` text variables are a workspace-only
+    // feature that doesn't apply to V2 yet (no graph_nodes context),
+    // so we leave those tokens to fall back to bare labels.
+    const resolvedShots: Array<{ index: number; prompt: string; duration: string }> = [];
+    for (let i = 0; i < shots.length; i++) {
+      const scenePrompt = rewriteKlingTokens(shots[i].prompt ?? "");
+      resolvedShots.push({
+        index: i + 1,
+        prompt: scenePrompt,
+        duration: String(shots[i].duration),
+      });
+    }
+    body.multi_prompt = resolvedShots;
+  } else {
+    // Standard single-prompt mode — same positional rewrite.
+    const finalPrompt = rewriteKlingTokens(prompt);
+    if (finalPrompt) body.prompt = finalPrompt;
+  }
+
+  if (negativePrompt) body.negative_prompt = negativePrompt;
+  if (imageList.length > 0) body.image_list = imageList;
+  if (videoList.length > 0) body.video_list = videoList;
+
+  // ── Element refs (character / object identity for Omni v3) ──
+  // `elementsPool` was built above from BOTH explicit `elements`-port
+  // wires AND `mentioned_assets[].kind === "element"`. The order in
+  // the pool is the order in body.elements — and that order drives
+  // the `@Element{N}` index already baked into `body.prompt` /
+  // `body.multi_prompt` by `rewriteKlingTokens`.
+  // We base64-encode the URLs (Kling reads bytes more reliably than
+  // signed URLs whose TTL might expire mid-render).
+  if (elementsPool.length > 0) {
+    const elementList: Array<Record<string, unknown>> = [];
+    for (const e of elementsPool) {
+      const refsB64: string[] = [];
+      for (const u of e.reference_image_urls) {
+        try {
+          const bytes = await fetchImageBuffer(u);
+          refsB64.push(bytesToBase64(bytes));
+        } catch (err) {
+          console.warn(`[kling-omni] element "${e.name}" ref load failed, using URL:`, err);
+          refsB64.push(u);
+        }
+      }
+      let frontalB64: string | undefined;
+      if (e.frontal_image_url) {
+        try {
+          const bytes = await fetchImageBuffer(e.frontal_image_url);
+          frontalB64 = bytesToBase64(bytes);
+        } catch (err) {
+          console.warn(`[kling-omni] element "${e.name}" frontal load failed, using URL:`, err);
+          frontalB64 = e.frontal_image_url;
+        }
+      }
+
+      if (refsB64.length === 0 && !frontalB64) continue;
+      const entry: Record<string, unknown> = { name: e.name };
+      if (refsB64.length > 0) entry.reference_image_urls = refsB64;
+      if (frontalB64) entry.frontal_image_url = frontalB64;
+      elementList.push(entry);
+    }
+    if (elementList.length > 0) {
+      body.elements = elementList;
+      console.log(
+        `[kling-omni] Added ${elementList.length} element(s) — @Element1..@Element${elementList.length}`,
+      );
+    }
+  }
+
+  console.log(`[kling-omni] POST ${ENDPOINT} model=${mapping.model} mode=${mapping.mode} duration=${duration}s images=${imageList.length} videos=${videoList.length} multi_shot=${isMultiShot}`);
+
+  const res = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${jwtToken}` },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error(`[kling-omni] API HTTP ${res.status}: ${errText.substring(0, 500)}`);
+    if (res.status === 402 || res.status === 429 || /account balance not enough|insufficient balance|quota exceeded|billing/i.test(errText)) {
+      throw new Error("PROVIDER_BILLING_ERROR");
+    }
+    throw new Error(`Kling Omni API error (HTTP ${res.status}): ${errText.substring(0, 200)}`);
+  }
+
+  let result: Record<string, unknown>;
+  try {
+    result = await res.json();
+  } catch {
+    const text = await res.text().catch(() => "");
+    console.error(`[kling-omni] Failed to parse JSON: ${text.substring(0, 500)}`);
+    throw new Error("Kling Omni API returned invalid JSON response");
+  }
+
+  const message = String(result?.message ?? "Kling Omni API error");
+  if (result?.code !== 0) {
+    if (/account balance not enough|insufficient balance|quota exceeded|billing/i.test(message)) {
+      throw new Error("PROVIDER_BILLING_ERROR");
+    }
+    throw new Error(message || "Kling Omni API error");
+  }
+
+  const taskId = String((result?.data as Record<string, unknown>)?.task_id ?? "");
+  if (!taskId) {
+    throw new Error("Kling Omni API did not return a task_id");
+  }
+
+  // Async — Kling Omni renders take 60-180s which blows past Supabase
+  // edge function compute budget if we poll inline. Frontend polls
+  // workspace-run-node with `action="poll_kling"` until succeeds.
+  return {
+    task_id: taskId,
+    outputs: {
+      output_video: "",
+      output_start_frame: rawImageUrl || "",
+      output_end_frame: "",
+    },
+    output_type: "video_url",
+    provider_meta: {
+      model: modelSlug,
+      mode: mapping.mode,
+      is_omni: true,
+      has_video_ref: videoList.length > 0,
+      has_image_ref: imageList.length > 0,
+      poll_endpoint: ENDPOINT,
+    },
+  };
+}
+
+
+const GEMINI_IMAGE_MODELS: Record<string, { gemini_model: string }> = {
+  "nano-banana-pro": { gemini_model: "gemini-3-pro-image-preview" },
+  "nano-banana-2":   { gemini_model: "gemini-3.1-flash-image-preview" },
+};
+
+async function executeBanana(
+  params: Record<string, unknown>,
+  supabase: ReturnType<typeof createClient>,
+): Promise<ProviderResult> {
+  // Workspace dev names this secret `GEMINI_API_KEY`; live editor uses
+  // `GOOGLE_AI_STUDIO_KEY`. Accept either so the same code base runs in
+  // both environments without a migration.
+  const GOOGLE_AI_STUDIO_KEY =
+    Deno.env.get("GOOGLE_AI_STUDIO_KEY") ?? Deno.env.get("GEMINI_API_KEY");
+  if (!GOOGLE_AI_STUDIO_KEY) {
+    throw new Error(
+      "Neither GOOGLE_AI_STUDIO_KEY nor GEMINI_API_KEY is configured",
+    );
+  }
+
+  const rawModel = String(params.model_name ?? params.model ?? "nano-banana-pro");
+  const modelId = BANANA_MODEL_MAP[rawModel] ?? rawModel;
+  const modelConfig = GEMINI_IMAGE_MODELS[modelId];
+  if (!modelConfig) throw new Error(`Unknown Banana model: ${modelId}. Available: ${Object.keys(GEMINI_IMAGE_MODELS).join(", ")}`);
+
+  const prompt = String(params.prompt ?? "");
+  const aspectRatio = String(params.aspect_ratio ?? "Auto");
+  /* Output resolution. Maps to Gemini's `imageConfig.imageSize`:
+   *   "1K" / "2K" — Banana 2 (Flash Image)
+   *   "1K" / "2K" / "4K" — Banana Pro (Pro Image)
+   * Empty / "auto" leaves the field off entirely so Gemini picks
+   * the model's default resolution. */
+  const imageSize = String(params.image_size ?? "").trim();
+  const imageUrl = params.image_url as string | undefined;
+  const mentionImageUrls = params.mention_image_urls as string[] | undefined;
+
+  if (!prompt) throw new Error("A prompt is required.");
+
+  // Build Gemini API request parts
+  const parts: Array<Record<string, unknown>> = [];
+  parts.push({ text: prompt });
+
+  // Resolve reference images to base64 inline data for Gemini
+  const imageUrls: string[] = mentionImageUrls ?? (imageUrl ? [imageUrl] : []);
+  if (imageUrls.length > 0) {
+    for (const url of imageUrls) {
+      try {
+        const bytes = await fetchImageBuffer(url);
+        const base64 = bytesToBase64(bytes);
+        // Detect mime from first bytes
+        let mime = "image/png";
+        if (bytes[0] === 0xFF && bytes[1] === 0xD8) mime = "image/jpeg";
+        else if (bytes[0] === 0x52 && bytes[1] === 0x49) mime = "image/webp";
+        parts.push({ inlineData: { mimeType: mime, data: base64 } });
+      } catch (imgErr) {
+        console.warn(`[banana-direct] Failed to resolve image: ${imgErr}`);
+      }
+    }
+    console.log(`[banana-direct] Added ${imageUrls.length} reference images`);
+  }
+
+  console.log(`[banana-direct] Requesting ${modelId} (${modelConfig.gemini_model}), ref_images: ${imageUrls.length}`);
+
+  // Build generationConfig — both aspectRatio and imageSize live
+  // under `imageConfig`. We only include keys the user actually
+  // set so Gemini's default kicks in for the others.
+  const generationConfig: Record<string, unknown> = {
+    responseModalities: ["TEXT", "IMAGE"],
+  };
+  const imageConfig: Record<string, unknown> = {};
+  if (aspectRatio && aspectRatio !== "Auto") {
+    imageConfig.aspectRatio = aspectRatio;
+  }
+  if (imageSize && imageSize.toLowerCase() !== "auto") {
+    imageConfig.imageSize = imageSize;
+  }
+  if (Object.keys(imageConfig).length > 0) {
+    generationConfig.imageConfig = imageConfig;
+  }
+
+  // ── Global Nano Banana tier override (admin-controlled throttle) ──
+  // subscription_settings.nano_banana_tier_override:
+  //   'auto'           → honour params.service_tier (current behavior)
+  //   'force_standard' → strip service_tier (always Standard)
+  //   'force_flex'     → set service_tier="flex" (cheaper but slower/queued)
+  // NOTE: Gemini Developer API REST contract requires snake_case "service_tier"
+  // at the root of the request body with lowercase value "flex" — NOT
+  // camelCase "serviceTier" with "FLEX". The previous payload was rejected
+  // with HTTP 400 every time, which is what made every Banana Pro request
+  // fail right after Force Flex was applied.
+  // Ref: https://ai.google.dev/gemini-api/docs/flex-inference  (REST tab)
+  let useFlex = false;
+  try {
+    const { data: tierRow } = await supabase
+      .from("subscription_settings")
+      .select("value")
+      .eq("key", "nano_banana_tier_override")
+      .maybeSingle();
+    const override = (tierRow?.value as string | undefined) ?? "auto";
+    if (override === "force_flex") {
+      useFlex = true;
+    } else if (override === "force_standard") {
+      useFlex = false;
+    } else {
+      const fromParam = String(params.service_tier ?? "").toLowerCase();
+      useFlex = fromParam === "flex";
+    }
+    console.log(`[banana-direct] Tier override='${override}', resolved=${useFlex ? "FLEX" : "STANDARD"}`);
+  } catch (tierErr) {
+    console.warn(`[banana-direct] Failed to read tier override, defaulting to Standard:`, tierErr);
+  }
+
+  const requestPayload: Record<string, unknown> = {
+    contents: [{ parts }],
+    generationConfig,
+  };
+  if (useFlex) {
+    // REST contract: snake_case key + lowercase value
+    requestPayload.service_tier = "flex";
+  }
+  const geminiRequestBody = JSON.stringify(requestPayload);
+
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelConfig.gemini_model}:generateContent?key=${GOOGLE_AI_STUDIO_KEY}`;
+  console.log(`[banana-direct] Calling model: ${modelConfig.gemini_model}`);
+
+  /* ── Hard client-side timeout ─────────────────────────────
+   * Supabase edge functions die with WORKER_RESOURCE_LIMIT once
+   * total CPU time crosses ~150s (default tier). Gemini Pro Image
+   * with Flex queueing or many ref images can blow past that, so
+   * we abort the fetch at ~120s — leaving enough headroom for the
+   * upload + JSON-parse work below to finish before the platform
+   * pulls the plug. The caller gets a friendly error instead of a
+   * generic platform 500. */
+  const ABORT_MS = 120_000;
+  const aborter = new AbortController();
+  const abortTimer = setTimeout(() => aborter.abort(), ABORT_MS);
+  const modelLabel = modelId === "nano-banana-pro" ? "Nano Banana Pro" : "Nano Banana 2";
+
+  let aiResponse: Response;
+  try {
+    aiResponse = await fetch(geminiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // Tell Gemini to wait up to 280s before returning a 504, matching
+        // what the legacy editor uses for long Banana generations.
+        "X-Server-Timeout": "280",
+      },
+      body: geminiRequestBody,
+      signal: aborter.signal,
+    });
+  } catch (fetchErr) {
+    clearTimeout(abortTimer);
+    if ((fetchErr as { name?: string })?.name === "AbortError") {
+      console.error(`[banana-direct] Gemini fetch aborted after ${ABORT_MS}ms`);
+      throw new Error(
+        `${modelLabel} ใช้เวลานานเกิน ${Math.round(ABORT_MS / 1000)} วินาที — ลองลดจำนวน reference images ` +
+          `หรือทำ prompt ให้สั้นลง แล้วกด Run ใหม่`,
+      );
+    }
+    throw fetchErr;
+  }
+  clearTimeout(abortTimer);
+
+  if (!aiResponse.ok) {
+    const statusCode = aiResponse.status;
+    const errorText = await aiResponse.text();
+    console.error(`[banana-direct] Gemini API error: ${statusCode}`, errorText.substring(0, 500));
+    if (statusCode === 429 || (statusCode < 500 && /billing|quota|exceeded|resource exhausted/i.test(errorText))) {
+      throw new Error("PROVIDER_BILLING_ERROR");
+    }
+    throw new Error(`${modelLabel} failed (HTTP ${statusCode}). Please try again.`);
+  }
+
+  const aiResult = await aiResponse.json();
+  const candidate = aiResult.candidates?.[0]?.content;
+  const responseParts = candidate?.parts || [];
+
+  // Extract image from response
+  let imageBase64: string | null = null;
+  let imageMime = "image/png";
+
+  for (const part of responseParts) {
+    if (part.inlineData) {
+      imageBase64 = part.inlineData.data;
+      imageMime = part.inlineData.mimeType || "image/png";
+    }
+  }
+
+  if (!imageBase64) {
+    throw new Error("No image was generated. Try a different prompt.");
+  }
+
+  // Upload to storage
+  const ext = imageMime.split("/")[1] || "png";
+  const fileName = `pipeline/${Date.now()}.${ext}`;
+  const binaryData = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
+
+  let publicUrl = `data:${imageMime};base64,${imageBase64}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from("ai-media")
+    .upload(fileName, binaryData, { contentType: imageMime, upsert: true });
+
+  if (uploadError) {
+    console.error("[banana-direct] Upload error:", uploadError);
+  } else {
+    const { data: urlData, error: signError } = await supabase.storage
+      .from("ai-media")
+      .createSignedUrl(fileName, 60 * 60 * 24 * 7);
+    if (!signError && urlData?.signedUrl) {
+      publicUrl = urlData.signedUrl;
+    } else {
+      const { data: pubData } = supabase.storage.from("ai-media").getPublicUrl(fileName);
+      publicUrl = pubData.publicUrl;
+    }
+  }
+
+  console.log(`[banana-direct] Success — image uploaded to storage`);
+
+  return {
+    result_url: publicUrl,
+    outputs: { output_image: publicUrl },
+    output_type: "image_url" as const,
+    provider_meta: { model: modelId },
+  };
+}
+
+async function executeChatAi(params: Record<string, unknown>): Promise<ProviderResult> {
+  const model = String(params.model_name ?? "google/gemini-3.1-pro-preview");
+  const systemPrompt = String(params.system_prompt ?? "You are a helpful AI assistant.");
+  const userPrompt = String(params.prompt ?? "");
+  const temperature = Number(params.temperature ?? 0.7);
+  const maxTokens = parseInt(String(params.max_tokens ?? "1024"), 10);
+  const context = params.context_text as string | undefined;
+
+  if (!userPrompt && !context) throw new Error("Prompt is required");
+
+  const messages: Array<{ role: string; content: string }> = [
+    { role: "system", content: systemPrompt },
+  ];
+  if (context) {
+    messages.push({ role: "user", content: `Context:\n${context}\n\n${userPrompt}` });
+  } else {
+    messages.push({ role: "user", content: userPrompt });
+  }
+
+  let content: string;
+
+  if (model.startsWith("google/")) {
+    const GOOGLE_KEY = Deno.env.get("GOOGLE_AI_STUDIO_KEY");
+    if (!GOOGLE_KEY) throw new Error("GOOGLE_AI_STUDIO_KEY is not configured");
+    const geminiModelMap: Record<string, string> = {
+      "google/gemini-3.1-pro-preview": "gemini-3.1-pro-preview",
+      "google/gemini-3-flash-preview": "gemini-3-flash-preview",
+    };
+    const geminiModel = geminiModelMap[model] ?? model.replace("google/", "");
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${GOOGLE_KEY}`;
+    const geminiContents: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+    for (const msg of messages) {
+      if (msg.role === "system") continue;
+      geminiContents.push({ role: msg.role === "assistant" ? "model" : "user", parts: [{ text: msg.content }] });
+    }
+    const res = await fetch(geminiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: geminiContents,
+        generationConfig: { temperature, maxOutputTokens: maxTokens },
+      }),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      if (res.status === 429 || (res.status < 500 && /billing|quota|exceeded|resource exhausted/i.test(errText))) throw new Error("PROVIDER_BILLING_ERROR");
+      throw new Error(`Google AI API error (${res.status})`);
+    }
+    const data = await res.json();
+    content = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  } else if (model.startsWith("openai/")) {
+    const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY");
+    if (!OPENAI_KEY) throw new Error("OPENAI_API_KEY is not configured");
+    const openaiModel = model.replace("openai/", "");
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_KEY}` },
+      body: JSON.stringify({ model: openaiModel, messages, temperature, max_tokens: maxTokens }),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      if (res.status === 429 || res.status === 402 || /billing|quota|insufficient_quota|rate limit/i.test(errText)) throw new Error("PROVIDER_BILLING_ERROR");
+      throw new Error(`OpenAI API error (${res.status})`);
+    }
+    const data = await res.json();
+    content = data.choices?.[0]?.message?.content ?? "";
+  } else {
+    throw new Error(`Unsupported model: ${model}`);
+  }
+
+  return { result_url: content, outputs: { output_text: content }, output_type: "text", provider_meta: { model } };
+}
+
+/**
+ * executeRemoveBg — calls our remove-background edge function (Replicate BiRefNet).
+ */
+async function executeRemoveBg(params: Record<string, unknown>, supabaseUrl: string, serviceRoleKey: string): Promise<ProviderResult> {
+  const imageUrl = String(params.image_url ?? "");
+  if (!imageUrl) {
+    throw new Error("Remove Background requires an image input.");
+  }
+
+  console.log(`[remove-bg-pipeline] Calling remove-background edge fn`);
+
+  const res = await fetch(`${supabaseUrl}/functions/v1/remove-background`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${serviceRoleKey}`,
+      apikey: serviceRoleKey,
+    },
+    body: JSON.stringify({ image_url: imageUrl }),
+  });
+
+  const json = await res.json();
+  if (!res.ok) {
+    const errMsg = String(json?.error || `remove-background failed (${res.status})`);
+    if (errMsg === "PROVIDER_BILLING_ERROR") throw new Error("PROVIDER_BILLING_ERROR");
+    throw new Error(errMsg);
+  }
+
+  const url = String(json.result_url ?? json.outputs?.output_image ?? "");
+  if (!url) throw new Error("remove-background returned no URL");
+
+  return {
+    result_url: url,
+    outputs: { output_image: url },
+    output_type: "image_url" as const,
+    provider_meta: json.provider_meta ?? { model: "replicate-birefnet" },
+  };
+}
+
+/**
+ * executeMergeAudio — proxies to merge-audio-video edge fn (Shotstack).
+ * Reads video_url + audio_url from inputs, returns the muxed video URL.
+ */
+async function executeMergeAudio(params: Record<string, unknown>): Promise<ProviderResult> {
+  const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+  const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+  const videoUrl = String(params.video_url ?? "");
+  const audioUrl = String(params.audio_url ?? "");
+  if (!videoUrl) throw new Error("Merge Audio requires a video input.");
+  if (!audioUrl) throw new Error("Merge Audio requires an audio input.");
+
+  console.log(`[merge-audio-pipeline] Calling merge-audio-video edge fn`);
+
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/merge-audio-video`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+    },
+    body: JSON.stringify({
+      video_url: videoUrl,
+      audio_url: audioUrl,
+      audio_mode: params.audio_mode ?? "replace",
+      audio_volume: params.audio_volume ?? 1,
+    }),
+  });
+
+  const json = await res.json();
+  if (!res.ok) {
+    const errMsg = String(json?.error || `merge-audio-video failed (${res.status})`);
+    if (errMsg === "PROVIDER_BILLING_ERROR") throw new Error("PROVIDER_BILLING_ERROR");
+    throw new Error(errMsg);
+  }
+
+  const url = String(json.result_url ?? json.outputs?.output_video ?? "");
+  if (!url) throw new Error("merge-audio-video returned no URL");
+
+  return {
+    result_url: url,
+    outputs: { output_video: url },
+    output_type: "video_url" as const,
+    provider_meta: json.provider_meta ?? { provider: "shotstack" },
+  };
+}
+
+
+/* ═══════════════════════════════════════════════════════════
+   @mention resolver — Provider-Aware
+   ═══════════════════════════════════════════════════════════ */
+
+interface MentionResolution {
+  resolvedPrompt: string;
+  mentionedImageUrls: string[];
+}
+
+/**
+ * Resolve @[Label](nodeId) tokens in a prompt string.
+ * Step 1: Extract all mentions and resolve nodeId → real URL.
+ * Step 2: Format the prompt text differently per provider.
+ */
+async function resolveMentionsInPrompt(
+  prompt: string,
+  graphNodes: Array<{ id: string; type: string; data: Record<string, unknown> }> | undefined,
+  supabase: ReturnType<typeof createClient>,
+  provider?: string,
+  stepResults?: Array<{ step_index: number; status: string; result_url?: string; outputs?: Record<string, string> }>,
+  steps?: Array<{ node_id: string }>,
+): Promise<MentionResolution> {
+  if (!prompt.includes("@[")) return { resolvedPrompt: prompt, mentionedImageUrls: [] };
+
+  const mentions = [...prompt.matchAll(/@\[([^\]]+)\]\(([^)]+)\)/g)];
+  if (mentions.length === 0) return { resolvedPrompt: prompt, mentionedImageUrls: [] };
+
+  // ── Step 1: Resolve every nodeId → URL ──
+  const resolvedUrls: Array<{ fullMatch: string; label: string; url: string | null }> = [];
+
+  for (const match of mentions) {
+    const fullMatch = match[0];
+    const label = match[1];
+    const nodeId = match[2];
+    let resolvedUrl: string | null = null;
+
+    // 1a. Try step_results (output of a previous action node)
+    if (!resolvedUrl && stepResults && steps) {
+      const sourceIdx = steps.findIndex((s) => s.node_id === nodeId);
+      if (sourceIdx >= 0) {
+        const sr = stepResults.find((r) => r.step_index === sourceIdx && r.status === "completed");
+        if (sr) {
+          resolvedUrl = sr.result_url || (sr.outputs ? Object.values(sr.outputs).find(Boolean) : undefined) || null;
+        }
+      }
+    }
+
+    // 1b. Try graph_nodes (input node with uploaded asset)
+    if (!resolvedUrl && graphNodes) {
+      const node = graphNodes.find((n) => n.id === nodeId);
+      if (node) {
+        const data = node.data || {};
+        const uploadedUrl = data.uploadedUrl as string | undefined;
+        if (uploadedUrl) {
+          resolvedUrl = uploadedUrl;
+        } else {
+          const storagePath = data.storagePath as string | undefined;
+          if (storagePath) {
+            const { data: signedData } = await supabase.storage.from("ai-media").createSignedUrl(storagePath, 3600);
+            if (signedData?.signedUrl) resolvedUrl = signedData.signedUrl;
+          }
+          if (!resolvedUrl) {
+            resolvedUrl = (data.previewUrl as string | undefined) || null;
+          }
+        }
+      }
+    }
+
+    resolvedUrls.push({ fullMatch, label, url: resolvedUrl });
+  }
+
+  // Collect unique resolved image URLs
+  const mentionedImageUrls = resolvedUrls.map((r) => r.url).filter(Boolean) as string[];
+
+  // ── Step 2: Provider-aware prompt formatting with AI context instructions ──
+  let result = prompt;
+  const p = (provider || "").toLowerCase();
+  const contextInstructions: string[] = [];
+
+  if (p === "kling" || p === "kling_extension" || p === "motion_control") {
+    // Kling: replace with @image_N placeholder, pass URLs separately
+    for (let i = 0; i < resolvedUrls.length; i++) {
+      const r = resolvedUrls[i];
+      if (r.url) {
+        const placeholder = `@image_${i + 1}`;
+        result = result.replace(r.fullMatch, placeholder);
+        contextInstructions.push(`${placeholder} refers to the attached image "${r.label}"`);
+      } else {
+        result = result.replace(r.fullMatch, `[${r.label}]`);
+      }
+    }
+  } else if (p === "banana") {
+    // Banana/Gemini multimodal: strip tokens, images injected as inline parts
+    // Append structured context so AI knows what each attached image represents
+    for (let i = 0; i < resolvedUrls.length; i++) {
+      const r = resolvedUrls[i];
+      if (r.url) {
+        result = result.replace(r.fullMatch, "");
+        contextInstructions.push(`Reference the attached image "${r.label}" (image ${i + 1}) for visual context`);
+      } else {
+        result = result.replace(r.fullMatch, `[${r.label}]`);
+      }
+    }
+  } else if (p === "chat_ai") {
+    // Chat AI: embed URL inline for context with semantic label
+    for (const r of resolvedUrls) {
+      if (r.url) {
+        result = result.replace(r.fullMatch, `[Image: ${r.label}]`);
+        contextInstructions.push(`"${r.label}" refers to the resource at: ${r.url}`);
+      } else {
+        result = result.replace(r.fullMatch, `[${r.label}]`);
+      }
+    }
+  } else {
+    // Legacy / unknown: strip tokens completely, first URL goes to image_url param
+    for (const r of resolvedUrls) {
+      result = result.replace(r.fullMatch, "");
+    }
+  }
+
+  // Clean up whitespace artifacts
+  result = result.replace(/\s{2,}/g, " ").trim();
+
+  // Append context instructions block if any mentions were resolved
+  if (contextInstructions.length > 0) {
+    result = `${result}\n\n[Context: ${contextInstructions.join(". ")}.]\n`;
+  }
+
+  console.log(`[mention-resolver] Provider="${provider}", resolved ${mentionedImageUrls.length} image(s), instructions=${contextInstructions.length}, prompt length=${result.length}`);
+  return { resolvedPrompt: result, mentionedImageUrls };
+}
+
+/**
+ * Resolves #[Label](nodeId) text variable tokens via direct string replacement.
+ */
+function resolveTextVariablesInPrompt(
+  prompt: string,
+  graphNodes: Array<{ id: string; type: string; data: Record<string, unknown> }> | undefined,
+  outputs?: Record<string, Record<string, string>>,
+): string {
+  if (!graphNodes || !prompt.includes("#[")) return prompt;
+  const textVarRegex = /#\[([^\]]+)\]\(([^)]+)\)/g;
+  return prompt.replace(textVarRegex, (_fullMatch, _label, nodeId) => {
+    if (outputs) {
+      const nodeOutputs = outputs[nodeId];
+      if (nodeOutputs) {
+        const textValue = nodeOutputs.output_text || nodeOutputs.text || Object.values(nodeOutputs)[0];
+        if (textValue) return `"${textValue}"`;
+      }
+    }
+    const node = graphNodes.find((n) => n.id === nodeId);
+    if (node) {
+      const data = node.data || {};
+      const textValue = (data.textValue as string) || (data.text as string);
+      if (textValue) return `"${textValue}"`;
+    }
+    return "";
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Provider Health Probe
+   ═══════════════════════════════════════════════════════════ */
+
+async function probeProviderHealth(provider: string): Promise<{ healthy: boolean; reason: string }> {
+  try {
+    if (provider === "kling" || provider === "kling_extension" || provider === "motion_control") {
+      const KLING_ACCESS_KEY_ID = Deno.env.get("KLING_ACCESS_KEY_ID");
+      const KLING_SECRET_KEY = Deno.env.get("KLING_SECRET_KEY");
+      if (!KLING_ACCESS_KEY_ID || !KLING_SECRET_KEY) return { healthy: false, reason: "credentials missing" };
+      const jwt = await generateKlingJWT(KLING_ACCESS_KEY_ID, KLING_SECRET_KEY);
+      // GET on text2video listing — lightweight, returns 200 if service up
+      const res = await fetch("https://api.klingai.com/v1/videos/text2video?pageNum=1&pageSize=1", {
+        headers: { Authorization: `Bearer ${jwt}` },
+      });
+      return { healthy: res.ok || res.status === 404, reason: `HTTP ${res.status}` };
+    }
+    if (provider === "banana" || provider === "chat_ai") {
+      const KEY = Deno.env.get("GOOGLE_AI_STUDIO_KEY");
+      if (!KEY) return { healthy: false, reason: "credentials missing" };
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${KEY}`);
+      return { healthy: res.ok, reason: `HTTP ${res.status}` };
+    }
+    if (provider === "remove_bg") {
+      const REPLICATE = Deno.env.get("REPLICATE_API_TOKEN");
+      if (!REPLICATE) return { healthy: false, reason: "credentials missing" };
+      const res = await fetch("https://api.replicate.com/v1/account", {
+        headers: { Authorization: `Bearer ${REPLICATE}` },
+      });
+      await res.body?.cancel();
+      return { healthy: res.ok, reason: `HTTP ${res.status}` };
+    }
+    if (provider === "merge_audio") {
+      const KEY = Deno.env.get("SHOTSTACK_API_KEY");
+      if (!KEY) return { healthy: false, reason: "credentials missing" };
+      // Shotstack /render GET requires an id; just check API root reachability via probe endpoint.
+      const res = await fetch("https://api.shotstack.io/edit/v1/probe/probe", {
+        headers: { "x-api-key": KEY },
+      });
+      await res.body?.cancel();
+      // Shotstack probe returns 4xx on bad input but 200/401 on auth check
+      return { healthy: res.status !== 401 && res.status !== 403, reason: `HTTP ${res.status}` };
+    }
+    if (provider === "mp3_input") {
+      return { healthy: true, reason: "passthrough" };
+    }
+    return { healthy: true, reason: "unknown provider, assumed healthy" };
+  } catch (err) {
+    return { healthy: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Single-step executor (extracted for parallel reuse)
+   Builds params, runs retries, performs health probe, returns outcome.
+   Does NOT update DB — caller aggregates results.
+   ═══════════════════════════════════════════════════════════ */
+
+interface StepOutcome {
+  step_index: number;
+  node_id: string;
+  node_type: string;
+  provider: string;
+  status: "completed" | "running" | "failed" | "skipped" | "queued_for_retry";
+  result_url?: string;
+  outputs?: Record<string, string>;
+  task_id?: string;
+  output_type: string;
+  provider_meta?: Record<string, unknown>;
+  error?: string;
+  is_async: boolean;
+  health_probe?: { healthy: boolean; reason: string };
+  retry_job_id?: string; // set when status = 'queued_for_retry'
+}
+
+// Inline budget = INLINE_BUDGET_ATTEMPTS (4) + queue worker retries 14 = TOTAL_MAX_RETRIES (18)
+void TOTAL_MAX_RETRIES;
+
+async function executeOneStep(
+  supabase: ReturnType<typeof createClient>,
+  execution: Record<string, unknown>,
+  stepIndex: number,
+  steps: Array<{
+    node_id: string; node_type: string; provider: string; is_async: boolean;
+    output_type: string; params: Record<string, unknown>;
+    input_edges: Array<{ source_node_id: string; target_handle: string; source_handle: string }>;
+    level?: number;
+  }>,
+  priorResults: Array<{
+    step_index: number; status: string; node_id?: string; result_url?: string;
+    outputs?: Record<string, string>; task_id?: string; output_type: string;
+    provider_meta?: Record<string, unknown>;
+  }>,
+  SUPABASE_URL: string,
+  token: string,
+): Promise<StepOutcome> {
+  const stepDef = steps[stepIndex];
+  if (!stepDef) {
+    return {
+      step_index: stepIndex, node_id: "?", node_type: "?", provider: "?",
+      status: "failed", output_type: "image_url", is_async: false,
+      error: "Step definition not found",
+    };
+  }
+
+  // ─── Skip cascade: if any upstream dependency failed/skipped, skip this node ───
+  for (const edge of stepDef.input_edges ?? []) {
+    const upstreamIdx = steps.findIndex((s) => s.node_id === edge.source_node_id);
+    if (upstreamIdx < 0) continue; // upstream is an input node, not a step
+    const upstreamResult = priorResults.find((r) => r.step_index === upstreamIdx);
+    if (upstreamResult && (upstreamResult.status === "failed" || upstreamResult.status === "skipped")) {
+      console.warn(`[step-executor] Step ${stepIndex} (${stepDef.node_id}) SKIPPED — upstream ${edge.source_node_id} ${upstreamResult.status}`);
+      return {
+        step_index: stepIndex, node_id: stepDef.node_id, node_type: stepDef.node_type,
+        provider: stepDef.provider, status: "skipped", output_type: stepDef.output_type,
+        is_async: stepDef.is_async,
+        error: `Skipped: upstream node "${edge.source_node_id}" ${upstreamResult.status}`,
+      };
+    }
+  }
+
+  // ─── Build step params with @mentions, #vars, edge mapping ───
+  const stepParams = { ...stepDef.params };
+  const graphNodes = (execution.pricing_info as Record<string, unknown>)?.graph_nodes as Array<{ id: string; type: string; data: Record<string, unknown> }> | undefined;
+  const allMentionedImageUrls: string[] = [];
+
+  for (const [key, val] of Object.entries(stepParams)) {
+    if (typeof val === "string" && val.includes("@[")) {
+      const { resolvedPrompt, mentionedImageUrls } = await resolveMentionsInPrompt(
+        val, graphNodes, supabase, stepDef.provider, priorResults, steps,
+      );
+      stepParams[key] = resolvedPrompt;
+      allMentionedImageUrls.push(...mentionedImageUrls);
+    }
+    if (typeof stepParams[key] === "string" && (stepParams[key] as string).includes("#[")) {
+      stepParams[key] = resolveTextVariablesInPrompt(stepParams[key] as string, graphNodes, priorResults);
+    }
+  }
+
+  if (allMentionedImageUrls.length > 0) {
+    const p = stepDef.provider.toLowerCase();
+    if (p === "kling" || p === "kling_extension" || p === "motion_control") {
+      if (!stepParams.image_url) stepParams.image_url = allMentionedImageUrls[0];
+    } else if (p === "banana") {
+      stepParams.mention_image_urls = allMentionedImageUrls;
+      if (!stepParams.image_url) stepParams.image_url = allMentionedImageUrls[0];
+    } else {
+      if (!stepParams.image_url) stepParams.image_url = allMentionedImageUrls[0];
+    }
+  }
+
+  // ─── Edge-based parameter mapping ───
+  const edgeImageUrls: string[] = [];
+  if (stepDef.input_edges && stepDef.input_edges.length > 0) {
+    for (const edge of stepDef.input_edges) {
+      let rawValue: string | undefined;
+      const sourceStepResult = priorResults.find((r) => {
+        const sourceStep = steps.findIndex((s) => s.node_id === edge.source_node_id);
+        return r.step_index === sourceStep && r.status === "completed";
+      });
+      if (sourceStepResult) {
+        const outputKey = edge.source_handle || "output_video";
+        rawValue = sourceStepResult.outputs?.[outputKey] ?? sourceStepResult.result_url;
+      }
+      if (!rawValue) {
+        const inputUrls = (execution.pricing_info as Record<string, unknown>)?.input_urls as Record<string, string> | undefined;
+        if (inputUrls?.[edge.source_node_id]) rawValue = inputUrls[edge.source_node_id];
+      }
+      if (!rawValue || !edge.target_handle) continue;
+
+      const handleDef = normalizeHandle(stepDef.provider, edge.target_handle);
+      if (handleDef) {
+        validateEdgeValue(rawValue, handleDef.data_type, edge.target_handle);
+        if (handleDef.internal_key === "image_url" && handleDef.data_type === "image") {
+          edgeImageUrls.push(rawValue);
+          if (!stepParams[handleDef.internal_key]) stepParams[handleDef.internal_key] = rawValue;
+        } else {
+          stepParams[handleDef.internal_key] = rawValue;
+        }
+      } else {
+        stepParams[edge.target_handle] = rawValue;
+      }
+    }
+  }
+
+  const existingMentionUrls = (stepParams.mention_image_urls as string[] | undefined) ?? [];
+  const allAggregatedImages = [...new Set([...allMentionedImageUrls, ...edgeImageUrls, ...existingMentionUrls])];
+  if (allAggregatedImages.length > 0) {
+    stepParams.mention_image_urls = allAggregatedImages;
+    if (!stepParams.image_url) stepParams.image_url = allAggregatedImages[0];
+  }
+
+  console.log(
+    `[step-executor] Executing step ${stepIndex} (${stepDef.node_type}/${stepDef.provider}) ` +
+    `with inline budget (${INLINE_BUDGET_ATTEMPTS} attempts) → enqueue on exhaustion`,
+  );
+
+  // ─── Execute with inline budget (4 attempts, ~90s) ───────────────
+  const runOnce = async (): Promise<ProviderResult> => {
+    switch (stepDef.provider) {
+      case "kling":
+      case "kling_extension":
+      case "motion_control":
+        return await executeKling(stepParams);
+      case "banana":
+        return await executeBanana(stepParams, SUPABASE_URL, token);
+      case "chat_ai":
+        return await executeChatAi(stepParams);
+      case "remove_bg":
+        return await executeRemoveBg(stepParams);
+      case "merge_audio":
+        return await executeMergeAudio(stepParams);
+      case "mp3_input":
+        return {
+          result_url: String(stepParams.audio_url ?? stepParams.previewUrl ?? ""),
+          outputs: { output_audio: String(stepParams.audio_url ?? stepParams.previewUrl ?? "") },
+          output_type: "video_url" as const,
+          provider_meta: { provider: "mp3_input", passthrough: true },
+        };
+      default:
+        throw new Error(`No executor for provider: ${stepDef.provider}`);
+    }
+  };
+
+  const inlineOutcome = await executeWithInlineBudget<ProviderResult>(
+    runOnce,
+    `[step-executor ${stepIndex} ${stepDef.provider}]`,
+  );
+
+  console.log(
+    `[step-executor] Step ${stepIndex} inline outcome: classification=${inlineOutcome.classification}, ` +
+    `attempts=${inlineOutcome.attempts}/${INLINE_BUDGET_ATTEMPTS}`,
+  );
+
+  // ── SUCCESS path ─────────────────────────────────────────────────
+  if (inlineOutcome.classification === "success" && inlineOutcome.result) {
+    const stepResult = inlineOutcome.result;
+    const isAsync = stepDef.is_async && !!stepResult.task_id;
+    return {
+      step_index: stepIndex, node_id: stepDef.node_id, node_type: stepDef.node_type,
+      provider: stepDef.provider,
+      status: isAsync ? "running" : "completed",
+      result_url: stepResult.result_url ?? undefined,
+      outputs: stepResult.outputs,
+      task_id: stepResult.task_id ?? undefined,
+      output_type: stepResult.output_type,
+      provider_meta: stepResult.provider_meta,
+      is_async: isAsync,
+    };
+  }
+
+  // ── PERMANENT path — refund immediately ──────────────────────────
+  if (inlineOutcome.classification === "permanent") {
+    const errMsg = inlineOutcome.error?.message || "Unknown permanent error";
+    console.error(`[step-executor] Step ${stepIndex} PERMANENT: ${errMsg}`);
+    return {
+      step_index: stepIndex, node_id: stepDef.node_id, node_type: stepDef.node_type,
+      provider: stepDef.provider, status: "failed",
+      output_type: stepDef.output_type, is_async: stepDef.is_async,
+      error: `${errMsg} (permanent error — content/billing/safety, not retried)`,
+    };
+  }
+
+  // ── EXHAUSTED_INLINE path — enqueue for worker ───────────────────
+  // Only enqueue if part of a flow_run. Stand-alone executions → fail.
+  const flowRunId = execution.flow_run_id as string | undefined;
+  if (!flowRunId) {
+    const errMsg = inlineOutcome.error?.message || "Unknown error";
+    console.warn(`[step-executor] Step ${stepIndex} no flow_run_id, skipping queue: ${errMsg}`);
+    return {
+      step_index: stepIndex, node_id: stepDef.node_id, node_type: stepDef.node_type,
+      provider: stepDef.provider, status: "failed",
+      output_type: stepDef.output_type, is_async: stepDef.is_async,
+      error: `${errMsg} (inline budget exhausted, no flow_run_id to queue)`,
+    };
+  }
+
+  const resumePayload = {
+    execution_id: execution.id,
+    step_index: stepIndex,
+    user_id: execution.user_id,
+    flow_id: execution.flow_id,
+    enqueued_at: new Date().toISOString(),
+    first_error: inlineOutcome.error?.message?.substring(0, 500) ?? null,
+  };
+
+  const jobId = await enqueueRetryJob({
+    supabase: supabase as unknown as {
+      rpc: (fn: string, args: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
+    },
+    flow_run_id: flowRunId,
+    step_index: stepIndex,
+    node_id: stepDef.node_id,
+    provider: stepDef.provider,
+    node_type: stepDef.node_type,
+    resume_payload: resumePayload,
+    last_error: inlineOutcome.error?.message ?? "Unknown transient error",
+  });
+
+  if (!jobId) {
+    console.error(`[step-executor] Step ${stepIndex} enqueue FAILED, returning as failed`);
+    return {
+      step_index: stepIndex, node_id: stepDef.node_id, node_type: stepDef.node_type,
+      provider: stepDef.provider, status: "failed",
+      output_type: stepDef.output_type, is_async: stepDef.is_async,
+      error: `${inlineOutcome.error?.message} (inline budget exhausted + enqueue failed)`,
+    };
+  }
+
+  console.log(`[step-executor] Step ${stepIndex} ENQUEUED for retry — job_id=${jobId}`);
+  return {
+    step_index: stepIndex, node_id: stepDef.node_id, node_type: stepDef.node_type,
+    provider: stepDef.provider, status: "queued_for_retry",
+    output_type: stepDef.output_type, is_async: stepDef.is_async,
+    retry_job_id: jobId,
+    error: `Transient error, queued for async retry (job ${jobId.substring(0, 8)}...)`,
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Per-node refund + DB persistence
+   ═══════════════════════════════════════════════════════════ */
+
+async function persistStepOutcomes(
+  supabase: ReturnType<typeof createClient>,
+  execution: Record<string, unknown>,
+  outcomes: StepOutcome[],
+  steps: Array<{ node_id: string; node_type: string }>,
+  userId: string,
+): Promise<{ totalRefunded: number; refundedNodes: string[] }> {
+  // Re-fetch latest step_results to merge atomically
+  const { data: latest } = await supabase
+    .from("pipeline_executions")
+    .select("step_results, status")
+    .eq("id", execution.id as string)
+    .maybeSingle();
+
+  const existing = (latest?.step_results ?? []) as Array<Record<string, unknown>>;
+  const existingByIdx = new Map(existing.map((r) => [r.step_index as number, r]));
+
+  // Track previous status per step for idempotent refund (only refund on transition INTO failed)
+  const prevStatusByIdx = new Map<number, string | undefined>();
+  for (const r of existing) {
+    prevStatusByIdx.set(r.step_index as number, r.status as string | undefined);
+  }
+
+  for (const out of outcomes) {
+    existingByIdx.set(out.step_index, {
+      step_index: out.step_index,
+      node_id: out.node_id,
+      status: out.status,
+      result_url: out.result_url,
+      outputs: out.outputs,
+      task_id: out.task_id,
+      output_type: out.output_type,
+      provider_meta: out.provider_meta,
+      error: out.error,
+      health_probe: out.health_probe,
+      retry_job_id: out.retry_job_id,
+    });
+  }
+  const merged = Array.from(existingByIdx.values()).sort(
+    (a, b) => (a.step_index as number) - (b.step_index as number),
+  );
+
+  // Per-node refund for failed/skipped nodes — IDEMPOTENT GUARD:
+  // Only refund on transition INTO failed/skipped. If the previous status was
+  // already failed/skipped, the refund was already issued — skip.
+  const perNodeCostMap = ((execution.pricing_info as Record<string, unknown>)?.per_node_cost_map ?? {}) as Record<string, number>;
+  const credits_deducted = (execution.credits_deducted as number) ?? 0;
+  let totalRefunded = 0;
+  const refundedNodes: string[] = [];
+
+  for (const out of outcomes) {
+    if (out.status !== "failed" && out.status !== "skipped") continue;
+    const prevStatus = prevStatusByIdx.get(out.step_index);
+    if (prevStatus === "failed" || prevStatus === "skipped") {
+      console.log(`[step-executor] Step ${out.step_index} already in terminal state (${prevStatus}), skipping refund (idempotent)`);
+      continue;
+    }
+    const refundAmount = perNodeCostMap[out.node_id] ?? 0;
+    if (refundAmount <= 0) {
+      console.warn(`[step-executor] No cost found for node ${out.node_id}, skipping refund`);
+      continue;
+    }
+    try {
+      await refundCreditsAtomic(
+        supabase, userId, refundAmount,
+        `Refund: node "${out.node_id}" (${out.provider}) ${out.status} - ${(out.error ?? "").substring(0, 80)}`,
+        (execution.flow_run_id as string) || (execution.flow_id as string),
+      );
+      totalRefunded += refundAmount;
+      refundedNodes.push(out.node_id);
+      console.log(`[step-executor] Refunded ${refundAmount} credits for node ${out.node_id}`);
+    } catch (refundErr) {
+      console.error(`[step-executor] Refund failed for node ${out.node_id}:`, refundErr);
+    }
+  }
+
+  // Recompute pipeline status: completed/running/failed/partial
+  const totalSteps = (execution.total_steps as number) ?? merged.length;
+  const allDone = merged.length === totalSteps;
+  const anyRunning = merged.some((r) => r.status === "running");
+  const anyQueued = merged.some((r) => r.status === "queued_for_retry");
+  const anyFailed = merged.some((r) => r.status === "failed" || r.status === "skipped");
+  const allFailed = allDone && merged.every((r) => r.status === "failed" || r.status === "skipped");
+
+  let pipelineStatus: string;
+  if (anyRunning || anyQueued) pipelineStatus = "running";
+  else if (allDone && allFailed) pipelineStatus = "failed_refunded";
+  else if (allDone && anyFailed) pipelineStatus = "completed_partial";
+  else if (allDone) pipelineStatus = "completed";
+  else pipelineStatus = "running";
+
+  if (anyQueued) {
+    console.log(`[step-executor] Flow has queued_for_retry step(s) — keeping pipeline status as 'running'`);
+  }
+
+  await supabase
+    .from("pipeline_executions")
+    .update({
+      status: pipelineStatus,
+      step_results: merged,
+      updated_at: new Date().toISOString(),
+      ...(totalRefunded > 0 ? { credits_refunded: ((execution.credits_refunded as number) ?? 0) + totalRefunded } : {}),
+    })
+    .eq("id", execution.id as string);
+
+  // Update flow_run aggregate when terminal
+  if ((pipelineStatus === "completed" || pipelineStatus === "completed_partial" || pipelineStatus === "failed_refunded") && execution.flow_run_id) {
+    const aggregatedByNode: Record<string, unknown> = {};
+    for (const sr of merged) {
+      const nodeId = (sr.node_id || `step_${sr.step_index}`) as string;
+      aggregatedByNode[nodeId] = {
+        result_url: sr.result_url ?? undefined,
+        outputs: sr.outputs ?? undefined,
+        output_type: sr.output_type ?? undefined,
+        status: sr.status ?? undefined,
+        error: sr.error ?? undefined,
+      };
+    }
+    const lastCompleted = [...merged].reverse().find((r) => r.status === "completed");
+    const finalRunStatus = pipelineStatus === "failed_refunded"
+      ? "failed_refunded"
+      : (pipelineStatus === "completed_partial" ? "completed_partial" : "completed");
+
+    await supabase
+      .from("flow_runs")
+      .update({
+        status: finalRunStatus,
+        outputs: {
+          result_url: (lastCompleted?.result_url as string | undefined) ?? null,
+          output_type: (lastCompleted?.output_type as string | undefined) ?? null,
+          credit_cost: credits_deducted,
+          credits_refunded: totalRefunded,
+          pipeline_steps: steps.map((s) => s.node_type),
+          by_node: aggregatedByNode,
+          partial_failure: pipelineStatus === "completed_partial",
+        },
+        ...(totalRefunded > 0 ? { error_message: `Partial failure: refunded ${totalRefunded} credits across ${refundedNodes.length} node(s)` } : {}),
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", execution.flow_run_id as string);
+
+    // Auto-save successful results
+    for (const sr of merged) {
+      if (sr.status !== "completed" || !sr.result_url) continue;
+      const fileType = (sr.output_type as string) === "image_url" ? "image"
+        : (sr.output_type as string) === "video_url" ? "video" : "image";
+      try {
+        await supabase.from("user_assets").insert({
+          user_id: userId,
+          name: `workflow-${fileType}-${Date.now()}`,
+          file_url: sr.result_url as string,
+          file_type: fileType,
+          source: "workflow",
+          category: "generated",
+          metadata: { flow_id: execution.flow_id, flow_run_id: execution.flow_run_id, node_id: sr.node_id },
+        });
+      } catch (assetErr) {
+        console.warn("[step-executor] Failed to auto-save asset:", assetErr);
+      }
+    }
+  }
+
+  return { totalRefunded, refundedNodes };
+}
+
+
+/* ═══════════════════════════════════════════════════════════
+   WORKSPACE V2 ENTRY HANDLER
+   ───────────────────────────────────────────────────────────
+   Lifted from execute-pipeline-step. The legacy serve() at the
+   bottom of the original file walked DB rows (pipeline_executions
+   + pipeline_steps) and orchestrated multi-step pipelines with
+   credit refund / retry queue. Workspace V2 is a sandbox: every
+   Run is a single, stateless node call — no DB rows, no credit
+   ledger, no retries. We re-use the per-provider executors above
+   verbatim (executeBanana / executeKling / executeChatAi /
+   executeRemoveBg / executeMergeAudio) so the model-side
+   behaviour stays identical to the legacy editor.
+
+   Request body shape (sent by the workspace frontend):
+     {
+       node_type:    "bananaProNode" | "imageGenNode" | "klingVideoNode"
+                    | "videoGenNode" | "removeBackgroundNode"
+                    | "mergeAudioNode" | "chatAiNode",
+       params:       Record<string, unknown>,
+       inputs:       Record<string, unknown>,
+       mentioned_assets?: Array<{ label, nodeId, url, fieldType }>,
+     }
+
+   Response shape:
+     { type, url, outputs, prompt_used, prompt_source, provider_meta }
+     OR { error: string }
+   ═══════════════════════════════════════════════════════════ */
+
+/**
+ * Resolve the provider from node_type AND the picked model.
+ *
+ * The unified `imageGenNode` / `videoGenNode` exposes models from
+ * multiple providers in a single dropdown (e.g. nano-banana-* and
+ * seedream-* both live under imageGenNode). So the dispatch must look
+ * at `model_name` first, falling back to node_type for legacy keys.
+ *
+ * Provider keys must match HANDLE_SCHEMA above.
+ */
+/**
+ * Video-to-Prompt — Gemini 3.x video understanding.
+ *
+ * Pulls bytes from a signed video URL, attaches as inlineData to a
+ * Gemini multimodal call, and asks the model to break the clip into
+ * scenes using professional photo + film terminology. Returns the
+ * model's text reply.
+ *
+ * Inline data has a hard ~20 MB cap on Gemini's REST endpoint. For
+ * larger files we'd want the Files API (resumable upload → fileUri).
+ * Workspace V2 wireframe stays on inline for simplicity — short test
+ * clips only.
+ */
+async function executeVideoToPrompt(params: Record<string, unknown>): Promise<ProviderResult> {
+  const KEY =
+    Deno.env.get("GOOGLE_AI_STUDIO_KEY") ?? Deno.env.get("GEMINI_API_KEY");
+  if (!KEY) {
+    throw new Error("GEMINI_API_KEY (or GOOGLE_AI_STUDIO_KEY) is not configured");
+  }
+
+  const model = String(params.model_name ?? "gemini-3.1-pro-preview");
+  const videoUrl = String(params.video_url ?? "");
+  if (!videoUrl) {
+    throw new Error("Video to Prompt requires a video input.");
+  }
+  const userExtra = String(params.prompt ?? "").trim();
+  const language = String(params.language ?? "th").toLowerCase();
+  const langName = language === "en" ? "English" : "Thai";
+
+  // Fetch + base64-encode the video bytes (reusing the image helper —
+  // it's a generic byte fetcher, not image-specific).
+  const bytes = await fetchImageBuffer(videoUrl);
+  if (bytes.byteLength > 20 * 1024 * 1024) {
+    throw new Error(
+      `Video is ${(bytes.byteLength / 1024 / 1024).toFixed(1)} MB — Gemini inline cap is 20 MB. Use a shorter clip or wait for the Files API path.`,
+    );
+  }
+  const base64 = bytesToBase64(bytes);
+
+  // MIME from URL extension (good enough for the common cases).
+  let mime = "video/mp4";
+  const lower = videoUrl.toLowerCase();
+  if (lower.includes(".webm")) mime = "video/webm";
+  else if (lower.includes(".mov") || lower.includes(".quicktime")) mime = "video/quicktime";
+  else if (lower.includes(".m4v")) mime = "video/x-m4v";
+  else if (lower.includes(".mkv")) mime = "video/x-matroska";
+
+  // System prompt — keep this short and direct. Gemini follows
+  // structured instructions well; over-prompting hurts more than it
+  // helps for a multimodal task like this.
+  const systemPrompt =
+    `You are a professional cinematographer and photography director analysing a short video clip.\n\n` +
+    `Watch the attached video carefully and break it down scene-by-scene. A "scene" is a continuous shot or a cohesive group of shots that share the same setup; cut whenever the camera, subject, or location changes substantially.\n\n` +
+    `For each scene, describe (use proper photography + film terminology — shot size, camera angle, camera movement, lens feel, lighting setup, key/fill ratio, time of day, colour palette, mood, framing principles like rule-of-thirds or leading lines, depth-of-field, composition):\n` +
+    `  • Subject + composition\n` +
+    `  • Camera (shot size, angle, movement)\n` +
+    `  • Lens feel (wide / standard / telephoto, approx focal length impression)\n` +
+    `  • Lighting + colour grading\n` +
+    `  • Action / motion\n` +
+    `  • Mood / atmosphere\n\n` +
+    `Output format: numbered scenes with short headers. End with a one-sentence overall stylistic summary the user could re-use as a prompt for an image / video generator.\n\n` +
+    `Respond in ${langName}.`;
+
+  const userTurn = userExtra
+    ? `${userExtra}\n\n(Default analysis above applies if the instruction above doesn't override it.)`
+    : "Analyse this video.";
+
+  const requestBody = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { text: `${systemPrompt}\n\n---\n\n${userTurn}` },
+          { inlineData: { mimeType: mime, data: base64 } },
+        ],
+      },
+    ],
+    generationConfig: { responseModalities: ["TEXT"] },
+  };
+
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${KEY}`;
+  console.log(`[video-to-prompt] Calling ${model}, video=${(bytes.byteLength / 1024).toFixed(0)}KB`);
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Server-Timeout": "280",
+    },
+    body: JSON.stringify(requestBody),
+  });
+
+  if (!resp.ok) {
+    const errText = (await resp.text()).substring(0, 500);
+    console.error(`[video-to-prompt] Gemini ${resp.status}:`, errText);
+    if (resp.status === 429 || /billing|quota|exceeded/i.test(errText)) {
+      throw new Error("PROVIDER_BILLING_ERROR");
+    }
+    throw new Error(`Video to Prompt failed (HTTP ${resp.status}): ${errText}`);
+  }
+
+  const data = (await resp.json()) as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  };
+  const text = (data.candidates?.[0]?.content?.parts ?? [])
+    .map((p) => p.text ?? "")
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+
+  if (!text) {
+    throw new Error("Gemini returned no text — try a shorter clip or different model.");
+  }
+
+  return {
+    outputs: { text },
+    output_type: "text" as const,
+    provider_meta: { model, video_bytes: bytes.byteLength, mime },
+  };
+}
+
+function getProviderForNodeType(
+  nodeType: string,
+  modelName?: string,
+): string {
+  const m = String(modelName ?? "").toLowerCase();
+
+  if (nodeType === "bananaProNode" || nodeType === "imageGenNode") {
+    if (m.startsWith("seedream")) return "seedream";
+    if (m.startsWith("gpt-image") || m.startsWith("dall-e")) return "openai";
+    return "banana";
+  }
+  if (nodeType === "klingVideoNode" || nodeType === "videoGenNode") {
+    if (m.startsWith("seedance")) return "seedance";
+    return "kling";
+  }
+  if (nodeType === "seedDreamNode") return "seedream";
+  if (nodeType === "seedDanceNode") return "seedance";
+  if (nodeType === "removeBackgroundNode") return "remove_bg";
+  if (nodeType === "mergeAudioNode") return "merge_audio";
+  if (nodeType === "chatAiNode") return "chat_ai";
+  if (nodeType === "videoToPromptNode") return "video_understanding";
+
+  throw new Error(`Workspace: no provider mapping for node_type "${nodeType}"`);
+}
+
+/**
+ * Provider-aware @-mention rewriter for the workspace V2 handler.
+ *
+ * The frontend tokenises mentions as plain `@<label>` (not the legacy
+ * `@[Label](nodeId)` form) and passes the resolved assets in the
+ * payload's `mentioned_assets` array. This helper:
+ *   - Rewrites tokens inline (provider-specific format)
+ *   - Appends a `[Context: …]` block at the end of the prompt
+ *
+ * For Banana the inline tokens are stripped and the context block
+ * speaks naturally about each attached image. For OpenAI gpt-image-2
+ * the tokens become `Image N (Label)` so the model can address each
+ * reference by index — matching OpenAI's prompting guide.
+ *
+ * Stateless on purpose — the legacy `resolveMentionsInPrompt` depends
+ * on graph rows + pipeline_executions which V2 doesn't have.
+ */
+/**
+ * The mention token format used everywhere in the workspace —
+ * produced by the legacy PromptMentionTextarea (atomic blue chips).
+ *
+ *   @[Label](nodeId)
+ */
+const MENTION_REGEX = /@\[([^\]]+)\]\(([^)]+)\)/g;
+
+/**
+ * Role-aware context instructions per provider — ported from the main
+ * project's `getBananaRoleInstruction` / `getOpenAIImageRoleInstruction`
+ * (mediaforge-backend execute-pipeline-step v18+). Roles come from
+ * the asset node's `referenceType` field — creator picks one of:
+ *   subject | scene | style | object | pose | general
+ * "general" is the default and matches the pre-role behaviour.
+ */
+function getBananaRoleInstruction(role: string): string {
+  switch (role) {
+    case "subject":
+      return "SUBJECT reference — preserve the face, identity, body type, and clothing from this image with maximum fidelity. This is the primary subject of the generated image.";
+    case "scene":
+      return "SCENE/BACKGROUND reference — use ONLY for the setting, environment, lighting, atmosphere, and composition behind the subject. Do NOT copy any people, faces, or characters from this image.";
+    case "style":
+      return "STYLE reference — use ONLY for the visual style, color palette, mood, lighting tone, and artistic aesthetic. Do NOT copy any specific subjects, faces, scenes, or compositions from this image.";
+    case "object":
+      return "OBJECT/PRODUCT reference — include this exact item in the generated image. Preserve its shape, colors, branding, and proportions accurately. Do NOT change the object's design.";
+    case "pose":
+      return "POSE/COMPOSITION reference — copy ONLY the body posture, hand placement, camera angle, and framing from this image. Do NOT copy the face, identity, clothing, or background.";
+    case "general":
+    default:
+      return "use as visual reference";
+  }
+}
+
+function getOpenAIImageRoleInstruction(role: string): string {
+  switch (role) {
+    case "subject":
+      return "[SUBJECT] Preserve the face, identity, body type, and clothing from this image exactly. This is the primary subject of the generated image — do NOT alter facial features.";
+    case "scene":
+      return "[BACKGROUND] Use ONLY for setting, environment, lighting, atmosphere, and composition. Do NOT copy any people, faces, or characters from this image.";
+    case "style":
+      return "[STYLE] Use ONLY for the visual style, color palette, mood, and artistic aesthetic. Do NOT copy specific subjects, faces, scenes, or compositions.";
+    case "object":
+      return "[OBJECT] Include this exact item in the generated image. Preserve shape, colors, branding, and proportions accurately. Do NOT alter the object's design.";
+    case "pose":
+      return "[POSE] Copy ONLY the body posture, hand placement, camera angle, and framing. Do NOT copy the face, identity, clothing, or background.";
+    case "general":
+    default:
+      return "use as reference";
+  }
+}
+
+/**
+ * Inline-only mention rewriter. Replaces `@[Label](nodeId)` and plain
+ * `@<label>` tokens with provider-specific position references —
+ * **without** appending the `[Context: …]` block.
+ *
+ * Use this on every string param that may carry mentions. Legacy
+ * executeOneStep scans `Object.entries(stepParams)` and runs an
+ * equivalent loop — V2 mirrors that pattern so multi-prompt nodes
+ * (negative_prompt, system_prompt, etc.) stay consistent.
+ */
+function rewriteMentionsInline(
+  text: string,
+  mentioned: Array<{ label?: string; nodeId?: string; url?: string | null; fieldType?: "image" | "video" | null; role?: string }>,
+  provider: string,
+): string {
+  if (!text) return text;
+  const imageMentions = mentioned.filter(
+    (m) => m && m.fieldType === "image" && typeof m.url === "string" && m.url,
+  );
+  if (imageMentions.length === 0) {
+    return text.replace(MENTION_REGEX, (_full, label) => label);
+  }
+  const indexByNodeId = new Map<string, number>();
+  imageMentions.forEach((m, i) => {
+    if (m.nodeId) indexByNodeId.set(m.nodeId, i);
+  });
+  const indexByLabel = new Map<string, number>();
+  imageMentions.forEach((m, i) => {
+    if (m.label) indexByLabel.set(m.label, i);
+  });
+  let out = text.replace(MENTION_REGEX, (_full, label: string, nodeId: string) => {
+    const idx = indexByNodeId.get(nodeId);
+    if (idx === undefined) return label;
+    return provider === "openai" ? `Image ${idx + 1} (${label})` : `[${label}]`;
+  });
+  out = out.replace(/@([^\s@[]+)/g, (full, name: string) => {
+    const idx = indexByLabel.get(name);
+    if (idx === undefined) return full;
+    return provider === "openai" ? `Image ${idx + 1} (${name})` : `[${name}]`;
+  });
+  return out;
+}
+
+/**
+ * Append the `[Context: …]` block once, on the primary prompt field.
+ * Banana names attachments by `[Label]` (matches the inline anchors
+ * `rewriteMentionsInline` placed in the prompt). OpenAI names them
+ * by `Image N (Label)` because gpt-image-2's multipart form keeps
+ * text and attachments in separate fields.
+ *
+ * Each line ends with a role-specific instruction so the model knows
+ * how to USE each attachment (subject vs scene vs style vs object vs
+ * pose). Defaults to a generic "use as reference" when role is not
+ * set — matches pre-role behaviour.
+ */
+function appendMentionContext(
+  text: string,
+  mentioned: Array<{ label?: string; nodeId?: string; url?: string | null; fieldType?: "image" | "video" | null; role?: string }>,
+  provider: string,
+): string {
+  const imageMentions = mentioned.filter(
+    (m) => m && m.fieldType === "image" && typeof m.url === "string" && m.url,
+  );
+  if (imageMentions.length === 0) return text;
+  const lines = imageMentions.map((m, i) => {
+    const role = (m.role ?? "general").toLowerCase();
+    if (provider === "openai") {
+      const ri = getOpenAIImageRoleInstruction(role);
+      return `Image ${i + 1} = "${m.label ?? ""}" — ${ri}`;
+    }
+    const ri = getBananaRoleInstruction(role);
+    return `[${m.label ?? ""}] = image ${i + 1} (attached) — ${ri}`;
+  });
+  // Squash any double-spaces left over from earlier strip cases, then
+  // append. Mirror the legacy whitespace cleanup at the same spot.
+  const cleaned = text.replace(/\s{2,}/g, " ").trim();
+  return `${cleaned}\n\n[Context: ${lines.join(". ")}.]`;
+}
+
+// Note: the old `applyMentionContext` wrapper has been removed —
+// callers now use `rewriteMentionsInline` (per-string) +
+// `appendMentionContext` (once on prompt) so role-aware context can
+// be threaded through without re-walking every param.
+
+/**
+ * OpenAI gpt-image-2 executor.
+ *
+ * Mirrors the spec used by the legacy product:
+ *   - `/v1/images/edits` when ref images are present (multipart with
+ *     repeated `image` parts — OpenAI SDK convention, NOT `image[]`)
+ *   - `/v1/images/generations` when text-only (JSON body)
+ *   - Conservative param set on /edits (no background, no
+ *     output_format) to dodge the 403s the legacy editor was seeing.
+ *   - Surfaces OpenAI's verbatim error message — they're the most
+ *     useful diagnostic for billing / safety / quota issues.
+ */
+async function executeOpenAIImage2(
+  params: Record<string, unknown>,
+  supabase: ReturnType<typeof createClient>,
+): Promise<ProviderResult> {
+  const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not configured");
+
+  const prompt = String(params.prompt ?? "");
+  if (!prompt) throw new Error("A prompt is required.");
+
+  const model = String(params.model_name ?? params.model ?? "gpt-image-2");
+  const quality = String(params.quality ?? "medium");
+  const size = String(params.size ?? "1024x1024");
+  const outputFormat = String(params.output_format ?? "png");
+  // `background` accepts "auto" | "transparent" | "opaque". Transparent
+  // requires the output format to be png or webp; OpenAI rejects it
+  // with jpeg, so we silently force-fallback to "auto" in that case
+  // rather than letting the user hit an error from the provider.
+  const rawBackground = String(params.background ?? "auto");
+  const background =
+    rawBackground === "transparent" && outputFormat === "jpeg"
+      ? "auto"
+      : rawBackground;
+  const moderation = String(params.moderation ?? "auto");
+
+  const refUrls: string[] =
+    (params.mention_image_urls as string[] | undefined) ??
+    (params.image_url ? [String(params.image_url)] : []);
+
+  const useEdits = refUrls.length > 0;
+  let response: Response;
+
+  if (useEdits) {
+    const form = new FormData();
+    form.append("model", model);
+    form.append("prompt", prompt);
+    form.append("quality", quality);
+    form.append("size", size);
+    form.append("n", "1");
+
+    // OpenAI's /v1/images/edits multipart convention:
+    //   - 1 image  → field name `image`     (singular)
+    //   - 2+ images → field name `image[]`  (array syntax)
+    //
+    // Repeated `image` parts (without []) trips the new API guard:
+    //   "Duplicate parameter: 'image'. You provided multiple values
+    //    for this parameter, whereas only one is allowed."
+    // The recommended fix in their error is the `image[]` form, which
+    // we apply once we know how many refs we're shipping.
+    const fieldName = refUrls.length > 1 ? "image[]" : "image";
+    let loaded = 0;
+    for (let i = 0; i < refUrls.length; i++) {
+      try {
+        const bytes = await fetchImageBuffer(refUrls[i]);
+        let mime = "image/png";
+        let ext = "png";
+        if (bytes[0] === 0xFF && bytes[1] === 0xD8) { mime = "image/jpeg"; ext = "jpg"; }
+        else if (bytes[0] === 0x52 && bytes[1] === 0x49) { mime = "image/webp"; ext = "webp"; }
+        const blob = new Blob([bytes], { type: mime });
+        form.append(fieldName, blob, `ref_${i}.${ext}`);
+        loaded++;
+      } catch (err) {
+        console.warn(`[openai-image-2] Failed to load ref ${i}:`, err);
+      }
+    }
+    if (loaded === 0) {
+      throw new Error("All reference images failed to load");
+    }
+
+    response = await fetch("https://api.openai.com/v1/images/edits", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      body: form,
+    });
+  } else {
+    response = await fetch("https://api.openai.com/v1/images/generations", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model,
+        prompt,
+        n: 1,
+        size,
+        quality,
+        output_format: outputFormat,
+        background,
+        moderation,
+      }),
+    });
+  }
+
+  if (!response.ok) {
+    const status = response.status;
+    const errorText = await response.text();
+    let errorMsg = errorText.substring(0, 500);
+    try {
+      const errJson = JSON.parse(errorText);
+      errorMsg = (errJson as { error?: { message?: string } })?.error?.message ?? errorMsg;
+    } catch { /* keep raw text */ }
+
+    console.error(`[openai-image-2] HTTP ${status}: ${errorMsg.substring(0, 200)}`);
+
+    if (status === 429 || /billing|quota|exceeded|insufficient/i.test(errorText)) {
+      throw new Error("PROVIDER_BILLING_ERROR");
+    }
+    if (status === 401 || status === 403) {
+      throw new Error(`OpenAI ${status}: ${errorMsg}`);
+    }
+    if (status >= 500) {
+      throw new Error(`OpenAI ${status}: temporary upstream error — ${errorMsg}`);
+    }
+    throw new Error(`GPT Image 2 failed: ${errorMsg}`);
+  }
+
+  const result = (await response.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
+  const item = result.data?.[0];
+  const b64 = item?.b64_json;
+  if (!b64) {
+    throw new Error("OpenAI returned no image data");
+  }
+
+  const ext = outputFormat === "jpeg" ? "jpg" : outputFormat;
+  const mime = `image/${outputFormat === "jpg" ? "jpeg" : outputFormat}`;
+  const fileName = `pipeline/${Date.now()}-openai.${ext}`;
+  const binaryData = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+
+  let publicUrl = `data:${mime};base64,${b64}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from("ai-media")
+    .upload(fileName, binaryData, { contentType: mime, upsert: true });
+
+  if (uploadError) {
+    console.error("[openai-image-2] Upload error:", uploadError);
+  } else {
+    const { data: urlData, error: signError } = await supabase.storage
+      .from("ai-media")
+      .createSignedUrl(fileName, 60 * 60 * 24 * 7);
+    if (!signError && urlData?.signedUrl) {
+      publicUrl = urlData.signedUrl;
+    } else {
+      const { data: pubData } = supabase.storage.from("ai-media").getPublicUrl(fileName);
+      publicUrl = pubData.publicUrl;
+    }
+  }
+
+  return {
+    result_url: publicUrl,
+    outputs: { output_image: publicUrl },
+    output_type: "image_url" as const,
+    provider_meta: { model },
+  };
+}
+
+/** Server-side mirror of the frontend `MentionedAsset` shape. */
+export interface MentionedAssetSrv {
+  /** "asset" = AssetNode (image/video); "element" = saved/creator
+   *  ElementNode resolved to a Kling Omni element entry. */
+  kind?: "asset" | "element";
+  label?: string;
+  nodeId?: string;
+  /** Asset-only. */
+  url?: string | null;
+  fieldType?: "image" | "video" | "audio" | null;
+  role?: string;
+  /** Element-only. */
+  name?: string;
+  reference_image_urls?: string[];
+  frontal_image_url?: string;
+  brand_element_id?: string;
+}
+
+interface WorkspaceRunBody {
+  node_type?: string;
+  params?: Record<string, unknown>;
+  inputs?: Record<string, unknown>;
+  mentioned_assets?: MentionedAssetSrv[];
+  /** Async-poll mode (Kling video tasks). Frontend resends after the
+   *  initial Run returned a `task_id` and an empty URL. */
+  action?: "poll_kling";
+  task_id?: string;
+  poll_endpoint?: string;
+}
+
+serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+
+  const startTime = Date.now();
+  const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+  const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+  try {
+    /* ─── Auth ─────────────────────────────────────────────── */
+    const authHeader = req.headers.get("authorization");
+    if (!authHeader) {
+      return new Response(
+        JSON.stringify({ error: "Authorization required" }),
+        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+    const token = authHeader.replace("Bearer ", "");
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) {
+      return new Response(
+        JSON.stringify({ error: "Invalid token" }),
+        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    /* ─── Parse body ───────────────────────────────────────── */
+    const body = (await req.json()) as WorkspaceRunBody;
+
+    /* ─── Async poll path (Kling video tasks) ──────────────── */
+    if (body.action === "poll_kling") {
+      const taskId = String(body.task_id ?? "").trim();
+      const pollEndpoint = String(body.poll_endpoint ?? "").trim();
+      if (!taskId || !pollEndpoint) {
+        return new Response(
+          JSON.stringify({ error: "task_id and poll_endpoint required for poll_kling" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      // Whitelist Kling host AND constrain the path EXACTLY so this
+      // can't be abused as an open proxy. The previous regex matched
+      // only the prefix, so a poll_endpoint like
+      // `https://api.klingai.com/v1/videos/../../foo` could in theory
+      // pass (URL-normalisation-dependent). Tighten to: only the four
+      // known endpoints. taskId is appended by THIS handler (line
+      // below), not the caller, so the endpoint here must be exactly
+      // 3 path segments.
+      const ALLOWED_KIND = new Set([
+        "omni-video",
+        "image2video",
+        "text2video",
+        "motion-control",
+      ]);
+      let pollUrlOk = false;
+      try {
+        const u = new URL(pollEndpoint);
+        const segs = u.pathname.replace(/^\/+/, "").split("/").filter(Boolean);
+        // Expected: ["v1","videos","<kind>"] — exactly 3 segments.
+        pollUrlOk =
+          u.protocol === "https:" &&
+          u.hostname === "api.klingai.com" &&
+          segs.length === 3 &&
+          segs[0] === "v1" &&
+          segs[1] === "videos" &&
+          ALLOWED_KIND.has(segs[2]);
+      } catch {
+        pollUrlOk = false;
+      }
+      if (!pollUrlOk) {
+        return new Response(
+          JSON.stringify({ error: "poll_endpoint must be a Kling video endpoint" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const KLING_AK =
+        Deno.env.get("KLING_ACCESS_KEY_ID") ??
+        Deno.env.get("KLING_AK") ??
+        Deno.env.get("KLING_ACCESS_KEY");
+      const KLING_SK =
+        Deno.env.get("KLING_SECRET_KEY") ??
+        Deno.env.get("KLING_SK") ??
+        Deno.env.get("KLING_SECRET");
+      if (!KLING_AK || !KLING_SK) {
+        return new Response(
+          JSON.stringify({ error: "Kling credentials missing on server" }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const jwt = await generateKlingJWT(KLING_AK, KLING_SK);
+      const pollUrl = `${pollEndpoint}/${encodeURIComponent(taskId)}`;
+      const r = await fetch(pollUrl, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${jwt}` },
+      });
+      if (!r.ok) {
+        const errText = await r.text().catch(() => "");
+        return new Response(
+          JSON.stringify({
+            status: "polling_error",
+            http_status: r.status,
+            message: errText.substring(0, 300),
+          }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const payload = await r.json().catch(() => ({} as Record<string, unknown>));
+      const data = (payload?.data ?? {}) as Record<string, unknown>;
+      const status = String(data.task_status ?? "").toLowerCase();
+      const statusMsg = String(data.task_status_msg ?? payload?.message ?? "");
+      let videoUrl = "";
+      if (status === "succeed" || status === "success") {
+        const tr = (data.task_result ?? {}) as Record<string, unknown>;
+        const videos = Array.isArray(tr.videos) ? (tr.videos as Array<Record<string, unknown>>) : [];
+        videoUrl = videos.length > 0 ? String(videos[0]?.url ?? "") : "";
+      }
+      return new Response(
+        JSON.stringify({
+          status,             // "submitted" | "processing" | "succeed" | "failed"
+          task_id: taskId,
+          url: videoUrl,
+          message: statusMsg,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    const nodeType = String(body.node_type ?? "");
+    const rawParams = body.params ?? {};
+    const inputs = body.inputs ?? {};
+    const mentioned = body.mentioned_assets ?? [];
+
+    if (!nodeType) {
+      return new Response(
+        JSON.stringify({ error: "node_type is required" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    const provider = getProviderForNodeType(
+      nodeType,
+      rawParams.model_name as string | undefined,
+    );
+
+    /* ─── Build resolved params ───────────────────────────── */
+    // Start from caller params, then overlay edge-resolved inputs
+    // (mapped through HANDLE_SCHEMA so e.g. ref_image → image_url)
+    // and mention URLs as a fallback ref_image / mention_image_urls.
+    const params: Record<string, unknown> = { ...rawParams };
+
+    // Did the caller provide a text prompt via an upstream Text edge?
+    // Used to populate the response's prompt_source field.
+    const textInputUsed =
+      typeof inputs.text === "string" ||
+      typeof inputs.context === "string" ||
+      typeof inputs.context_text === "string";
+    // Prefer the upstream Text wire whenever the node's own Prompt
+    // field is empty OR whitespace-only. The previous truthy check
+    // let prompts of "\n" (or " ") through, which both made
+    // executeBanana receive a literal newline AND skipped the
+    // @[mention](id) tokens that lived in `inputs.text` — the model
+    // then saw context block but no instruction, and just remixed
+    // the refs randomly.
+    const promptParamIsBlank = !String(params.prompt ?? "").trim();
+    if (typeof inputs.text === "string" && promptParamIsBlank) {
+      params.prompt = inputs.text;
+    }
+    const contextParamIsBlank = !String(params.context_text ?? "").trim();
+    if (typeof inputs.context === "string" && contextParamIsBlank) {
+      params.context_text = inputs.context;
+    }
+
+    // Edge inputs → internal_key via HANDLE_SCHEMA.
+    // Frontend may send a single value OR an array of values per
+    // targetHandle (when the user wires multiple sources into the same
+    // image port — e.g. 14 refs into Banana). Normalise to array first.
+    const edgeImageUrls: string[] = [];
+    for (const [targetHandle, value] of Object.entries(inputs)) {
+      // text/context already mapped above
+      if (targetHandle === "text" || targetHandle === "context") continue;
+
+      const values = Array.isArray(value) ? value : [value];
+
+      // Object/array values bypass the URL string path entirely —
+      // they're complex payloads (e.g. ElementNode → Kling Omni
+      // `elements`: [{name, reference_image_urls, frontal_image_url}]).
+      // Map through HANDLE_SCHEMA when the handle is registered, else
+      // pass through to params verbatim.
+      const objectVals = values.filter(
+        (v): v is Record<string, unknown> =>
+          v !== null && typeof v === "object" && !Array.isArray(v),
+      );
+      if (objectVals.length > 0 && objectVals.length === values.length) {
+        const handleDef = normalizeHandle(provider, targetHandle);
+        const key = handleDef?.internal_key ?? targetHandle;
+        const existing = params[key];
+        const merged = Array.isArray(existing)
+          ? [...(existing as unknown[]), ...objectVals]
+          : objectVals;
+        params[key] = merged;
+        continue;
+      }
+
+      const stringVals = values.filter(
+        (v): v is string => typeof v === "string" && v.length > 0,
+      );
+      if (stringVals.length === 0) continue;
+
+      const handleDef = normalizeHandle(provider, targetHandle);
+      if (handleDef) {
+        for (const v of stringVals) {
+          try {
+            validateEdgeValue(v, handleDef.data_type, targetHandle);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return new Response(
+              JSON.stringify({ error: msg }),
+              { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+            );
+          }
+          if (handleDef.internal_key === "image_url" && handleDef.data_type === "image") {
+            edgeImageUrls.push(v);
+          }
+        }
+        if (handleDef.internal_key === "image_url" && handleDef.data_type === "image") {
+          // Use the first ref as the primary image_url; the rest live
+          // in mention_image_urls (merged below) for multi-image
+          // dispatchers (Banana, OpenAI gpt-image-2).
+          if (!params[handleDef.internal_key]) {
+            params[handleDef.internal_key] = stringVals[0];
+          }
+        } else {
+          // Non-image keys: last value wins (uncommon for them to
+          // duplicate; keep behaviour simple).
+          params[handleDef.internal_key] = stringVals[stringVals.length - 1];
+        }
+      } else {
+        // Unknown handle for this provider — pass through (array-ify
+        // back to scalar when there's just one).
+        params[targetHandle] = stringVals.length === 1 ? stringVals[0] : stringVals;
+      }
+    }
+
+    // Mentioned assets → image_url / mention_image_urls fallback.
+    // Kling owns its mentions inside executeKlingOmni (positional
+    // `@Element{N}` / `@Image{N}` rewrite), so this fallback is for
+    // banana / openai / chat_ai only.
+    const mentionImageUrls = mentioned
+      .filter(
+        (m) =>
+          m &&
+          m.kind !== "element" &&
+          m.fieldType === "image" &&
+          typeof m.url === "string" &&
+          m.url,
+      )
+      .map((m) => m.url as string);
+    if (provider !== "kling" && mentionImageUrls.length > 0) {
+      if (provider === "banana" || provider === "openai") {
+        const merged = Array.from(new Set([
+          ...((params.mention_image_urls as string[] | undefined) ?? []),
+          ...mentionImageUrls,
+          ...edgeImageUrls,
+        ]));
+        params.mention_image_urls = merged;
+        if (!params.image_url) params.image_url = merged[0];
+      } else {
+        if (!params.image_url) params.image_url = mentionImageUrls[0];
+      }
+    }
+
+    /* ─── Mention rewrite (mirrors legacy executeOneStep) ─── */
+    // Kling owns its rewrite (positional indexing — different syntax
+    // from Banana/OpenAI). Skip the generic helpers when provider is
+    // kling to avoid stripping `@[Label](nodeId)` tokens before the
+    // Kling executor can see them.
+    if (provider !== "kling") {
+      // Step 1: inline-rewrite tokens in EVERY string param so that
+      // negative_prompt / system_prompt / context_text / etc. all get
+      // their `@[Label](id)` anchors converted, not just `prompt`.
+      // Legacy iterates `Object.entries(stepParams)` for the same reason.
+      for (const [key, val] of Object.entries(params)) {
+        if (typeof val !== "string") continue;
+        if (!val.includes("@")) continue; // fast-path: no token at all
+        params[key] = rewriteMentionsInline(val, mentioned, provider);
+      }
+      // Step 2: append the `[Context: …]` block once, on the primary
+      // prompt. Banana / OpenAI both need the model to know which
+      // attachment maps to which name; doing this per-param would
+      // duplicate the block on every field.
+      if (typeof params.prompt === "string") {
+        params.prompt = appendMentionContext(params.prompt, mentioned, provider);
+      }
+    }
+
+    /* ─── Dispatch ────────────────────────────────────────── */
+    let result: ProviderResult;
+    switch (provider) {
+      case "banana":
+        result = await executeBanana(params, supabase);
+        break;
+      case "kling":
+        result = await executeKling(params, supabase, mentioned);
+        break;
+      case "chat_ai":
+        result = await executeChatAi(params);
+        break;
+      case "remove_bg":
+        result = await executeRemoveBg(params, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+        break;
+      case "merge_audio":
+        result = await executeMergeAudio(params);
+        break;
+      case "openai":
+        result = await executeOpenAIImage2(params, supabase);
+        break;
+      case "video_understanding":
+        result = await executeVideoToPrompt(params);
+        break;
+      case "seedream":
+      case "seedance":
+        // Not yet ported from the legacy editor — fail loud rather than
+        // silently falling through to Banana/Kling and producing nonsense.
+        throw new Error(
+          `Provider "${provider}" not yet implemented in workspace-run-node. ` +
+            `Pick a Banana / Kling / GPT Image 2 model for now.`,
+        );
+      default:
+        throw new Error(`No executor for provider "${provider}"`);
+    }
+
+    /* ─── Format response ─────────────────────────────────── */
+    const responseType =
+      result.output_type === "video_url" ? "video" :
+      result.output_type === "text"      ? "text"  :
+      "image";
+
+    const promptUsed = String(params.prompt ?? params.system_prompt ?? "");
+    const promptSource = textInputUsed ? "text_input_edge" : "prompt_param";
+
+    const durationMs = Date.now() - startTime;
+    console.log(
+      `[workspace-run-node] ${nodeType} (${provider}) done in ${durationMs}ms ` +
+      `-> ${responseType}${result.task_id ? " task=" + result.task_id : ""}`,
+    );
+
+    // Surface text outputs at the top level so the frontend's `r.text`
+    // path picks them up (used by Chat AI, Video to Prompt, etc.).
+    const textOut =
+      result.output_type === "text"
+        ? (result.outputs?.text as string | undefined) ??
+          (result.outputs ? Object.values(result.outputs)[0] : undefined)
+        : undefined;
+
+    return new Response(
+      JSON.stringify({
+        type: responseType,
+        url: result.result_url,
+        text: textOut,
+        outputs: result.outputs,
+        task_id: result.task_id,
+        prompt_used: promptUsed,
+        prompt_source: promptSource,
+        provider_meta: result.provider_meta,
+        node_type: nodeType,
+      }),
+      { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+    );
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[workspace-run-node] error:", msg);
+    return new Response(
+      JSON.stringify({ error: msg }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+    );
+  }
+});
