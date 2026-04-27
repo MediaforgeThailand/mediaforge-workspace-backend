@@ -229,6 +229,11 @@ const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     video:         { internal_key: "video_url",      data_type: "video" },
     ref_video:     { internal_key: "video_url",      data_type: "video" },
   },
+  tripo3d: {
+    image:         { internal_key: "image_url",      data_type: "image" },
+    image_input:   { internal_key: "image_url",      data_type: "image" },
+    ref_image:     { internal_key: "image_url",      data_type: "image" },
+  },
 };
 
 /** Resolve a targetHandle to the correct internal param key for a given provider */
@@ -1405,6 +1410,154 @@ async function executeChatAi(params: Record<string, unknown>): Promise<ProviderR
   return { result_url: content, outputs: { output_text: content }, output_type: "text", provider_meta: { model } };
 }
 
+/* ═══════════════════════════════════════════════════════════
+   Tripo3D — Image to 3D Model (ASYNC pattern)
+   ═══════════════════════════════════════════════════════════
+ *
+ * Tripo3D image_to_model jobs commonly take 60-300s — well past
+ * the ~150s edge-function CPU budget. We follow the same pattern
+ * as Kling: the executor SUBMITS the task and returns the
+ * task_id + poll_endpoint immediately. The frontend then polls
+ * via `action="poll_tripo3d"` (one short edge-fn call per check)
+ * until the job lands a GLB URL or fails. Each poll is cheap so
+ * we never run into the worker resource limit.
+ *
+ * Env vars (either name works — the user's secret is `TRIO_API_KEY`,
+ * Tripo's own naming convention is `TRIPO_API_KEY`):
+ *   - TRIO_API_KEY
+ *   - TRIPO_API_KEY
+ */
+/* Tripo3D `model_version` strings — pulled directly from the
+ * official docs at platform.tripo3d.ai/docs/generation. The
+ * date suffix is part of the contract; without it the API
+ * returns code 2017 "version invalid".
+ *
+ * Default is `v3.1-20260211` (gold standard, what Freepik /
+ * Pikaso label as "Tripo v3.1"). `P1-20260311` is even newer
+ * but still flagged as preview; expose it as an option only.
+ *
+ * Last verified against the docs: 2026-04-28. */
+const TRIPO3D_MODEL_VERSIONS: Record<string, string> = {
+  "tripo3d-p1":     "P1-20260311",
+  "tripo3d-v3.1":   "v3.1-20260211",
+  "tripo3d-v3.0":   "v3.0-20250812",
+  "tripo3d-turbo":  "Turbo-v1.0-20250506",
+  "tripo3d-v2.5":   "v2.5-20250123",
+  "tripo3d-v2.0":   "v2.0-20240919",
+  "tripo3d-v1.4":   "v1.4-20240625",
+};
+
+const TRIPO3D_POLL_ENDPOINT = "https://api.tripo3d.ai/v2/openapi/task";
+
+async function executeTripo3D(
+  params: Record<string, unknown>,
+  _supabase: ReturnType<typeof createClient>,
+): Promise<ProviderResult> {
+  const KEY =
+    Deno.env.get("TRIO_API_KEY") ??
+    Deno.env.get("TRIPO_API_KEY") ??
+    Deno.env.get("TRIPO3D_API_KEY");
+  if (!KEY) {
+    throw new Error(
+      "TRIO_API_KEY (or TRIPO_API_KEY) is not configured — set it in Supabase project secrets.",
+    );
+  }
+
+  // Resolve image: prefer a wired `image` input, else a mention.
+  const imageUrl =
+    (params.image_url as string | undefined) ??
+    (params.image as string | undefined) ??
+    (Array.isArray(params.mention_image_urls)
+      ? (params.mention_image_urls as string[])[0]
+      : undefined);
+  if (!imageUrl) {
+    throw new Error("Image to 3D needs an image input — wire an asset / generation into the `image` port.");
+  }
+
+  const modelKey = String(params.model_name ?? "tripo3d-v3.1");
+  const modelVersion = TRIPO3D_MODEL_VERSIONS[modelKey] ?? TRIPO3D_MODEL_VERSIONS["tripo3d-v3.1"];
+
+  const texture = String(params.texture ?? "true") === "true";
+  const pbr = String(params.pbr ?? "true") === "true";
+  const autoSize = String(params.auto_size ?? "true") === "true";
+
+  const submitBody: Record<string, unknown> = {
+    type: "image_to_model",
+    file: { type: "url", url: imageUrl },
+    model_version: modelVersion,
+    texture,
+    pbr,
+    auto_size: autoSize,
+  };
+
+  console.log(
+    `[tripo3d] Submitting image_to_model task (model=${modelVersion}, ` +
+      `texture=${texture}, pbr=${pbr})`,
+  );
+
+  const submitRes = await fetch(TRIPO3D_POLL_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${KEY}`,
+    },
+    body: JSON.stringify(submitBody),
+  });
+
+  if (!submitRes.ok) {
+    const errText = (await submitRes.text()).substring(0, 500);
+    console.error(`[tripo3d] submit ${submitRes.status}:`, errText);
+    if (submitRes.status === 401 || submitRes.status === 403) {
+      throw new Error(
+        `Tripo3D authentication failed (HTTP ${submitRes.status}) — check TRIO_API_KEY.`,
+      );
+    }
+    if (submitRes.status === 429 || /billing|quota|insufficient/i.test(errText)) {
+      throw new Error("PROVIDER_BILLING_ERROR");
+    }
+    // Surface invalid-version specifically so the user knows to pick a
+    // different model in the dropdown — Tripo3D rejects unrecognised
+    // version strings with code 2017.
+    if (/version value is invalid|code"?\s*:\s*2017/i.test(errText)) {
+      throw new Error(
+        `Tripo3D ปฏิเสธ version "${modelVersion}" — เลือก model อื่นใน dropdown ` +
+          `(v2.5 / Turbo / v2.0 / v1.4 ตามที่ระบบรองรับ)`,
+      );
+    }
+    throw new Error(`Tripo3D submit failed (HTTP ${submitRes.status}): ${errText}`);
+  }
+
+  const submitData = await submitRes.json() as {
+    code?: number;
+    data?: { task_id?: string };
+    message?: string;
+  };
+  if (submitData.code !== undefined && submitData.code !== 0) {
+    throw new Error(`Tripo3D returned error code ${submitData.code}: ${submitData.message ?? "no detail"}`);
+  }
+  const taskId = String(submitData?.data?.task_id ?? "").trim();
+  if (!taskId) {
+    throw new Error("Tripo3D didn't return a task_id");
+  }
+
+  console.log(`[tripo3d] task submitted task_id=${taskId.slice(0, 8)}…`);
+
+  /* Async hand-off — frontend polls via action="poll_tripo3d" until
+   * the job lands. Each poll is one quick edge-fn call (no risk of
+   * worker timeout) so even multi-minute jobs finish reliably. */
+  return {
+    task_id: taskId,
+    outputs: {},
+    output_type: "image_url" as const,
+    provider_meta: {
+      provider: "tripo3d",
+      model_version: modelVersion,
+      poll_endpoint: TRIPO3D_POLL_ENDPOINT,
+      task_id: taskId,
+    },
+  };
+}
+
 /**
  * executeRemoveBg — calls our remove-background edge function (Replicate BiRefNet).
  */
@@ -2323,6 +2476,7 @@ function getProviderForNodeType(
   if (nodeType === "mergeAudioNode") return "merge_audio";
   if (nodeType === "chatAiNode") return "chat_ai";
   if (nodeType === "videoToPromptNode") return "video_understanding";
+  if (nodeType === "imageTo3dNode") return "tripo3d";
 
   throw new Error(`Workspace: no provider mapping for node_type "${nodeType}"`);
 }
@@ -2672,11 +2826,18 @@ interface WorkspaceRunBody {
   params?: Record<string, unknown>;
   inputs?: Record<string, unknown>;
   mentioned_assets?: MentionedAssetSrv[];
-  /** Async-poll mode (Kling video tasks). Frontend resends after the
-   *  initial Run returned a `task_id` and an empty URL. */
-  action?: "poll_kling";
+  /** Async-poll mode (Kling video tasks, Tripo3D 3D-model tasks).
+   *  Frontend resends after the initial Run returned a `task_id`
+   *  and an empty URL. Each provider has its own action so we can
+   *  whitelist the upstream URL per provider. */
+  action?: "poll_kling" | "poll_tripo3d" | "mirror_tripo_url";
   task_id?: string;
   poll_endpoint?: string;
+  /** For action="mirror_tripo_url": the Tripo3D CDN URL to mirror
+   *  into Supabase storage so model-viewer can fetch it across
+   *  CORS. Used to migrate generations that were created before
+   *  the inline mirror was deployed in poll_tripo3d. */
+  url?: string;
 }
 
 serve(async (req) => {
@@ -2707,6 +2868,126 @@ serve(async (req) => {
 
     /* ─── Parse body ───────────────────────────────────────── */
     const body = (await req.json()) as WorkspaceRunBody;
+
+    /* ─── On-demand Tripo URL mirror ──────────────────────────
+     *
+     * Tripo3D's CDN (`tripo-data.*.tripo3d.com`) does NOT send
+     * `Access-Control-Allow-Origin`, so the browser blocks
+     * model-viewer's WebGL fetch — the GLB never loads, only the
+     * still poster image renders. The poll_tripo3d action mirrors
+     * GLB+PNG into Supabase storage at task-completion time, but
+     * generations created BEFORE that fix was deployed kept the
+     * raw Tripo URLs and stay broken.
+     *
+     * This endpoint is the migration path: hand it any Tripo URL
+     * and it returns a Supabase signed URL for the same asset. The
+     * frontend caches the mapping per session via a hook so a tile
+     * triggers ONE mirror call and reuses the result everywhere.
+     *
+     * Hard-whitelisted to *.tripo3d.com hosts so this can't be
+     * abused as a generic open proxy. */
+    if (body.action === "mirror_tripo_url") {
+      const srcUrl = String(body.url ?? "").trim();
+      if (!srcUrl) {
+        return new Response(
+          JSON.stringify({ error: "url required for mirror_tripo_url" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      let hostOk = false;
+      try {
+        const u = new URL(srcUrl);
+        hostOk =
+          u.protocol === "https:" &&
+          (u.hostname.endsWith(".tripo3d.com") || u.hostname === "tripo3d.com");
+      } catch {
+        hostOk = false;
+      }
+      if (!hostOk) {
+        return new Response(
+          JSON.stringify({ error: "Only tripo3d.com URLs may be mirrored" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      // Pick the extension off the path (signed URLs append a
+      // long query string we want to ignore).
+      const pathOnly = srcUrl.split("?")[0].split("#")[0];
+      const m = pathOnly.match(/\.(glb|gltf|usdz|obj|fbx|png|jpe?g|webp|avif)$/i);
+      const ext = (m?.[1] ?? "glb").toLowerCase();
+      const contentType =
+        ext === "gltf" ? "model/gltf+json"
+        : ext === "usdz" ? "model/vnd.usdz+zip"
+        : ext === "glb" ? "model/gltf-binary"
+        : ext === "obj" ? "model/obj"
+        : ext === "fbx" ? "application/octet-stream"
+        : ext === "jpg" || ext === "jpeg" ? "image/jpeg"
+        : ext === "webp" ? "image/webp"
+        : ext === "avif" ? "image/avif"
+        : ext === "png" ? "image/png"
+        : "application/octet-stream";
+
+      try {
+        const r = await fetch(srcUrl);
+        if (!r.ok) {
+          return new Response(
+            JSON.stringify({
+              error: `Tripo fetch failed (HTTP ${r.status})`,
+              http_status: r.status,
+            }),
+            { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        const buf = new Uint8Array(await r.arrayBuffer());
+        // User-scoped path so the asset is owned by THIS user's
+        // bucket policy. Uniqueness via timestamp + a hash of the
+        // source URL keeps re-mirrors from clobbering each other.
+        const hashInput = new TextEncoder().encode(srcUrl);
+        const hashBuf = await crypto.subtle.digest("SHA-1", hashInput);
+        const hashHex = Array.from(new Uint8Array(hashBuf))
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("")
+          .slice(0, 16);
+        const fileName = `tripo3d-mirror/${user.id}/${hashHex}.${ext}`;
+
+        const { error: upErr } = await supabase.storage
+          .from("ai-media")
+          .upload(fileName, buf, { contentType, upsert: true });
+        if (upErr) {
+          console.warn(`[tripo3d-mirror] upload err: ${upErr.message}`);
+          return new Response(
+            JSON.stringify({ error: `Storage upload failed: ${upErr.message}` }),
+            { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        const { data: signed, error: signErr } = await supabase.storage
+          .from("ai-media")
+          .createSignedUrl(fileName, 60 * 60 * 24 * 365);
+        if (signErr || !signed?.signedUrl) {
+          return new Response(
+            JSON.stringify({ error: `Sign URL failed: ${signErr?.message ?? "unknown"}` }),
+            { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        console.log(`[tripo3d-mirror] ok ${ext} bytes=${buf.byteLength} path=${fileName}`);
+        return new Response(
+          JSON.stringify({
+            url: signed.signedUrl,
+            storage_path: fileName,
+            bytes: buf.byteLength,
+            content_type: contentType,
+          }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[tripo3d-mirror] threw: ${msg}`);
+        return new Response(
+          JSON.stringify({ error: `Mirror failed: ${msg}` }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+    }
 
     /* ─── Async poll path (Kling video tasks) ──────────────── */
     if (body.action === "poll_kling") {
@@ -2800,6 +3081,239 @@ serve(async (req) => {
           task_id: taskId,
           url: videoUrl,
           message: statusMsg,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    /* ─── Async poll path (Tripo3D 3D-model tasks) ──────────
+     * Each call is one quick GET to api.tripo3d.ai/v2/openapi/task
+     * — no risk of edge-fn worker timeout even on multi-minute
+     * jobs. Frontend re-fires this every 4-5s until status flips
+     * to success / failed. */
+    if (body.action === "poll_tripo3d") {
+      const taskId = String(body.task_id ?? "").trim();
+      const pollEndpoint = String(body.poll_endpoint ?? "").trim();
+      if (!taskId || !pollEndpoint) {
+        return new Response(
+          JSON.stringify({ error: "task_id and poll_endpoint required for poll_tripo3d" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      // Whitelist Tripo3D host so this can't be abused as an open
+      // proxy. Path must be exactly `/v2/openapi/task` (we append
+      // `/{taskId}` here on the server).
+      let pollUrlOk = false;
+      try {
+        const u = new URL(pollEndpoint);
+        pollUrlOk =
+          u.protocol === "https:" &&
+          u.hostname === "api.tripo3d.ai" &&
+          u.pathname.replace(/\/+$/, "") === "/v2/openapi/task";
+      } catch {
+        pollUrlOk = false;
+      }
+      if (!pollUrlOk) {
+        return new Response(
+          JSON.stringify({ error: "poll_endpoint must be the Tripo3D /v2/openapi/task endpoint" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const KEY =
+        Deno.env.get("TRIO_API_KEY") ??
+        Deno.env.get("TRIPO_API_KEY") ??
+        Deno.env.get("TRIPO3D_API_KEY");
+      if (!KEY) {
+        return new Response(
+          JSON.stringify({ error: "Tripo3D credentials missing on server" }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const pollUrl = `${pollEndpoint}/${encodeURIComponent(taskId)}`;
+      const r = await fetch(pollUrl, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${KEY}` },
+      });
+      if (!r.ok) {
+        const errText = await r.text().catch(() => "");
+        return new Response(
+          JSON.stringify({
+            status: "polling_error",
+            http_status: r.status,
+            message: errText.substring(0, 300),
+          }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const payload = (await r.json().catch(() => ({}))) as {
+        code?: number;
+        data?: Record<string, unknown>;
+      };
+      const data = (payload?.data ?? {}) as Record<string, unknown>;
+      const status = String(data.status ?? "").toLowerCase();
+      const progress = Number(data.progress ?? 0);
+      const block = (data.output ?? data.result ?? {}) as Record<string, unknown>;
+
+      // Dump the raw output object so we can see EXACTLY what fields
+      // Tripo3D returns. Crucial for debugging when the user reports
+      // "got a webm not a GLB" — the offending field is right here.
+      // Truncate to keep edge-fn logs readable.
+      console.log(
+        `[tripo3d] task=${taskId.slice(0, 8)} status=${status} progress=${progress} ` +
+          `output_keys=${Object.keys(block).join(",")} ` +
+          `output_preview=${JSON.stringify(block).slice(0, 600)}`,
+      );
+
+      const extractUrl = (v: unknown): string => {
+        if (typeof v === "string") return v;
+        if (v && typeof v === "object" && "url" in (v as Record<string, unknown>)) {
+          const inner = (v as Record<string, unknown>).url;
+          if (typeof inner === "string") return inner;
+        }
+        return "";
+      };
+
+      /* Strict GLB filter — Tripo3D's `output` object contains a
+       * MIX of asset URLs. Some fields point to GLB / GLTF (3D
+       * meshes), others to PNG / WebM (preview thumbnails or
+       * turntable videos). model-viewer can ONLY render mesh
+       * formats; hand it a webm and it silently shows the poster,
+       * which looks like the previous "static image" bug.
+       *
+       * We extract every candidate URL, then pick the first one
+       * whose extension is a known 3D mesh format. Anything else
+       * lands in the preview-image fallback path. */
+      const isMeshUrl = (u: string): boolean =>
+        /\.(glb|gltf|usdz|obj|fbx)(\?|#|$)/i.test(u);
+      const isImageUrl = (u: string): boolean =>
+        /\.(png|jpe?g|webp|avif)(\?|#|$)/i.test(u);
+
+      // Pull every URL the response carries — under every common
+      // field name we've seen Tripo3D use.
+      const candidateFields = [
+        "pbr_model",
+        "model",
+        "base_model",
+        "glb",
+        "gltf",
+        "usdz",
+        "rendered_image",
+        "preview_image",
+        "thumbnail_image",
+        "image",
+        "video_thumbnail",
+        "rendered_video",
+      ];
+      const candidates: string[] = [];
+      for (const k of candidateFields) {
+        const u = extractUrl(block[k]);
+        if (u) candidates.push(u);
+      }
+      // Also walk any unknown string-valued fields — Tripo could
+      // rename a field on a future model version and we'd miss it.
+      for (const [k, v] of Object.entries(block)) {
+        if (candidateFields.includes(k)) continue;
+        const u = extractUrl(v);
+        if (u && !candidates.includes(u)) candidates.push(u);
+      }
+
+      const tripoModelUrl = candidates.find(isMeshUrl) ?? "";
+      const tripoRenderedImage = candidates.find(isImageUrl) ?? "";
+
+      /* Mirror Tripo3D outputs into our own storage —
+       * Tripo's CDN (`tripo-data.cdn.bcebos.com`) doesn't serve the
+       * `Access-Control-Allow-Origin` header that <model-viewer>
+       * needs for its WebGL fetch, so the GLB silently fails to
+       * load and the user sees only the poster image. Re-hosting in
+       * Supabase storage solves both CORS and URL expiry in one
+       * shot, the same way we already mirror OpenAI / Kling outputs.
+       *
+       * Mirror only fires on the terminal "succeed" status so we
+       * don't waste bandwidth on every progress poll. If mirroring
+       * fails (network blip, oversize file, etc.) we silently fall
+       * back to the raw Tripo URL — model-viewer will use the
+       * poster as before, but at least the GLB stays downloadable. */
+      let modelUrl = tripoModelUrl;
+      let renderedImage = tripoRenderedImage;
+      const isTerminalSuccess = status === "succeed" || status === "success";
+      if (isTerminalSuccess) {
+        const mirror = async (
+          srcUrl: string,
+          ext: string,
+          contentType: string,
+        ): Promise<string | null> => {
+          try {
+            const r = await fetch(srcUrl);
+            if (!r.ok) {
+              console.warn(`[tripo3d] mirror ${ext} fetch ${r.status}`);
+              return null;
+            }
+            const buf = new Uint8Array(await r.arrayBuffer());
+            const fileName = `tripo3d/${taskId}/${Date.now()}.${ext}`;
+            const { error: upErr } = await supabase.storage
+              .from("ai-media")
+              .upload(fileName, buf, { contentType, upsert: true });
+            if (upErr) {
+              console.warn(`[tripo3d] mirror ${ext} upload err: ${upErr.message}`);
+              return null;
+            }
+            const { data: signed, error: signErr } = await supabase.storage
+              .from("ai-media")
+              .createSignedUrl(fileName, 60 * 60 * 24 * 365); // 1 year
+            if (signErr || !signed?.signedUrl) {
+              console.warn(`[tripo3d] mirror ${ext} sign err: ${signErr?.message}`);
+              return null;
+            }
+            return signed.signedUrl;
+          } catch (err) {
+            console.warn(`[tripo3d] mirror ${ext} threw:`, err);
+            return null;
+          }
+        };
+
+        if (tripoModelUrl) {
+          // Pick the actual extension from the URL so we keep .glb /
+          // .gltf / .usdz semantics intact for model-viewer.
+          const m = tripoModelUrl.match(/\.(glb|gltf|usdz|obj|fbx)(?=\?|#|$)/i);
+          const ext = (m?.[1] ?? "glb").toLowerCase();
+          const contentType = ext === "gltf" ? "model/gltf+json"
+            : ext === "usdz" ? "model/vnd.usdz+zip"
+            : "model/gltf-binary"; // .glb default; .obj/.fbx fall through
+          const mirrored = await mirror(tripoModelUrl, ext, contentType);
+          if (mirrored) modelUrl = mirrored;
+        }
+        if (tripoRenderedImage) {
+          const m = tripoRenderedImage.match(/\.(png|jpe?g|webp|avif)(?=\?|#|$)/i);
+          const ext = (m?.[1] ?? "png").toLowerCase();
+          const contentType =
+            ext === "jpg" || ext === "jpeg" ? "image/jpeg"
+            : ext === "webp" ? "image/webp"
+            : ext === "avif" ? "image/avif"
+            : "image/png";
+          const mirrored = await mirror(tripoRenderedImage, ext, contentType);
+          if (mirrored) renderedImage = mirrored;
+        }
+        console.log(
+          `[tripo3d] mirror done glb=${modelUrl !== tripoModelUrl ? "ok" : "passthru"} ` +
+            `img=${renderedImage !== tripoRenderedImage ? "ok" : "passthru"}`,
+        );
+      }
+
+      // Surface a normalised payload — frontend treats `succeed` /
+      // `success` as terminal-positive, `failed` as terminal-negative,
+      // anything else as still-running.
+      return new Response(
+        JSON.stringify({
+          status,           // queued | running | success | failed
+          progress,
+          task_id: taskId,
+          // For UI parity with poll_kling we put the rendered image
+          // URL here so the frontend can swap the placeholder for a
+          // real preview the moment it lands.
+          url: renderedImage || modelUrl,
+          model_url: modelUrl,
+          preview_image: renderedImage,
+          message: payload?.data?.message ?? "",
         }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
@@ -2996,6 +3510,9 @@ serve(async (req) => {
         break;
       case "video_understanding":
         result = await executeVideoToPrompt(params);
+        break;
+      case "tripo3d":
+        result = await executeTripo3D(params, supabase);
         break;
       case "seedream":
       case "seedance":
