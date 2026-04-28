@@ -728,6 +728,23 @@ async function executeKlingOmni(
       console.error(`[kling-omni] end_frame fetch failed:`, convErr);
     }
     imageList.push({ image_url: tailPayload, type: "end_frame" });
+    // Wiring the SAME upstream node into both start + end ports is a
+    // LEGITIMATE creative intent — the user wants motion that loops
+    // back to the original shot (e.g. a 360° camera spin returning
+    // to the start angle, a pendulum swing). An earlier version of
+    // this code deduped the duplicate URL and dropped end_frame, but
+    // that broke the loop-back use case (creatives wanted "ขยับแล้ว
+    // กลับมาที่เดิม", not "no end_frame"). Keep both frames as-is and
+    // rely on the prompt to drive the in-between motion. Log the
+    // case so we can correlate with low-motion outputs in dashboard.
+    if (rawImageUrl && rawTailUrl === rawImageUrl) {
+      console.log(
+        `[kling-omni] start_frame === end_frame — loop-back intent. ` +
+          `Motion comes from prompt. URL=${
+            rawImageUrl.length > 80 ? rawImageUrl.slice(0, 80) + "…" : rawImageUrl
+          }`,
+      );
+    }
   }
 
   // Additional ref_image (no type constraint — general reference)
