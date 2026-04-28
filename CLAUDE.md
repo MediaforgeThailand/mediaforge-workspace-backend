@@ -1,13 +1,22 @@
-# CLAUDE.md — mediaforge-backend
+# CLAUDE.md — mediaforge-workspace-backend
 
 ## Overview
 
-Supabase backend for MediaForge — AI-powered media creation SaaS for Thai SMEs. This repo contains all database migrations, edge functions, and Supabase configuration. Two separate frontend apps connect to this single backend.
+Supabase backend for the MediaForge **Workspace** product (split out
+from the consumer app per CTO directive — workspace.mediaforge.co
+will be the standalone subdomain). Migrations + edge functions for
+the node-based canvas editor live here. Companion frontend repo:
+`mediaforge-workspace-frontend`.
+
+The original consumer app's backend (`mediaforge-backend`, project
+`yonnvlhgwdxkuirhdfaz`) still exists for the rest of the consumer
+product surface — workspace code there is being phased out as part
+of the same split.
 
 ## Project
 
-- **Supabase Project:** `yonnvlhgwdxkuirhdfaz` (ap-southeast-1, Singapore)
-- **Dashboard:** https://supabase.com/dashboard/project/yonnvlhgwdxkuirhdfaz
+- **Supabase Project:** `fymncypboeubdikpbmqc` (ap-southeast-1, Singapore) — DEDICATED workspace project
+- **Dashboard:** https://supabase.com/dashboard/project/fymncypboeubdikpbmqc
 
 ## Structure
 
@@ -32,7 +41,7 @@ supabase/
 
 ```bash
 # Link to remote project
-npx supabase link --project-ref yonnvlhgwdxkuirhdfaz
+npx supabase link --project-ref fymncypboeubdikpbmqc
 
 # Push migrations to remote
 npx supabase db push
