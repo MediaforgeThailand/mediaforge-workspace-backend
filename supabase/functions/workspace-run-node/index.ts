@@ -1241,28 +1241,38 @@ async function executeSeedance(
     throw new Error(`Seedance model ${modelSlug} does not support reference video input.`);
   }
 
-  const content = buildSeedanceContent({
-    prompt,
-    ratio: ratio === "Auto" ? undefined : ratio,
-    resolution,
-    duration,
-    generateAudio,
-    cameraFixed,
-    seed,
-    watermark: false,
-    startFrameUrl,
-    endFrameUrl,
-    referenceVideoUrl,
-  });
+  // Optional Seedance 2.0 multimodal reference audio (the v2 spec
+  // accepts an audio_url with role="reference_audio" alongside
+  // ref images / video).
+  const referenceAudioUrl = (params.reference_audio_url ?? params.audio_url) as string | undefined;
+
+  const built = buildSeedanceContent(
+    {
+      prompt,
+      ratio: ratio === "Auto" ? undefined : ratio,
+      resolution,
+      duration,
+      generateAudio,
+      cameraFixed,
+      seed,
+      watermark: false,
+      startFrameUrl,
+      endFrameUrl,
+      referenceVideoUrl,
+      referenceAudioUrl,
+    },
+    { v2: isV2 },
+  );
 
   console.log(
-    `[seedance] submit model=${entry.model} duration=${duration}s ` +
+    `[seedance] submit model=${entry.model} v2=${isV2} duration=${duration}s ` +
       `resolution=${resolution ?? "default"} ratio=${ratio ?? "default"} ` +
-      `audio=${generateAudio} i2v=${!!startFrameUrl} vref=${!!referenceVideoUrl}`,
+      `audio=${generateAudio} i2v=${!!startFrameUrl} vref=${!!referenceVideoUrl} ` +
+      `aref=${!!referenceAudioUrl}`,
   );
 
   const taskId = await submitSeedanceTask(
-    { model: entry.model, content },
+    { model: entry.model, ...built },
     apiKey,
   );
 
