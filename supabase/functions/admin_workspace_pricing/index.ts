@@ -63,6 +63,8 @@ const USD_TO_THB = 35;
 const FLOW_CREDITS_PER_THB = 125;
 const WORKSPACE_CREDITS_PER_THB = 50;
 const FLOW_TO_WORKSPACE_RATIO = WORKSPACE_CREDITS_PER_THB / FLOW_CREDITS_PER_THB;
+const CMO_SHARED_CREDIT_DOMAIN = "cmo-group.com";
+const CMO_SHARED_CREDIT_POOL_USER_ID = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0";
 
 type CreditCostWriteRow = {
   feature: string;
@@ -368,6 +370,52 @@ async function setPricingBuffer(
 // the insert when no resolvable uuid is supplied. The frontend doesn't
 // pass one yet — leaving the hook in place so it lights up the day we
 // federate admin auth.
+function sharedCreditPoolUserIdForEmail(email?: string | null): string | null {
+  const normalized = String(email ?? "").trim().toLowerCase();
+  if (!normalized.endsWith(`@${CMO_SHARED_CREDIT_DOMAIN}`)) return null;
+  return CMO_SHARED_CREDIT_POOL_USER_ID;
+}
+
+async function getWorkspaceCreditBalance(
+  client: SupabaseClient,
+  authHeader: string | null,
+): Promise<{
+  data: {
+    balance: number;
+    total_purchased: number;
+    total_used: number;
+    is_shared_pool: boolean;
+    pool_domain: string | null;
+    pool_user_id: string | null;
+  };
+}> {
+  const token = String(authHeader ?? "").replace(/^Bearer\s+/i, "").trim();
+  if (!token) throw new Error("Authorization required");
+
+  const { data: authData, error: authError } = await client.auth.getUser(token);
+  if (authError || !authData.user) throw new Error("Invalid token");
+
+  const sharedPoolUserId = sharedCreditPoolUserIdForEmail(authData.user.email);
+  const creditUserId = sharedPoolUserId ?? authData.user.id;
+  const { data, error } = await client
+    .from("user_credits")
+    .select("balance,total_purchased,total_used")
+    .eq("user_id", creditUserId)
+    .maybeSingle();
+  if (error) throw new Error(`user_credits read failed: ${error.message}`);
+
+  return {
+    data: {
+      balance: Number((data as { balance?: number } | null)?.balance ?? 0),
+      total_purchased: Number((data as { total_purchased?: number } | null)?.total_purchased ?? 0),
+      total_used: Number((data as { total_used?: number } | null)?.total_used ?? 0),
+      is_shared_pool: Boolean(sharedPoolUserId),
+      pool_domain: sharedPoolUserId ? CMO_SHARED_CREDIT_DOMAIN : null,
+      pool_user_id: sharedPoolUserId,
+    },
+  };
+}
+
 async function tryAudit(
   client: SupabaseClient,
   args: {
@@ -848,6 +896,9 @@ Deno.serve(async (req: Request) => {
 
       case "get_pricing_buffer":
         return json(await getPricingBuffer(admin));
+
+      case "get_workspace_credit_balance":
+        return json(await getWorkspaceCreditBalance(admin, req.headers.get("authorization")));
 
       case "get_pricing_catalog": {
         const buffer = await getPricingBuffer(admin);

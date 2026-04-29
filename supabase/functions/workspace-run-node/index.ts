@@ -2241,6 +2241,8 @@ async function executeGeminiTts(
   if (!text) throw new Error("Audio Generation requires a script (prompt).");
 
   const voice = String(params.voice ?? "Charon");
+  const model = String(params.model_name ?? "gemini-3.1-flash-tts-preview");
+  const stylePrompt = String(params.style_prompt ?? "").trim();
 
   const res = await fetch(`${SUPABASE_URL}/functions/v1/text-to-speech`, {
     method: "POST",
@@ -2248,7 +2250,12 @@ async function executeGeminiTts(
       "Content-Type": "application/json",
       Authorization: authHeader,
     },
-    body: JSON.stringify({ text, voice }),
+    body: JSON.stringify({
+      text,
+      voice,
+      model,
+      style_prompt: stylePrompt,
+    }),
   });
 
   const json = await res.json();
@@ -2267,7 +2274,8 @@ async function executeGeminiTts(
     provider_meta: {
       provider: "gemini_tts",
       voice,
-      model: String(params.model_name ?? "gemini-2.5-flash-preview-tts"),
+      model,
+      style_prompt: stylePrompt || null,
     },
   };
 }
@@ -3193,9 +3201,44 @@ function workspaceMultiplierForProvider(
 type WorkspaceCreditCharge = {
   amount: number;
   teamId: string | null;
+  creditUserId: string;
   referenceId: string;
   feature: string;
 };
+
+const CMO_SHARED_CREDIT_DOMAIN = "cmo-group.com";
+const CMO_SHARED_CREDIT_POOL_USER_ID = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0";
+
+function sharedCreditPoolUserIdForEmail(email?: string | null): string | null {
+  const normalized = String(email ?? "").trim().toLowerCase();
+  if (!normalized.endsWith(`@${CMO_SHARED_CREDIT_DOMAIN}`)) return null;
+  return CMO_SHARED_CREDIT_POOL_USER_ID;
+}
+
+async function resolveWorkspaceCreditUserId(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+  email?: string | null,
+): Promise<{ creditUserId: string; isSharedPool: boolean; email: string | null }> {
+  let resolvedEmail = email ?? null;
+  if (!resolvedEmail) {
+    try {
+      const { data, error } = await supabase.auth.admin.getUserById(userId);
+      if (!error) resolvedEmail = data.user?.email ?? null;
+    } catch (err) {
+      console.warn(
+        "[workspace-credits] shared pool email lookup skipped:",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+  const sharedPoolId = sharedCreditPoolUserIdForEmail(resolvedEmail);
+  return {
+    creditUserId: sharedPoolId ?? userId,
+    isSharedPool: Boolean(sharedPoolId),
+    email: resolvedEmail,
+  };
+}
 
 function buildChargeParams(
   body: WorkspaceRunBody,
@@ -3241,6 +3284,7 @@ async function consumeWorkspaceCredits(args: {
   nodeType: string;
   provider: string;
   params: Record<string, unknown>;
+  userEmail?: string | null;
 }): Promise<WorkspaceCreditCharge | null> {
   if (args.body.skip_credit_charge || !shouldChargeWorkspaceProvider(args.provider)) {
     return null;
@@ -3257,9 +3301,13 @@ async function consumeWorkspaceCredits(args: {
       args.body.node_id ??
       crypto.randomUUID(),
   );
-  const description = `${args.nodeType} ${String(args.params.model_name ?? args.params.model ?? args.provider)}`;
+  const creditOwner = await resolveWorkspaceCreditUserId(args.supabase, args.userId, args.userEmail);
+  const descriptionBase = `${args.nodeType} ${String(args.params.model_name ?? args.params.model ?? args.provider)}`;
+  const description = creditOwner.isSharedPool
+    ? `${descriptionBase} (CMO shared pool; actual user ${creditOwner.email ?? args.userId})`
+    : descriptionBase;
   const { data, error } = await args.supabase.rpc("consume_credits_for", {
-    p_user_id: args.userId,
+    p_user_id: creditOwner.creditUserId,
     p_team_id: teamId,
     p_amount: amount,
     p_feature: def.feature,
@@ -3271,7 +3319,7 @@ async function consumeWorkspaceCredits(args: {
   if (error) {
     if (/function .*consume_credits_for/i.test(error.message)) {
       const fallback = await args.supabase.rpc("consume_credits", {
-        p_user_id: args.userId,
+        p_user_id: creditOwner.creditUserId,
         p_amount: amount,
         p_feature: def.feature,
         p_description: description,
@@ -3291,9 +3339,9 @@ async function consumeWorkspaceCredits(args: {
   }
 
   console.log(
-    `[workspace-credits] charged ${amount} credits user=${args.userId} team=${teamId ?? "personal"} ref=${referenceId}`,
+    `[workspace-credits] charged ${amount} credits user=${args.userId} credit_user=${creditOwner.creditUserId} team=${teamId ?? "personal"} ref=${referenceId}`,
   );
-  return { amount, teamId, referenceId, feature: def.feature };
+  return { amount, teamId, creditUserId: creditOwner.creditUserId, referenceId, feature: def.feature };
 }
 
 async function refundWorkspaceCredits(args: {
@@ -3305,9 +3353,11 @@ async function refundWorkspaceCredits(args: {
   canvasId?: string | null;
 }): Promise<void> {
   if (!args.charge || args.charge.amount <= 0) return;
+  const creditUserId = args.charge.creditUserId ??
+    (await resolveWorkspaceCreditUserId(args.supabase, args.userId)).creditUserId;
   try {
     const { error } = await args.supabase.rpc("refund_credits_for", {
-      p_user_id: args.userId,
+      p_user_id: creditUserId,
       p_team_id: args.charge.teamId,
       p_amount: args.charge.amount,
       p_reason: args.reason,
@@ -3321,7 +3371,7 @@ async function refundWorkspaceCredits(args: {
     }
     await refundCreditsAtomic(
       args.supabase,
-      args.userId,
+      creditUserId,
       args.charge.amount,
       args.reason,
       args.charge.referenceId,
@@ -3349,6 +3399,7 @@ async function refundWorkspaceJobCharge(args: {
     charge: {
       amount: remaining,
       teamId: args.job.credit_team_id ?? null,
+      creditUserId: (await resolveWorkspaceCreditUserId(args.supabase, args.job.user_id)).creditUserId,
       referenceId: args.job.id,
       feature: String(args.job.provider ?? args.job.node_type),
     },
@@ -4144,6 +4195,7 @@ serve(async (req) => {
         jobCharge = await consumeWorkspaceCredits({
           supabase,
           userId: user.id,
+          userEmail: user.email ?? null,
           body: runRequest,
           nodeType,
           provider,
@@ -5045,6 +5097,7 @@ serve(async (req) => {
     activeCreditCharge = await consumeWorkspaceCredits({
       supabase,
       userId: user.id,
+      userEmail: user.email ?? null,
       body,
       nodeType,
       provider,
