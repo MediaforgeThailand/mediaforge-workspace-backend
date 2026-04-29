@@ -364,9 +364,8 @@ export async function lookupBaseCost(
     const { data: resolutionExact } = await supabase
       .from("credit_costs").select("cost, pricing_type")
       .eq("feature", "generate_freepik_video")
-      .eq("model", model)
+      .eq("model", `${model}:${resolution}`)
       .eq("pricing_type", "per_second")
-      .eq("resolution", resolution)
       .eq("has_audio", hasAudio)
       .limit(1).maybeSingle();
 
@@ -379,9 +378,8 @@ export async function lookupBaseCost(
       const { data: noAudioResolution } = await supabase
         .from("credit_costs").select("cost, pricing_type")
         .eq("feature", "generate_freepik_video")
-        .eq("model", model)
+        .eq("model", `${model}:${resolution}`)
         .eq("pricing_type", "per_second")
-        .eq("resolution", resolution)
         .eq("has_audio", false)
         .limit(1).maybeSingle();
       if (noAudioResolution) {

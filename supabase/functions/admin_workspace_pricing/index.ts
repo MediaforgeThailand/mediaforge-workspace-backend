@@ -241,7 +241,7 @@ const SEEDANCE_ROWS: CreditCostWriteRow[] = [
   { model: "dreamina-seedance-2-0-260128", label: "Seedance 2.0 Pro direct-id fallback", cost: 250, resolution: null, audio: false, notes: "Direct BytePlus model id alias for Seedance 2.0 Pro." },
 ].map((row) => ({
   feature: "generate_freepik_video",
-  model: row.model,
+  model: row.resolution ? `${row.model}:${row.resolution}` : row.model,
   label: row.label,
   cost: row.cost,
   pricing_type: "per_second",
@@ -543,6 +543,12 @@ async function cleanupLegacyPricingRows(client: SupabaseClient): Promise<number>
       .eq("feature", "generate_freepik_video")
       .in("model", ["kling-v2-6-pro", "kling-v2-6-motion-pro"])
       .eq("pricing_type", "fixed"),
+    client
+      .from("credit_costs")
+      .delete()
+      .eq("feature", "generate_freepik_video")
+      .eq("model", "kling-v3-omni-video-ref")
+      .eq("has_audio", true),
     client
       .from("credit_costs")
       .delete()
