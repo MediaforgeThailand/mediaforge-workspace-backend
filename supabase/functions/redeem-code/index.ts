@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { rejectIfOrgUser } from "../_shared/orgUserGuard.ts";
 import { getAuthUser } from "../_shared/auth.ts";
 
 const corsHeaders = {
@@ -20,6 +21,9 @@ serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
+
+  const orgBlock = await rejectIfOrgUser(req);
+  if (orgBlock) return orgBlock;
 
   try {
     const authUser = await getAuthUser(req);
