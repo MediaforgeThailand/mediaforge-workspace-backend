@@ -12,6 +12,15 @@ import {
   TOTAL_MAX_RETRIES,
 } from "../_shared/providerRetry.ts";
 import { recordGenerationEvent } from "../_shared/analytics.ts";
+import {
+  SEEDANCE_BASE,
+  SEEDANCE_TASKS_PATH,
+  SEEDANCE_MODEL_MAP,
+  buildSeedanceContent,
+  loadSeedanceCredentials,
+  pollSeedanceOnce,
+  submitSeedanceTask,
+} from "../_shared/seedance.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -1135,6 +1144,110 @@ async function executeKlingOmni(
   };
 }
 
+/* ═══════════════════════════════════════════════════════════
+   Seedance (Bytedance / Volcengine Ark) video executor
+   ───────────────────────────────────────────────────────────
+   Async submit → poll. POST returns a task_id; the frontend then
+   hits action="poll_seedance" on this same function until status
+   flips to "succeeded". Same UX shape as Kling so the existing
+   polling hook in the frontend video node picker works without
+   model-aware branching.
+   ═══════════════════════════════════════════════════════════ */
+async function executeSeedance(
+  params: Record<string, unknown>,
+): Promise<ProviderResult> {
+  const { apiKey } = loadSeedanceCredentials();
+
+  const modelSlug = String(params.model_name ?? params.model ?? "seedance-1-5-pro-251215");
+  const entry = SEEDANCE_MODEL_MAP[modelSlug];
+  if (!entry) {
+    throw new Error(
+      `Unknown Seedance model: ${modelSlug}. ` +
+        `Available: ${Object.keys(SEEDANCE_MODEL_MAP).join(", ")}`,
+    );
+  }
+
+  const prompt = String(params.prompt ?? "").trim();
+  if (!prompt && !params.image_url) {
+    throw new Error("Seedance requires either a prompt or a start_frame image.");
+  }
+
+  // Coerce string-y param values (the frontend serialises everything
+  // through select dropdowns that hand us strings).
+  const ratio = (params.ratio ?? params.aspect_ratio) as string | undefined;
+  const resolution = params.resolution as string | undefined;
+  const durationRaw = params.duration as string | number | undefined;
+  const duration =
+    typeof durationRaw === "number"
+      ? durationRaw
+      : durationRaw
+        ? parseInt(String(durationRaw), 10) || 5
+        : 5;
+  const generateAudioRaw = params.generate_audio ?? params.has_audio;
+  const generateAudio = entry.supportsAudio
+    ? generateAudioRaw === true || generateAudioRaw === "true"
+    : false;
+  const cameraFixedRaw = params.camera_fixed;
+  const cameraFixed =
+    cameraFixedRaw === undefined
+      ? undefined
+      : cameraFixedRaw === true || cameraFixedRaw === "true";
+  const seedRaw = params.seed;
+  const seed =
+    typeof seedRaw === "number"
+      ? seedRaw
+      : seedRaw
+        ? parseInt(String(seedRaw), 10) || undefined
+        : undefined;
+  const startFrameUrl = (params.image_url ?? params.start_frame) as string | undefined;
+  const endFrameUrl = (params.image_tail_url ?? params.end_frame) as string | undefined;
+
+  const content = buildSeedanceContent({
+    prompt,
+    ratio: ratio === "Auto" ? undefined : ratio,
+    resolution,
+    duration,
+    generateAudio,
+    cameraFixed,
+    seed,
+    watermark: false,
+    startFrameUrl,
+    endFrameUrl,
+  });
+
+  console.log(
+    `[seedance] submit model=${entry.model} duration=${duration}s ` +
+      `resolution=${resolution ?? "default"} ratio=${ratio ?? "default"} ` +
+      `audio=${generateAudio} i2v=${!!startFrameUrl}`,
+  );
+
+  const taskId = await submitSeedanceTask(
+    { model: entry.model, content },
+    apiKey,
+  );
+
+  return {
+    task_id: taskId,
+    outputs: {
+      output_video: "",
+      output_start_frame: startFrameUrl ?? "",
+      output_last_frame: "",
+    },
+    output_type: "video_url",
+    provider_meta: {
+      provider: "seedance",
+      model: modelSlug,
+      provider_model_id: entry.model,
+      tier: entry.tier,
+      duration_seconds: duration,
+      resolution,
+      ratio,
+      has_audio: generateAudio,
+      is_image2video: !!startFrameUrl,
+      poll_endpoint: `${SEEDANCE_BASE}${SEEDANCE_TASKS_PATH}`,
+    },
+  };
+}
 
 const GEMINI_IMAGE_MODELS: Record<string, { gemini_model: string }> = {
   "nano-banana-pro": { gemini_model: "gemini-3-pro-image-preview" },
@@ -2858,7 +2971,7 @@ interface WorkspaceRunBody {
    *  Frontend resends after the initial Run returned a `task_id`
    *  and an empty URL. Each provider has its own action so we can
    *  whitelist the upstream URL per provider. */
-  action?: "poll_kling" | "poll_tripo3d" | "mirror_tripo_url";
+  action?: "poll_kling" | "poll_seedance" | "poll_tripo3d" | "mirror_tripo_url";
   task_id?: string;
   poll_endpoint?: string;
   /** For action="mirror_tripo_url": the Tripo3D CDN URL to mirror
@@ -3115,6 +3228,88 @@ serve(async (req) => {
           task_id: taskId,
           url: videoUrl,
           message: statusMsg,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    /* ─── Async poll path (Seedance / Volcengine Ark video tasks) ──
+     * Bytedance Seedance jobs typically land in 30-180s. Like Kling we
+     * return immediately on submit and let the frontend re-fire this
+     * action every few seconds. Whitelisted host so the action can't
+     * be abused as an open proxy. */
+    if (body.action === "poll_seedance") {
+      const taskId = String(body.task_id ?? "").trim();
+      const pollEndpoint = String(body.poll_endpoint ?? "").trim();
+      if (!taskId || !pollEndpoint) {
+        return new Response(
+          JSON.stringify({ error: "task_id and poll_endpoint required for poll_seedance" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      let pollUrlOk = false;
+      try {
+        const u = new URL(pollEndpoint);
+        // Volcengine Ark host is allowed; path must be exactly the
+        // tasks endpoint (we append /{taskId} below).
+        pollUrlOk =
+          u.protocol === "https:" &&
+          (u.hostname === "ark.cn-beijing.volces.com" ||
+            u.hostname.endsWith(".byteplusapi.com")) &&
+          u.pathname.replace(/\/+$/, "") === SEEDANCE_TASKS_PATH;
+      } catch {
+        pollUrlOk = false;
+      }
+      if (!pollUrlOk) {
+        return new Response(
+          JSON.stringify({ error: "poll_endpoint must be a Seedance tasks endpoint" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      let creds;
+      try {
+        creds = loadSeedanceCredentials();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({ error: msg }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      let statusObj;
+      try {
+        statusObj = await pollSeedanceOnce(taskId, creds.apiKey);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({
+            status: "polling_error",
+            message: msg.substring(0, 300),
+          }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const rawStatus = String(statusObj.status ?? "").toLowerCase();
+      // Normalise Volcengine status terms to the same vocabulary as
+      // poll_kling so the frontend can use one polling hook.
+      const normalised =
+        rawStatus === "succeeded" || rawStatus === "success"
+          ? "succeed"
+          : rawStatus === "failed" || rawStatus === "fail" || rawStatus === "cancelled"
+            ? "failed"
+            : rawStatus === "running"
+              ? "processing"
+              : rawStatus || "submitted";
+      const videoUrl =
+        normalised === "succeed" ? String(statusObj.content?.video_url ?? "") : "";
+      const message =
+        statusObj.error?.message ?? (normalised === "failed" ? "Task failed" : "");
+      return new Response(
+        JSON.stringify({
+          status: normalised,
+          task_id: taskId,
+          url: videoUrl,
+          message,
         }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
@@ -3548,13 +3743,15 @@ serve(async (req) => {
       case "tripo3d":
         result = await executeTripo3D(params, supabase);
         break;
-      case "seedream":
       case "seedance":
+        result = await executeSeedance(params);
+        break;
+      case "seedream":
         // Not yet ported from the legacy editor — fail loud rather than
-        // silently falling through to Banana/Kling and producing nonsense.
+        // silently falling through to Banana and producing nonsense.
         throw new Error(
           `Provider "${provider}" not yet implemented in workspace-run-node. ` +
-            `Pick a Banana / Kling / GPT Image 2 model for now.`,
+            `Pick a Banana / Kling / GPT Image 2 / Seedance model for now.`,
         );
       default:
         throw new Error(`No executor for provider "${provider}"`);
