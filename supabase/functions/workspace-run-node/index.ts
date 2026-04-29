@@ -30,6 +30,17 @@ import {
   pollSeedanceOnce,
   submitSeedanceTask,
 } from "../_shared/seedance.ts";
+import {
+  SEEDREAM_MODEL_MAP,
+  generateSeedreamImage,
+} from "../_shared/seedream.ts";
+import {
+  HYPER3D_BASE,
+  HYPER3D_TASKS_PATH,
+  HYPER3D_MODEL_MAP,
+  buildHyper3dContent,
+  submitHyper3dTask,
+} from "../_shared/hyper3d.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -2891,7 +2902,7 @@ function getProviderForNodeType(
     return "banana";
   }
   if (nodeType === "klingVideoNode" || nodeType === "videoGenNode") {
-    if (m.startsWith("seedance")) return "seedance";
+    if (m.startsWith("seedance") || m.startsWith("dreamina-seedance")) return "seedance";
     return "kling";
   }
   if (nodeType === "seedDreamNode") return "seedream";
@@ -2900,7 +2911,12 @@ function getProviderForNodeType(
   if (nodeType === "mergeAudioNode") return "merge_audio";
   if (nodeType === "chatAiNode") return "chat_ai";
   if (nodeType === "videoToPromptNode") return "video_understanding";
-  if (nodeType === "imageTo3dNode") return "tripo3d";
+  // 3D nodes: Hyper3D rides BytePlus ModelArk; Tripo3D is its own API.
+  // Route by model slug so a single node type can serve both providers.
+  if (nodeType === "imageTo3dNode") {
+    if (m.startsWith("hyper3d")) return "hyper3d";
+    return "tripo3d";
+  }
 
   // Audio generation — provider chosen by model_name. Default to
   // google_tts (Studio / Neural2 / WaveNet); fall back to the legacy
@@ -3519,6 +3535,7 @@ interface WorkspaceRunBody {
    *  Recorded in workspace_generation_events alongside user_id. None of
    *  these affect generation behaviour — they're informational only. */
   workspace_id?: string;
+  project_id?: string;
   canvas_id?: string;
   node_id?: string;
   /** Internal: background jobs are charged once at enqueue time, so
@@ -3541,6 +3558,7 @@ type WorkspaceJobStatus =
 type WorkspaceJobRow = {
   id: string;
   user_id: string;
+  project_id?: string | null;
   workspace_id?: string | null;
   canvas_id?: string | null;
   node_id?: string | null;
@@ -3950,6 +3968,7 @@ serve(async (req) => {
         .from("workspace_generation_jobs")
         .insert({
           user_id: user.id,
+          project_id: runRequest.project_id ?? null,
           workspace_id: runRequest.workspace_id ?? null,
           canvas_id: runRequest.canvas_id ?? null,
           node_id: runRequest.node_id ?? null,
@@ -4837,6 +4856,7 @@ serve(async (req) => {
       nodeType,
       params,
       result,
+      projectId: body.project_id ?? null,
       workspaceId: body.workspace_id ?? null,
       canvasId: body.canvas_id ?? null,
       nodeId: body.node_id ?? null,

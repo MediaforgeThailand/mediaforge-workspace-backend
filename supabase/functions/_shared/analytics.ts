@@ -200,6 +200,7 @@ export async function recordGenerationEvent(args: {
   nodeType: string;
   params: Record<string, unknown>;
   result: ProviderResultLike;
+  projectId?: string | null;
   workspaceId?: string | null;
   canvasId?: string | null;
   nodeId?: string | null;
@@ -240,6 +241,7 @@ export async function recordGenerationEvent(args: {
       .from("workspace_generation_events")
       .insert({
         user_id: args.userId,
+        project_id: args.projectId ?? null,
         workspace_id: args.workspaceId ?? null,
         canvas_id: args.canvasId ?? null,
         node_id: args.nodeId ?? null,
