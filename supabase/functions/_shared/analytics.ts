@@ -22,7 +22,7 @@ export interface ProviderResultLike {
   task_id?: string;
   result_url?: string;
   outputs: Record<string, unknown>;
-  output_type: "video_url" | "image_url" | "text";
+  output_type: "video_url" | "image_url" | "text" | "audio_url";
   provider_meta?: Record<string, unknown>;
 }
 
@@ -66,6 +66,7 @@ export function deriveAnalyticsFromRun(
   let feature: string;
   if (result.output_type === "video_url") feature = "video";
   else if (result.output_type === "image_url") feature = "image";
+  else if (result.output_type === "audio_url") feature = "audio";
   else if (result.output_type === "text") feature = "text";
   else if (/audio/i.test(nodeType)) feature = "audio";
   else if (/3d|tripo/i.test(nodeType)) feature = "model_3d";
