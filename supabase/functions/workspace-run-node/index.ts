@@ -261,6 +261,14 @@ const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     video:         { internal_key: "video_url",      data_type: "video" },
     ref_video:     { internal_key: "video_url",      data_type: "video" },
   },
+  seedance: {
+    start_frame:   { internal_key: "image_url",      data_type: "image" },
+    end_frame:     { internal_key: "image_tail_url", data_type: "image" },
+    image_input:   { internal_key: "image_url",      data_type: "image" },
+    image:         { internal_key: "image_url",      data_type: "image" },
+    ref_image:     { internal_key: "image_url",      data_type: "image" },
+    ref_video:     { internal_key: "video_url",      data_type: "video" },
+  },
   tripo3d: {
     image:         { internal_key: "image_url",      data_type: "image" },
     image_input:   { internal_key: "image_url",      data_type: "image" },
@@ -1195,9 +1203,6 @@ async function executeSeedance(
   }
 
   const prompt = String(params.prompt ?? "").trim();
-  if (!prompt && !params.image_url) {
-    throw new Error("Seedance requires either a prompt or a start_frame image.");
-  }
 
   // Coerce string-y param values (the frontend serialises everything
   // through select dropdowns that hand us strings).
@@ -1228,6 +1233,13 @@ async function executeSeedance(
         : undefined;
   const startFrameUrl = (params.image_url ?? params.start_frame) as string | undefined;
   const endFrameUrl = (params.image_tail_url ?? params.end_frame) as string | undefined;
+  const referenceVideoUrl = (params.video_url ?? params.ref_video) as string | undefined;
+  if (!prompt && !startFrameUrl && !referenceVideoUrl) {
+    throw new Error("Seedance requires a prompt, start_frame image, or ref_video.");
+  }
+  if (referenceVideoUrl && !entry.supportsVideoReference) {
+    throw new Error(`Seedance model ${modelSlug} does not support reference video input.`);
+  }
 
   const content = buildSeedanceContent({
     prompt,
@@ -1240,12 +1252,13 @@ async function executeSeedance(
     watermark: false,
     startFrameUrl,
     endFrameUrl,
+    referenceVideoUrl,
   });
 
   console.log(
     `[seedance] submit model=${entry.model} duration=${duration}s ` +
       `resolution=${resolution ?? "default"} ratio=${ratio ?? "default"} ` +
-      `audio=${generateAudio} i2v=${!!startFrameUrl}`,
+      `audio=${generateAudio} i2v=${!!startFrameUrl} vref=${!!referenceVideoUrl}`,
   );
 
   const taskId = await submitSeedanceTask(
@@ -1271,6 +1284,7 @@ async function executeSeedance(
       ratio,
       has_audio: generateAudio,
       is_image2video: !!startFrameUrl,
+      has_video_ref: !!referenceVideoUrl,
       poll_endpoint: `${SEEDANCE_BASE}${SEEDANCE_TASKS_PATH}`,
     },
   };

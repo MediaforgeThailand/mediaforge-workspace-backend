@@ -35,25 +35,27 @@ export interface SeedanceModelEntry {
   tier: "lite" | "pro" | "pro-fast" | "master";
   /** Audio generation supported (Seedance 1.5+ + 2.0). */
   supportsAudio: boolean;
+  /** Multimodal video reference supported (Seedance 2.0 series). */
+  supportsVideoReference?: boolean;
 }
 
 export const SEEDANCE_MODEL_MAP: Record<string, SeedanceModelEntry> = {
   // Legacy 1.x — kept for parity with the legacy nodeApiSchema.
-  "seedance-1-0-pro-250528": { model: "seedance-1-0-pro-250528", tier: "pro", supportsAudio: false },
-  "seedance-1-0-pro-fast-251015": { model: "seedance-1-0-pro-fast-251015", tier: "pro-fast", supportsAudio: false },
-  "seedance-1-5-pro-251215": { model: "seedance-1-5-pro-251215", tier: "pro", supportsAudio: true },
+  "seedance-1-0-pro-250528": { model: "seedance-1-0-pro-250528", tier: "pro", supportsAudio: false, supportsVideoReference: false },
+  "seedance-1-0-pro-fast-251015": { model: "seedance-1-0-pro-fast-251015", tier: "pro-fast", supportsAudio: false, supportsVideoReference: false },
+  "seedance-1-5-pro-251215": { model: "seedance-1-5-pro-251215", tier: "pro", supportsAudio: true, supportsVideoReference: false },
   // Seedance 2.0 family — BytePlus ModelArk model IDs (verified in
   // ap-southeast-1 console on 2026-04-30). The UI slug stays
   // "seedance-2-0-{lite|pro}" so the frontend dropdown doesn't have
   // to change; we forward the BytePlus identifier on the wire.
   //   - dreamina-seedance-2-0-260128       = Seedance 2.0 Pro (full)
   //   - dreamina-seedance-2-0-fast-260128  = Seedance 2.0 Fast (lite)
-  "seedance-2-0-lite": { model: "dreamina-seedance-2-0-fast-260128", tier: "lite", supportsAudio: true },
-  "seedance-2-0-pro":  { model: "dreamina-seedance-2-0-260128",      tier: "pro",  supportsAudio: true },
+  "seedance-2-0-lite": { model: "dreamina-seedance-2-0-fast-260128", tier: "lite", supportsAudio: true, supportsVideoReference: true },
+  "seedance-2-0-pro":  { model: "dreamina-seedance-2-0-260128",      tier: "pro",  supportsAudio: true, supportsVideoReference: true },
   // Direct-ID aliases — let the BytePlus IDs themselves resolve in
   // case any caller already sends the verbatim identifier.
-  "dreamina-seedance-2-0-260128":      { model: "dreamina-seedance-2-0-260128",      tier: "pro",  supportsAudio: true },
-  "dreamina-seedance-2-0-fast-260128": { model: "dreamina-seedance-2-0-fast-260128", tier: "lite", supportsAudio: true },
+  "dreamina-seedance-2-0-260128":      { model: "dreamina-seedance-2-0-260128",      tier: "pro",  supportsAudio: true, supportsVideoReference: true },
+  "dreamina-seedance-2-0-fast-260128": { model: "dreamina-seedance-2-0-fast-260128", tier: "lite", supportsAudio: true, supportsVideoReference: true },
 };
 
 export interface SeedanceTaskCreate {
@@ -110,6 +112,8 @@ export interface SeedanceParams {
   startFrameUrl?: string;
   /** Image-to-video end frame URL (optional, models that support it). */
   endFrameUrl?: string;
+  /** Seedance 2.0 multimodal reference video URL. */
+  referenceVideoUrl?: string;
 }
 
 /** Build the Volcengine Ark "content" array from prompt + params. */
@@ -140,6 +144,13 @@ export function buildSeedanceContent(p: SeedanceParams): Array<Record<string, un
       type: "image_url",
       image_url: { url: p.endFrameUrl },
       role: "last_frame",
+    });
+  }
+  if (p.referenceVideoUrl) {
+    content.push({
+      type: "video_url",
+      video_url: { url: p.referenceVideoUrl },
+      role: "reference_video",
     });
   }
 
