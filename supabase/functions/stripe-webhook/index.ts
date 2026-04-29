@@ -860,17 +860,39 @@ serve(async (req) => {
           });
         }
 
-        // Look up plan for accurate price + flags
+        // Look up plan for accurate price + flags. Pull both monthly
+        // and annual columns so we can pick the correct value based
+        // on the user's chosen cycle (set in checkout metadata).
         const { data: plan } = await supabase
           .from("subscription_plans")
-          .select("name, target, upfront_credits, price_thb, billing_cycle")
+          .select("name, target, upfront_credits, annual_credits, price_thb, annual_price_thb, billing_cycle")
           .eq("id", planId)
           .single();
 
-        const finalCredits = plan?.upfront_credits ?? creditsToGrant;
-        const amountThb = plan?.price_thb ?? (intent.amount || 0) / 100;
+        // The user's chosen cycle from intent metadata is the source
+        // of truth — the plan row's `billing_cycle` is the plan's
+        // intrinsic cadence (e.g. "metered" for Team) and shouldn't
+        // override what the buyer just paid for.
+        const finalBillingCycle = billingCycle;
         const finalPlanName = plan?.name ?? planName;
-        const finalBillingCycle = plan?.billing_cycle ?? billingCycle;
+
+        // Annual purchase grants the full year of credits + a year of
+        // status. Falls back to monthly (`upfront_credits`/`price_thb`)
+        // when the annual columns are null on the plan row.
+        const finalCredits = plan
+          ? Number(
+              finalBillingCycle === "annual" && plan.annual_credits != null
+                ? plan.annual_credits
+                : plan.upfront_credits
+            )
+          : creditsToGrant;
+        const amountThb = plan
+          ? Number(
+              finalBillingCycle === "annual" && plan.annual_price_thb != null
+                ? plan.annual_price_thb
+                : plan.price_thb
+            )
+          : (intent.amount || 0) / 100;
 
         // Re-validate after DB lookup
         if (!Number.isFinite(finalCredits) || finalCredits <= 0) {
