@@ -1227,18 +1227,34 @@ async function executeSeedance(
       : durationRaw
         ? parseInt(String(durationRaw), 10) || 5
         : 5;
-  // Seedance 2.0 (dreamina-seedance-*) accepts 4-14s per the
-  // BytePlus duration dropdown (matching the upstream Freepik UI).
-  // BytePlus returns `InvalidParameter` outside that range with
-  // "the parameter duration specified in the request is not valid
-  //  for model dreamina-seedance-2-0 in r2v". Server-side clamp
-  // is a defensive net for legacy frontend versions or direct API
-  // callers that still send 1.x-era values like 3s; legacy 1.x
-  // models accept 2-12s and stay untouched.
-  const isV2DurationGuard = entry.model.startsWith("dreamina-seedance");
-  if (isV2DurationGuard) {
+  // Per-model duration windows. BytePlus returns
+  // `InvalidParameter — the parameter duration specified in the
+  // request is not valid for model <slug>` for any value outside
+  // its model's accepted range. We clamp server-side as a safety
+  // net for older frontend builds and direct-API callers; the
+  // schema-driven UI already enforces these ranges.
+  //
+  //   dreamina-seedance-2-0 / -2-0-fast      → 4..15
+  //   seedance-1-5-pro                       → 4..12  (discrete in UI)
+  //   seedance-1-0-pro / -1-0-pro-fast       → 2..12
+  //   seedance-1-0-lite                      → 5 or 10 only
+  //
+  // Note: `entry.model` is the BytePlus-mapped slug (dreamina-* for
+  // 2.0, seedance-* for 1.x), so we check the underlying mapped name
+  // rather than the user-facing slug.
+  const mapped = entry.model;
+  if (mapped.startsWith("dreamina-seedance")) {
     if (!Number.isFinite(duration) || duration < 4) duration = 4;
-    else if (duration > 14) duration = 14;
+    else if (duration > 15) duration = 15;
+  } else if (mapped.startsWith("seedance-1-5")) {
+    if (!Number.isFinite(duration) || duration < 4) duration = 4;
+    else if (duration > 12) duration = 12;
+  } else if (mapped.startsWith("seedance-1-0-lite")) {
+    // Lite has only two valid values — snap to the nearer one.
+    duration = duration <= 7 ? 5 : 10;
+  } else if (mapped.startsWith("seedance-")) {
+    if (!Number.isFinite(duration) || duration < 2) duration = 2;
+    else if (duration > 12) duration = 12;
   }
   const generateAudioRaw = params.generate_audio ?? params.has_audio;
   const generateAudio = entry.supportsAudio
