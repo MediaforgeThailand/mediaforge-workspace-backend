@@ -1274,6 +1274,196 @@ async function executeSeedance(
   };
 }
 
+/**
+ * Seedream image-gen executor (BytePlus ModelArk, sync).
+ *
+ * One POST returns the rendered image URL — no polling. Mirrors the
+ * shape of executeBanana / executeOpenAIImage2 so downstream consumers
+ * (analytics recorder, response formatter) treat it identically.
+ *
+ * Same BytePlus Ark API key powers Seedance / Seedream / Hyper3D, so
+ * we lean on loadSeedanceCredentials() rather than introducing a
+ * separate SEEDREAM_API_KEY env var.
+ */
+async function executeSeedream(
+  params: Record<string, unknown>,
+): Promise<ProviderResult> {
+  const { apiKey } = loadSeedanceCredentials();
+
+  const modelSlug = String(params.model_name ?? params.model ?? "seedream-5-0");
+  const entry = SEEDREAM_MODEL_MAP[modelSlug];
+  if (!entry) {
+    throw new Error(
+      `Unknown Seedream model: ${modelSlug}. ` +
+        `Available: ${Object.keys(SEEDREAM_MODEL_MAP).join(", ")}`,
+    );
+  }
+
+  const prompt = String(params.prompt ?? "").trim();
+  if (!prompt) {
+    throw new Error("Seedream requires a prompt.");
+  }
+
+  // Size — accept either an explicit "WxH" string or a {width,height}
+  // pair the schema sometimes hands us.
+  const sizeRaw = params.size ?? params.image_size;
+  let size: string | undefined;
+  if (typeof sizeRaw === "string" && /^\d+x\d+$/i.test(sizeRaw)) {
+    size = sizeRaw;
+  } else if (typeof params.width === "number" && typeof params.height === "number") {
+    size = `${params.width}x${params.height}`;
+  } else {
+    size = "1024x1024";
+  }
+
+  const seedRaw = params.seed;
+  const seed =
+    typeof seedRaw === "number"
+      ? seedRaw
+      : seedRaw
+        ? parseInt(String(seedRaw), 10) || undefined
+        : undefined;
+
+  // Image-to-image hint (some Seedream variants accept it). The
+  // workspace shell passes ref images via image_url / mention_image_urls.
+  const refImage =
+    (params.image_url as string | undefined) ??
+    (Array.isArray(params.mention_image_urls)
+      ? (params.mention_image_urls as string[])[0]
+      : undefined);
+
+  const negativePrompt =
+    typeof params.negative_prompt === "string" ? params.negative_prompt : undefined;
+
+  console.log(
+    `[seedream] generate model=${entry.model} size=${size} seed=${seed ?? "auto"} ` +
+      `i2i=${!!refImage}`,
+  );
+
+  const items = await generateSeedreamImage(
+    {
+      model: entry.model,
+      prompt,
+      size,
+      response_format: "url",
+      n: 1,
+      ...(seed !== undefined ? { seed } : {}),
+      ...(refImage ? { image: refImage } : {}),
+      ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
+    },
+    apiKey,
+  );
+
+  const url = items[0]?.url;
+  if (!url) {
+    throw new Error("Seedream returned no URL in the first image item.");
+  }
+
+  return {
+    outputs: {
+      output_image: url,
+    },
+    output_type: "image_url",
+    provider_meta: {
+      provider: "seedream",
+      model: modelSlug,
+      provider_model_id: entry.model,
+      tier: entry.tier,
+      size,
+      revised_prompt: items[0]?.revised_prompt,
+      has_reference_image: !!refImage,
+    },
+  };
+}
+
+/**
+ * Hyper3D image-to-3D executor (BytePlus ModelArk, async).
+ *
+ * Submit/poll pipeline mirrors Seedance — we POST a task, return the
+ * task_id, and let the frontend drive the `poll_hyper3d` action. The
+ * provider_meta echoes the Tripo3D shape (`output_model` / `model_3d`)
+ * so the existing 3D node renderer can keep its happy path.
+ */
+async function executeHyper3D(
+  params: Record<string, unknown>,
+): Promise<ProviderResult> {
+  const { apiKey } = loadSeedanceCredentials();
+
+  const modelSlug = String(params.model_name ?? params.model ?? "hyper3d-gen2");
+  const entry = HYPER3D_MODEL_MAP[modelSlug];
+  if (!entry) {
+    throw new Error(
+      `Unknown Hyper3D model: ${modelSlug}. ` +
+        `Available: ${Object.keys(HYPER3D_MODEL_MAP).join(", ")}`,
+    );
+  }
+
+  // Resolve the reference image (image-to-3D requires one).
+  const imageUrl =
+    (params.image_url as string | undefined) ??
+    (params.image as string | undefined) ??
+    (Array.isArray(params.mention_image_urls)
+      ? (params.mention_image_urls as string[])[0]
+      : undefined);
+  if (!imageUrl) {
+    throw new Error(
+      "Hyper3D Gen2 requires an image input — wire an asset / generation into the `image` port.",
+    );
+  }
+
+  const prompt = typeof params.prompt === "string" ? params.prompt : undefined;
+  const formatRaw = params.format ?? params.output_format;
+  const format =
+    formatRaw === "obj" || formatRaw === "fbx" || formatRaw === "glb"
+      ? (formatRaw as "obj" | "fbx" | "glb")
+      : "glb";
+  const textureRaw = params.texture ?? params.bake_texture;
+  const texture =
+    textureRaw === undefined ? true : textureRaw === true || textureRaw === "true";
+  const seedRaw = params.seed;
+  const seed =
+    typeof seedRaw === "number"
+      ? seedRaw
+      : seedRaw
+        ? parseInt(String(seedRaw), 10) || undefined
+        : undefined;
+
+  const content = buildHyper3dContent({
+    imageUrl,
+    prompt,
+    format,
+    texture,
+    seed,
+  });
+
+  console.log(
+    `[hyper3d] submit model=${entry.model} format=${format} texture=${texture}`,
+  );
+
+  const taskId = await submitHyper3dTask(
+    { model: entry.model, content },
+    apiKey,
+  );
+
+  return {
+    task_id: taskId,
+    outputs: {
+      output_model: "",
+      output_image: imageUrl,
+    },
+    output_type: "model_3d",
+    provider_meta: {
+      provider: "hyper3d",
+      model: modelSlug,
+      provider_model_id: entry.model,
+      tier: entry.tier,
+      format,
+      texture,
+      poll_endpoint: `${HYPER3D_BASE}${HYPER3D_TASKS_PATH}`,
+    },
+  };
+}
+
 const GEMINI_IMAGE_MODELS: Record<string, { gemini_model: string }> = {
   "nano-banana-pro": { gemini_model: "gemini-3-pro-image-preview" },
   "nano-banana-2":   { gemini_model: "gemini-3.1-flash-image-preview" },
@@ -2978,6 +3168,7 @@ function workspaceMultiplierForProvider(
     case "seedream":
     case "remove_bg":
     case "tripo3d":
+    case "hyper3d":
       return multipliers.image;
     case "kling":
     case "seedance":
@@ -4795,6 +4986,9 @@ serve(async (req) => {
       case "tripo3d":
         result = await executeTripo3D(params, supabase);
         break;
+      case "hyper3d":
+        result = await executeHyper3D(params);
+        break;
       case "google_tts":
         // Pass the service-role supabase client + user id so the
         // executor can upload the MP3 and insert into user_assets
@@ -4812,12 +5006,8 @@ serve(async (req) => {
         result = await executeSeedance(params);
         break;
       case "seedream":
-        // Not yet ported from the legacy editor — fail loud rather than
-        // silently falling through to Banana and producing nonsense.
-        throw new Error(
-          `Provider "${provider}" not yet implemented in workspace-run-node. ` +
-            `Pick a Banana / Kling / GPT Image 2 / Seedance model for now.`,
-        );
+        result = await executeSeedream(params);
+        break;
       default:
         throw new Error(`No executor for provider "${provider}"`);
     }
