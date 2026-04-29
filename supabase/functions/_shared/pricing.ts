@@ -290,19 +290,36 @@ export async function lookupBaseCost(
     ? (parseInt(String(params.ref_video_duration ?? "0"), 10) || 0)
     : (parseInt(String(params.duration ?? "5"), 10) || 5);
 
-  const hasAudio = params.has_audio === true || params.has_audio === "true";
+  const hasAudio =
+    params.has_audio === true ||
+    params.has_audio === "true" ||
+    params.generate_audio === true ||
+    params.generate_audio === "true";
+  const resolution = String(params.resolution ?? "").trim().toLowerCase();
 
   // ── Omni: check for video-ref tier pricing ──
   if (isOmni) {
     const hasRefVideo = params._has_ref_video === true || params._has_ref_video === "true";
     const pricingModel = hasRefVideo ? `${model}-video-ref` : model;
+    const effectiveAudio = hasRefVideo ? false : hasAudio;
 
     // Try the tier-specific model first
-    const { data: tierRow } = await supabase
+    let { data: tierRow } = await supabase
       .from("credit_costs").select("cost, pricing_type")
       .eq("feature", "generate_freepik_video")
       .eq("model", pricingModel)
+      .eq("has_audio", effectiveAudio)
       .limit(1).maybeSingle();
+
+    if (!tierRow && effectiveAudio) {
+      const { data: noAudioTierRow } = await supabase
+        .from("credit_costs").select("cost, pricing_type")
+        .eq("feature", "generate_freepik_video")
+        .eq("model", pricingModel)
+        .eq("has_audio", false)
+        .limit(1).maybeSingle();
+      tierRow = noAudioTierRow;
+    }
 
     if (tierRow) {
       if (tierRow.pricing_type === "per_second") {
@@ -313,11 +330,22 @@ export async function lookupBaseCost(
 
     // Fallback to standard model if video-ref row doesn't exist
     if (hasRefVideo) {
-      const { data: stdRow } = await supabase
+      let { data: stdRow } = await supabase
         .from("credit_costs").select("cost, pricing_type")
         .eq("feature", "generate_freepik_video")
         .eq("model", model)
+        .eq("has_audio", effectiveAudio)
         .limit(1).maybeSingle();
+
+      if (!stdRow && effectiveAudio) {
+        const { data: noAudioStdRow } = await supabase
+          .from("credit_costs").select("cost, pricing_type")
+          .eq("feature", "generate_freepik_video")
+          .eq("model", model)
+          .eq("has_audio", false)
+          .limit(1).maybeSingle();
+        stdRow = noAudioStdRow;
+      }
 
       if (stdRow) {
         if (stdRow.pricing_type === "per_second") {
@@ -330,6 +358,37 @@ export async function lookupBaseCost(
     throw new PricingConfigError(
       `Pricing configuration missing for Omni model: ${pricingModel} (duration=${duration}s)`
     );
+  }
+
+  if (resolution) {
+    const { data: resolutionExact } = await supabase
+      .from("credit_costs").select("cost, pricing_type")
+      .eq("feature", "generate_freepik_video")
+      .eq("model", model)
+      .eq("pricing_type", "per_second")
+      .eq("resolution", resolution)
+      .eq("has_audio", hasAudio)
+      .limit(1).maybeSingle();
+
+    if (resolutionExact) {
+      const effectiveDuration = isMotion && duration <= 0 ? 5 : duration;
+      return Math.ceil(resolutionExact.cost * effectiveDuration);
+    }
+
+    if (hasAudio) {
+      const { data: noAudioResolution } = await supabase
+        .from("credit_costs").select("cost, pricing_type")
+        .eq("feature", "generate_freepik_video")
+        .eq("model", model)
+        .eq("pricing_type", "per_second")
+        .eq("resolution", resolution)
+        .eq("has_audio", false)
+        .limit(1).maybeSingle();
+      if (noAudioResolution) {
+        const effectiveDuration = isMotion && duration <= 0 ? 5 : duration;
+        return Math.ceil(noAudioResolution.cost * effectiveDuration);
+      }
+    }
   }
 
   const { data: perSecondExact } = await supabase
