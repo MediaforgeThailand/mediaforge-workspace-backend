@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { rejectIfOrgUser } from "../_shared/orgUserGuard.ts";
 import { quoteFlowCost, NODE_TYPE_REGISTRY, PricingConfigError, fetchFeatureMultipliers } from "../_shared/pricing.ts";
 
 const corsHeaders = {
@@ -10,6 +11,9 @@ const corsHeaders = {
 
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+
+  const orgBlock = await rejectIfOrgUser(req);
+  if (orgBlock) return orgBlock;
 
   try {
     const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -108,6 +112,9 @@ serve(async (req) => {
       isOwner,
       discountPercent,
       featureMultipliers,
+      // Pass the flow owner so revshare is split using the OWNER's
+      // current rank — not the runner's. The runner is the consumer.
+      creatorUserId: flow.user_id as string,
     });
 
     // ── Apply HARD ERP override (selling_price) if set ──

@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { rejectIfOrgUser } from "../_shared/orgUserGuard.ts";
 import { refundCreditsAtomic } from "../_shared/pricing.ts";
 import { logApiUsage } from "../_shared/posthogCapture.ts";
 
@@ -41,6 +42,7 @@ interface RunOwnerInfo {
   flow_id: string;
   status: string;
   outputs: Record<string, unknown> | null;
+  started_at: string | null;
 }
 
 async function verifyRunOwnership(
@@ -50,7 +52,7 @@ async function verifyRunOwnership(
 ): Promise<RunOwnerInfo> {
   const { data: run, error } = await supabase
     .from("flow_runs")
-    .select("user_id, flow_id, status, outputs")
+    .select("user_id, flow_id, status, outputs, started_at")
     .eq("id", runId)
     .maybeSingle();
 
@@ -68,6 +70,9 @@ async function verifyRunOwnership(
 
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+
+  const orgBlock = await rejectIfOrgUser(req);
+  if (orgBlock) return orgBlock;
 
   const startTime = Date.now();
   try {
@@ -120,14 +125,17 @@ serve(async (req) => {
     // SECURITY: Refund goes to run OWNER, not caller (already verified above)
     if (force_timeout && run_id && runOwner) {
       const errorMsg = "Polling timed out — generation took too long";
+      const durationMs = runOwner.started_at ? Date.now() - new Date(runOwner.started_at).getTime() : null;
       if (credit_cost && credit_cost > 0) {
         await refundCreditsAtomic(supabase, runOwner.user_id, credit_cost, `Refund: ${errorMsg}`, run_id);
         await supabase.from("flow_runs").update({
           status: "failed_refunded", error_message: errorMsg, completed_at: new Date().toISOString(),
+          ...(durationMs != null && { duration_ms: durationMs }),
         }).eq("id", run_id);
       } else {
         await supabase.from("flow_runs").update({
           status: "failed", error_message: errorMsg, completed_at: new Date().toISOString(),
+          ...(durationMs != null && { duration_ms: durationMs }),
         }).eq("id", run_id);
       }
       // Also fail any pipeline_executions linked to this run
@@ -351,6 +359,9 @@ serve(async (req) => {
         if (isPipelineFullyDone) {
           updatePayload.status = "completed";
           updatePayload.completed_at = new Date().toISOString();
+          if (runOwner?.started_at) {
+            updatePayload.duration_ms = Date.now() - new Date(runOwner.started_at).getTime();
+          }
         }
         const { data: claimed, error: claimErr } = await supabase
           .from("flow_runs")
@@ -378,6 +389,7 @@ serve(async (req) => {
               source: "workflow",
               category: "generated",
               metadata: { flow_id: runOwner.flow_id, flow_run_id: run_id },
+              ...(coverImage ? { thumbnail_url: coverImage } : {}),
             });
             console.log(`[run-flow-status] Auto-saved video asset for user ${runOwner.user_id}`);
           } catch (assetErr) {
@@ -426,14 +438,17 @@ serve(async (req) => {
       const errorMsg = (data?.task_status_msg as string) || "Generation failed";
 
       // SECURITY: Refund to run OWNER, not caller
+      const failDurationMs = runOwner?.started_at ? Date.now() - new Date(runOwner.started_at).getTime() : null;
       if (run_id && runOwner && credit_cost && credit_cost > 0) {
         await refundCreditsAtomic(supabase, runOwner.user_id, credit_cost, `Refund: ${errorMsg}`, run_id);
         await supabase.from("flow_runs").update({
           status: "failed_refunded", error_message: errorMsg, completed_at: new Date().toISOString(),
+          ...(failDurationMs != null && { duration_ms: failDurationMs }),
         }).eq("id", run_id);
       } else if (run_id) {
         await supabase.from("flow_runs").update({
           status: "failed", error_message: errorMsg, completed_at: new Date().toISOString(),
+          ...(failDurationMs != null && { duration_ms: failDurationMs }),
         }).eq("id", run_id);
       }
 

@@ -1,5 +1,57 @@
 project_id = "fymncypboeubdikpbmqc"
 
+# ─── Local dev ports ──────────────────────────────────────────────────────
+# Default supabase ports (54320-54327) are blocked by Hyper-V dynamic port
+# reservations on this machine. Override to 55xxx range which is outside
+# the excluded ranges. Verify with:
+#   netsh int ipv4 show excludedportrange protocol=tcp
+# If 55xxx ever becomes blocked, pick a different range (15xxx works too).
+
+[api]
+port = 55321
+
+[db]
+port = 55322
+shadow_port = 55320
+
+[studio]
+port = 55323
+
+[inbucket]
+port = 55324
+
+[analytics]
+port = 55327
+
+# ─── Auth (LOCAL DEV ONLY) ────────────────────────────────────────────────
+# Site URL + redirect allow-list must include the frontend dev origin so
+# Supabase Auth accepts the `redirectTo` parameter sent by the OAuth flow.
+# Vite tries 8080 first and falls back to 8081 if taken — both are listed.
+
+[auth]
+site_url = "http://localhost:8081"
+additional_redirect_urls = [
+  "http://localhost:8081",
+  "http://localhost:8081/auth",
+  "http://localhost:8081/**",
+  "http://localhost:8080",
+  "http://localhost:8080/auth",
+  "http://localhost:8080/**",
+  "http://127.0.0.1:8081/**",
+  "http://127.0.0.1:8080/**",
+]
+
+# Google OAuth — credentials in `supabase/.env` (auto-loaded by `supabase start`).
+# Authorized redirect URI in Google Console must include
+# `http://127.0.0.1:55321/auth/v1/callback` for local to work.
+[auth.external.google]
+enabled = true
+client_id = "env(GOOGLE_CLIENT_ID)"
+secret = "env(GOOGLE_CLIENT_SECRET)"
+redirect_uri = "http://127.0.0.1:55321/auth/v1/callback"
+
+# ──────────────────────────────────────────────────────────────────────────
+
 [functions.admin-login]
 verify_jwt = false
 
@@ -127,4 +179,13 @@ verify_jwt = false
 verify_jwt = false
 
 [functions.admin_workspace_analytics]
+verify_jwt = false
+
+[functions.mf-um-resolve-login]
+verify_jwt = false
+
+[functions.mf-um-org-admin-api]
+verify_jwt = false
+
+[functions.mf-um-class-enroll]
 verify_jwt = false

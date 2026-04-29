@@ -20,3 +20,13 @@ node_modules
 
 # Credentials
 SUPABASE_CREDENTIALS.md
+
+# Migration reference files — temporary copies created during Schema C
+# rebuild for side-by-side review. Not source of truth.
+*.MIGRATION
+*.MIGRATION-FULL-REFERENCE
+*.NEW-REPO-ORIGINAL
+*.OLD-WORKING-TREE
+
+# Supabase local env (Google OAuth secrets etc.)
+supabase/.env
