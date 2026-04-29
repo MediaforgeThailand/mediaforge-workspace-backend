@@ -97,6 +97,22 @@ function openAiImagePriceKeys(params: Record<string, unknown>): string[] {
   ]));
 }
 
+function googleModelPriceKeys(rawModel: unknown): string[] {
+  const model = String(rawModel ?? "").trim();
+  if (!model) return [];
+  const keys = [model];
+  if (model.startsWith("gemini-")) {
+    keys.push(`google/${model}`);
+  }
+  if (model === "google/gemini-3.1-pro-preview") {
+    keys.push("google/gemini-3-pro-preview");
+  }
+  if (model === "gemini-3.1-pro-preview") {
+    keys.push("google/gemini-3.1-pro-preview", "google/gemini-3-pro-preview");
+  }
+  return Array.from(new Set(keys));
+}
+
 async function firstCostByModelKeys(
   supabase: ReturnType<typeof createClient>,
   feature: string,
@@ -264,18 +280,18 @@ export async function lookupBaseCost(
   /* ── Chat AI ── */
   if (providerDef.provider === "chat_ai") {
     const model = String(params.model_name ?? params.model ?? DEFAULT_CHAT_MODEL);
-    const { data } = await supabase
-      .from("credit_costs").select("cost")
-      .eq("feature", "chat_ai")
-      .eq("model", model)
-      .limit(1).maybeSingle();
+    const match = await firstCostByModelKeys(
+      supabase,
+      "chat_ai",
+      googleModelPriceKeys(model),
+    );
 
-    if (!data) {
+    if (!match) {
       throw new PricingConfigError(
         `Pricing configuration missing for chat model: ${model}`
       );
     }
-    return data.cost;
+    return match.cost;
   }
 
   /* ── Video (Kling — unified: I2V, Extension, Motion Control, Omni) ── */

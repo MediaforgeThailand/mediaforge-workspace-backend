@@ -1735,7 +1735,10 @@ async function executeBanana(
 }
 
 async function executeChatAi(params: Record<string, unknown>): Promise<ProviderResult> {
-  const model = String(params.model_name ?? "google/gemini-3-pro-preview");
+  const requestedModel = String(params.model_name ?? "google/gemini-3-pro-preview");
+  const model = requestedModel.startsWith("gemini-")
+    ? `google/${requestedModel}`
+    : requestedModel;
   const systemPrompt = String(params.system_prompt ?? "You are a helpful AI assistant.");
   const userPrompt = String(params.prompt ?? "");
   const temperature = Number(params.temperature ?? 0.7);
@@ -3338,6 +3341,75 @@ async function resolveWorkspaceTeamId(
   }
 }
 
+async function ensureSpendableUserCreditBatch(
+  supabase: ReturnType<typeof createClient>,
+  creditUserId: string,
+  requiredAmount: number,
+): Promise<void> {
+  if (!creditUserId || requiredAmount <= 0) return;
+
+  try {
+    const nowIso = new Date().toISOString();
+    const [creditsRes, batchesRes] = await Promise.all([
+      supabase
+        .from("user_credits")
+        .select("balance")
+        .eq("user_id", creditUserId)
+        .maybeSingle(),
+      supabase
+        .from("credit_batches")
+        .select("remaining")
+        .eq("user_id", creditUserId)
+        .gt("remaining", 0)
+        .gt("expires_at", nowIso),
+    ]);
+
+    if (creditsRes.error) {
+      console.warn("[workspace-credits] balance repair skipped:", creditsRes.error.message);
+      return;
+    }
+    if (batchesRes.error) {
+      console.warn("[workspace-credits] batch repair skipped:", batchesRes.error.message);
+      return;
+    }
+
+    const scalarBalance = Math.max(0, Math.floor(Number(creditsRes.data?.balance ?? 0)));
+    const activeBatchBalance = (batchesRes.data ?? []).reduce(
+      (sum, row: { remaining?: number | null }) => sum + Math.max(0, Math.floor(Number(row.remaining ?? 0))),
+      0,
+    );
+
+    if (activeBatchBalance >= requiredAmount || scalarBalance <= activeBatchBalance) {
+      return;
+    }
+
+    const repairAmount = scalarBalance - activeBatchBalance;
+    const expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+    const { error } = await supabase.from("credit_batches").insert({
+      user_id: creditUserId,
+      amount: repairAmount,
+      remaining: repairAmount,
+      source_type: "topup",
+      expires_at: expiresAt,
+      reference_id: `balance-repair-${Date.now()}`,
+    });
+
+    if (error) {
+      console.warn("[workspace-credits] balance repair insert failed:", error.message);
+      return;
+    }
+
+    console.log(
+      `[workspace-credits] repaired spendable batch user=${creditUserId} amount=${repairAmount} active_before=${activeBatchBalance} scalar=${scalarBalance}`,
+    );
+  } catch (err) {
+    console.warn(
+      "[workspace-credits] balance repair failed:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
 async function consumeWorkspaceCredits(args: {
   supabase: ReturnType<typeof createClient>;
   userId: string;
@@ -3367,6 +3439,11 @@ async function consumeWorkspaceCredits(args: {
   const description = creditOwner.isSharedPool
     ? `${descriptionBase} (CMO shared pool; actual user ${creditOwner.email ?? args.userId})`
     : descriptionBase;
+
+  if (!teamId) {
+    await ensureSpendableUserCreditBatch(args.supabase, creditOwner.creditUserId, amount);
+  }
+
   const { data, error } = await args.supabase.rpc("consume_credits_for", {
     p_user_id: creditOwner.creditUserId,
     p_team_id: teamId,
