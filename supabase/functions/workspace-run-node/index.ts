@@ -274,6 +274,191 @@ interface ProviderResult {
   provider_meta?: Record<string, unknown>;
 }
 
+/* ═══════════════════════════════════════════════════════════
+   Generation-analytics recorder
+   ───────────────────────────────────────────────────────────
+   Workspace V2 is otherwise stateless — no flow_runs, no
+   pipeline_executions, no credit_transactions. To get any
+   visibility on per-model / per-tier volume we drop one row
+   into `workspace_generation_events` after each successful
+   run. The admin_workspace_analytics edge function aggregates
+   over this table.
+
+   Recording is best-effort: any DB error is logged + swallowed
+   so a transient pg hiccup never fails a working generation.
+   ═══════════════════════════════════════════════════════════ */
+
+/** Bucket image dimensions / video resolution into the four output tiers
+ *  the analytics surface displays. Matches the spec:
+ *    < 768  → low
+ *    < 1280 → medium
+ *    < 1920 → high
+ *    ≥ 1920 → 2k
+ *  When width/height are unknown we return null so the analytics page
+ *  can show "—" rather than mis-classify. */
+function classifyOutputTier(
+  width: number | null,
+  height: number | null,
+): string | null {
+  const max = Math.max(width ?? 0, height ?? 0);
+  if (!max) return null;
+  if (max >= 1920) return "2k";
+  if (max >= 1280) return "high";
+  if (max >= 768) return "medium";
+  return "low";
+}
+
+/** Map a provider key + raw params/result into a (feature, model, tier,
+ *  width, height, duration) tuple suitable for insertion. We pull
+ *  width/height first from the resolved params (image gens accept
+ *  explicit width × height or a `size` like "1024x1024"), fall back to
+ *  provider_meta when present (some providers echo the actual canvas
+ *  back), and last-ditch parse `aspect_ratio` shapes like "16:9" — but
+ *  aspect alone gives us no absolute pixel size, so we leave tier null
+ *  in that case. */
+function deriveAnalyticsFromRun(
+  provider: string,
+  nodeType: string,
+  params: Record<string, unknown>,
+  result: ProviderResult,
+): {
+  feature: string;
+  model: string;
+  output_tier: string | null;
+  width: number | null;
+  height: number | null;
+  duration_seconds: number | null;
+  aspect_ratio: string | null;
+} {
+  // Feature: derive from output type, falling back to nodeType keyword.
+  let feature: string;
+  if (result.output_type === "video_url") feature = "video";
+  else if (result.output_type === "image_url") feature = "image";
+  else if (result.output_type === "text") feature = "text";
+  else if (/audio/i.test(nodeType)) feature = "audio";
+  else if (/3d|tripo/i.test(nodeType)) feature = "model_3d";
+  else feature = "image"; // safest default for image-shaped node types
+
+  const model = String(
+    params.model_name ?? params.model ?? provider ?? "unknown",
+  );
+
+  // Width / height extraction — order matters.
+  let width: number | null = null;
+  let height: number | null = null;
+
+  const paramWidth = Number(params.width);
+  const paramHeight = Number(params.height);
+  if (Number.isFinite(paramWidth) && paramWidth > 0) width = paramWidth;
+  if (Number.isFinite(paramHeight) && paramHeight > 0) height = paramHeight;
+
+  // OpenAI gpt-image / DALL·E style "1024x1024".
+  if ((!width || !height) && typeof params.size === "string") {
+    const m = params.size.match(/^(\d+)x(\d+)$/i);
+    if (m) {
+      width = width ?? Number(m[1]);
+      height = height ?? Number(m[2]);
+    }
+  }
+
+  // Banana/Gemini "image_size" enum — gemini-3.x uses "1K", "2K", "4K"
+  // OR explicit dimensions. Bucket the enums directly.
+  let tierFromEnum: string | null = null;
+  const imageSize = String(params.image_size ?? params.imageSize ?? "")
+    .toLowerCase()
+    .trim();
+  if (imageSize === "4k") tierFromEnum = "2k"; // bucket 4k into top tier for analytics
+  else if (imageSize === "2k") tierFromEnum = "2k";
+  else if (imageSize === "1k") tierFromEnum = "high";
+  else if (imageSize === "512" || imageSize === "low") tierFromEnum = "low";
+
+  // provider_meta echo (e.g. Kling sometimes returns the actual rendered
+  // size). Optional, last-resort.
+  const meta = result.provider_meta ?? {};
+  if (!width && typeof meta.width === "number") width = meta.width;
+  if (!height && typeof meta.height === "number") height = meta.height;
+
+  // Duration (videos): Kling has `duration_seconds` or `duration`.
+  let duration: number | null = null;
+  const durRaw = params.duration_seconds ?? params.duration;
+  if (durRaw !== undefined && durRaw !== null) {
+    const n = Number(durRaw);
+    if (Number.isFinite(n) && n > 0) duration = n;
+  }
+
+  const aspect = typeof params.aspect_ratio === "string" && params.aspect_ratio
+    ? String(params.aspect_ratio)
+    : null;
+
+  // Tier resolution: pixel-based first, enum fallback.
+  const tier = classifyOutputTier(width, height) ?? tierFromEnum;
+
+  return {
+    feature,
+    model,
+    output_tier: tier,
+    width,
+    height,
+    duration_seconds: duration,
+    aspect_ratio: aspect,
+  };
+}
+
+/** Insert one analytics row for a successful run. Best-effort: errors
+ *  are logged + swallowed. Caller must already have a service-role
+ *  supabase client (the dispatcher does — it bypasses RLS for asset
+ *  inserts too). */
+async function recordGenerationEvent(args: {
+  supabase: ReturnType<typeof createClient>;
+  userId: string;
+  provider: string;
+  nodeType: string;
+  params: Record<string, unknown>;
+  result: ProviderResult;
+  workspaceId?: string | null;
+  canvasId?: string | null;
+  nodeId?: string | null;
+}): Promise<void> {
+  try {
+    const a = deriveAnalyticsFromRun(
+      args.provider,
+      args.nodeType,
+      args.params,
+      args.result,
+    );
+    const { error } = await args.supabase
+      .from("workspace_generation_events")
+      .insert({
+        user_id: args.userId,
+        workspace_id: args.workspaceId ?? null,
+        canvas_id: args.canvasId ?? null,
+        node_id: args.nodeId ?? null,
+        feature: a.feature,
+        model: a.model,
+        provider: args.provider,
+        output_tier: a.output_tier,
+        output_count: 1,
+        width: a.width,
+        height: a.height,
+        duration_seconds: a.duration_seconds,
+        aspect_ratio: a.aspect_ratio,
+        status: "completed",
+        task_id: args.result.task_id ?? null,
+      });
+    if (error) {
+      console.warn(
+        "[workspace-run-node] analytics insert skipped:",
+        error.message,
+      );
+    }
+  } catch (err) {
+    console.warn(
+      "[workspace-run-node] analytics insert threw:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
 /**
  * Extract end frame from a video URL.
  * TODO: Implement actual frame extraction (FFmpeg or provider API).
@@ -2855,6 +3040,12 @@ interface WorkspaceRunBody {
    *  CORS. Used to migrate generations that were created before
    *  the inline mirror was deployed in poll_tripo3d. */
   url?: string;
+  /** Optional context the frontend may pass for analytics attribution.
+   *  Recorded in workspace_generation_events alongside user_id. None of
+   *  these affect generation behaviour — they're informational only. */
+  workspace_id?: string;
+  canvas_id?: string;
+  node_id?: string;
 }
 
 serve(async (req) => {
@@ -3557,6 +3748,25 @@ serve(async (req) => {
       `[workspace-run-node] ${nodeType} (${provider}) done in ${durationMs}ms ` +
       `-> ${responseType}${result.task_id ? " task=" + result.task_id : ""}`,
     );
+
+    // Record an analytics event. Wrapped helper is best-effort and never
+    // throws — a failed insert must not fail the user's run. Skipped for
+    // text-only outputs (chat / video-to-prompt) since the analytics
+    // surface is purely media-volume oriented today; we'd just be
+    // inflating row counts with no business signal.
+    if (result.output_type !== "text") {
+      await recordGenerationEvent({
+        supabase,
+        userId: user.id,
+        provider,
+        nodeType,
+        params,
+        result,
+        workspaceId: body.workspace_id ?? null,
+        canvasId: body.canvas_id ?? null,
+        nodeId: body.node_id ?? null,
+      });
+    }
 
     // Surface text outputs at the top level so the frontend's `r.text`
     // path picks them up (used by Chat AI, Video to Prompt, etc.).

@@ -122,3 +122,9 @@ verify_jwt = false
 
 [functions.admin_workspace_logs]
 verify_jwt = false
+
+[functions.admin_workspace_pricing]
+verify_jwt = false
+
+[functions.admin_workspace_analytics]
+verify_jwt = false
