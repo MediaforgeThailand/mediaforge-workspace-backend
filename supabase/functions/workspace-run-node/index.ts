@@ -1312,6 +1312,10 @@ async function executeSeedream(
   let size: string | undefined;
   if (typeof sizeRaw === "string" && /^\d+x\d+$/i.test(sizeRaw)) {
     size = sizeRaw;
+  } else if (typeof sizeRaw === "string" && sizeRaw.toLowerCase() === "2k") {
+    size = "2048x2048";
+  } else if (typeof sizeRaw === "string" && sizeRaw.toLowerCase() === "3k") {
+    size = "3072x3072";
   } else if (typeof params.width === "number" && typeof params.height === "number") {
     size = `${params.width}x${params.height}`;
   } else {
@@ -4176,15 +4180,6 @@ serve(async (req) => {
         nodeType,
         runRequest.params?.model_name as string | undefined,
       );
-      if (provider === "seedream") {
-        return new Response(
-          JSON.stringify({
-            error:
-              "SeedDream is not available in Workspace runtime yet. Pick Banana, GPT Image 2, Kling, Seedance, TTS, or 3D for now.",
-          }),
-          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
-        );
-      }
       const model = String(
         runRequest.params?.model_name ??
           runRequest.params?.model ??

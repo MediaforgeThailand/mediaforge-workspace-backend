@@ -38,7 +38,7 @@ export interface SeedreamModelEntry {
   /** Ark model ID — the value sent in the API `model` field. */
   model: string;
   /** Pricing/quality tier label. Used for logging only. */
-  tier: "v4" | "v5";
+  tier: "v4" | "v5" | "v5-lite";
   /** Maximum supported size string the model accepts. */
   maxSize: string;
 }
@@ -50,6 +50,8 @@ export const SEEDREAM_MODEL_MAP: Record<string, SeedreamModelEntry> = {
   "seedream-5-0":          { model: "seedream-5-0-260128", tier: "v5", maxSize: "2048x2048" },
   "seedream-5-0-260128":   { model: "seedream-5-0-260128", tier: "v5", maxSize: "2048x2048" },
   "seedream-5":            { model: "seedream-5-0-260128", tier: "v5", maxSize: "2048x2048" },
+  "seedream-5-0-lite-260128": { model: "seedream-5-0-lite-260128", tier: "v5-lite", maxSize: "2048x2048" },
+  "seedream-4-5-251128":   { model: "seedream-4-5-251128", tier: "v4", maxSize: "2048x2048" },
 };
 
 export interface SeedreamGenerateRequest {
