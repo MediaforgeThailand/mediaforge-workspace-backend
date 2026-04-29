@@ -1191,8 +1191,6 @@ async function executeKlingOmni(
 async function executeSeedance(
   params: Record<string, unknown>,
 ): Promise<ProviderResult> {
-  const { apiKey } = loadSeedanceCredentials();
-
   const modelSlug = String(params.model_name ?? params.model ?? "seedance-1-5-pro-251215");
   const entry = SEEDANCE_MODEL_MAP[modelSlug];
   if (!entry) {
@@ -1201,6 +1199,8 @@ async function executeSeedance(
         `Available: ${Object.keys(SEEDANCE_MODEL_MAP).join(", ")}`,
     );
   }
+  const isV2 = entry.model.startsWith("dreamina-seedance-2-0");
+  const { apiKey } = loadSeedanceCredentials({ v2: isV2 });
 
   const prompt = String(params.prompt ?? "").trim();
 
@@ -3801,6 +3801,8 @@ interface WorkspaceRunBody {
   job_id?: string;
   task_id?: string;
   poll_endpoint?: string;
+  model?: string;
+  provider_model_id?: string;
   /** For action="mirror_tripo_url": the Tripo3D CDN URL to mirror
    *  into Supabase storage so model-viewer can fetch it across
    *  CORS. Used to migrate generations that were created before
@@ -3963,6 +3965,8 @@ async function pollWorkspaceAsyncResult(args: {
         action: pollAction,
         task_id: taskId,
         poll_endpoint: pollEndpoint,
+        model: String(providerMeta.model ?? providerMeta.provider_model_id ?? ""),
+        provider_model_id: String(providerMeta.provider_model_id ?? ""),
       } as WorkspaceRunBody,
     });
     lastStatus = String(pollResp.status ?? "").toLowerCase();
@@ -4555,11 +4559,14 @@ serve(async (req) => {
       let pollUrlOk = false;
       try {
         const u = new URL(pollEndpoint);
-        // Volcengine Ark host is allowed; path must be exactly the
-        // tasks endpoint (we append /{taskId} below).
+        const seedanceBaseHost = new URL(SEEDANCE_BASE).hostname;
+        // Volcengine/BytePlus Ark hosts are allowed; path must be
+        // exactly the tasks endpoint (we append /{taskId} below).
         pollUrlOk =
           u.protocol === "https:" &&
-          (u.hostname === "ark.cn-beijing.volces.com" ||
+          (u.hostname === seedanceBaseHost ||
+            u.hostname === "ark.cn-beijing.volces.com" ||
+            u.hostname.endsWith(".bytepluses.com") ||
             u.hostname.endsWith(".byteplusapi.com")) &&
           u.pathname.replace(/\/+$/, "") === SEEDANCE_TASKS_PATH;
       } catch {
@@ -4573,7 +4580,9 @@ serve(async (req) => {
       }
       let creds;
       try {
-        creds = loadSeedanceCredentials();
+        const pollModel = String(body.model ?? body.provider_model_id ?? "").toLowerCase();
+        const isV2Poll = pollModel.includes("seedance-2-0");
+        creds = loadSeedanceCredentials({ v2: isV2Poll });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         return new Response(
