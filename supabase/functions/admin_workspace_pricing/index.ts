@@ -453,10 +453,41 @@ async function saveCreditCostRow(
   return data;
 }
 
+async function cleanupLegacyPricingRows(client: SupabaseClient): Promise<number> {
+  let deleted = 0;
+  const staleDeletes = [
+    client
+      .from("credit_costs")
+      .delete()
+      .eq("feature", "generate_freepik_video")
+      .in("model", ["kling-v2-6-pro", "kling-v2-6-motion-pro"])
+      .eq("pricing_type", "fixed"),
+    client
+      .from("credit_costs")
+      .delete()
+      .eq("feature", "generate_openai_image")
+      .in("model", ["gpt-image-2:4k:low", "gpt-image-2:4k:medium", "gpt-image-2:4k:high"]),
+    client
+      .from("credit_costs")
+      .delete()
+      .like("label", "[STUB]%"),
+  ];
+  for (const deleteQuery of staleDeletes) {
+    const { count, error } = await deleteQuery.select("id", { count: "exact", head: true });
+    if (error) {
+      console.warn("admin_workspace_pricing: legacy cleanup skipped:", error.message);
+      continue;
+    }
+    deleted += count ?? 0;
+  }
+  return deleted;
+}
+
 async function seedWorkspacePricingCatalog(
   client: SupabaseClient,
   audit: { adminUserId: string | null },
-): Promise<{ data: { written: number; ratio: number; rows: unknown[] } }> {
+): Promise<{ data: { written: number; deleted_legacy: number; ratio: number; rows: unknown[] } }> {
+  const deletedLegacy = await cleanupLegacyPricingRows(client);
   const rows: unknown[] = [];
   for (const row of RECOMMENDED_WORKSPACE_PRICING) {
     rows.push(await saveCreditCostRow(client, row));
@@ -471,9 +502,9 @@ async function seedWorkspacePricingCatalog(
     adminUserId: audit.adminUserId,
     action: "workspace_pricing_catalog.seed",
     targetTable: "credit_costs",
-    details: { written: rows.length, ratio: FLOW_TO_WORKSPACE_RATIO, buffer_percent: buffer.data.buffer_percent },
+    details: { written: rows.length, deleted_legacy: deletedLegacy, ratio: FLOW_TO_WORKSPACE_RATIO, buffer_percent: buffer.data.buffer_percent },
   });
-  return { data: { written: rows.length, ratio: FLOW_TO_WORKSPACE_RATIO, rows } };
+  return { data: { written: rows.length, deleted_legacy: deletedLegacy, ratio: FLOW_TO_WORKSPACE_RATIO, rows } };
 }
 
 async function importFlowCreditCosts(

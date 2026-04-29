@@ -331,6 +331,19 @@ export async function lookupBaseCost(
     );
   }
 
+  const { data: perSecondExact } = await supabase
+    .from("credit_costs").select("cost, pricing_type")
+    .eq("feature", "generate_freepik_video")
+    .eq("model", model)
+    .eq("pricing_type", "per_second")
+    .eq("has_audio", hasAudio)
+    .limit(1).maybeSingle();
+
+  if (perSecondExact) {
+    const effectiveDuration = isMotion && duration <= 0 ? 5 : duration;
+    return Math.ceil(perSecondExact.cost * effectiveDuration);
+  }
+
   const { data: exactMatchLate } = await supabase
     .from("credit_costs").select("cost")
     .eq("feature", "generate_freepik_video")
@@ -351,19 +364,6 @@ export async function lookupBaseCost(
     .limit(1).maybeSingle();
 
   if (durationMatchLate) return durationMatchLate.cost;
-
-  const { data: perSecondExact } = await supabase
-    .from("credit_costs").select("cost, pricing_type")
-    .eq("feature", "generate_freepik_video")
-    .eq("model", model)
-    .eq("pricing_type", "per_second")
-    .eq("has_audio", hasAudio)
-    .limit(1).maybeSingle();
-
-  if (perSecondExact) {
-    const effectiveDuration = isMotion && duration <= 0 ? 5 : duration;
-    return Math.ceil(perSecondExact.cost * effectiveDuration);
-  }
 
   const { data } = await supabase
     .from("credit_costs").select("cost, pricing_type")
