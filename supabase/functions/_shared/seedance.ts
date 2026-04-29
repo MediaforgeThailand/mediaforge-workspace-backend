@@ -42,10 +42,18 @@ export const SEEDANCE_MODEL_MAP: Record<string, SeedanceModelEntry> = {
   "seedance-1-0-pro-250528": { model: "seedance-1-0-pro-250528", tier: "pro", supportsAudio: false },
   "seedance-1-0-pro-fast-251015": { model: "seedance-1-0-pro-fast-251015", tier: "pro-fast", supportsAudio: false },
   "seedance-1-5-pro-251215": { model: "seedance-1-5-pro-251215", tier: "pro", supportsAudio: true },
-  // Seedance 2.0 family — TODO: confirm exact dated model IDs once Volcengine
-  // publishes them. Use the unversioned slug as a fallback alias.
-  "seedance-2-0-lite": { model: "seedance-2-0-lite", tier: "lite", supportsAudio: true },
-  "seedance-2-0-pro": { model: "seedance-2-0-pro", tier: "pro", supportsAudio: true },
+  // Seedance 2.0 family — BytePlus ModelArk model IDs (verified in
+  // ap-southeast-1 console on 2026-04-30). The UI slug stays
+  // "seedance-2-0-{lite|pro}" so the frontend dropdown doesn't have
+  // to change; we forward the BytePlus identifier on the wire.
+  //   - dreamina-seedance-2-0.260128       = Seedance 2.0 Pro (full)
+  //   - dreamina-seedance-2-0-fast.260128  = Seedance 2.0 Fast (lite)
+  "seedance-2-0-lite": { model: "dreamina-seedance-2-0-fast.260128", tier: "lite", supportsAudio: true },
+  "seedance-2-0-pro":  { model: "dreamina-seedance-2-0.260128",      tier: "pro",  supportsAudio: true },
+  // Direct-ID aliases — let the BytePlus IDs themselves resolve in
+  // case any caller already sends the verbatim identifier.
+  "dreamina-seedance-2-0.260128":      { model: "dreamina-seedance-2-0.260128",      tier: "pro",  supportsAudio: true },
+  "dreamina-seedance-2-0-fast.260128": { model: "dreamina-seedance-2-0-fast.260128", tier: "lite", supportsAudio: true },
 };
 
 export interface SeedanceTaskCreate {
