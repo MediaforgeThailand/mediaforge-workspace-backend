@@ -61,16 +61,28 @@ export const SEEDANCE_MODEL_MAP: Record<string, SeedanceModelEntry> = {
 export interface SeedanceTaskCreate {
   model: string;
   /**
-   * Volcengine "content" array — same shape as Doubao multimodal.
-   * Each item is `{ type: "text", text }` for the prompt/params, or
-   * `{ type: "image_url", image_url: { url } }` for image-to-video
-   * reference frames (start_frame / end_frame).
+   * Ark "content" array — multimodal. Each item is one of:
+   *   - { type: "text", text }                                     (prompt)
+   *   - { type: "image_url",  image_url:  { url }, role? }         (ref image)
+   *   - { type: "video_url",  video_url:  { url }, role? }         (ref video, 2.0+)
+   *   - { type: "audio_url",  audio_url:  { url }, role? }         (ref audio, 2.0+)
    *
-   * Trailing flags inside the prompt text drive ratio / resolution /
-   * duration / audio: e.g.
-   *   "subject + action --resolution 720p --ratio 16:9 --duration 5 --camerafixed false"
+   * Roles per BytePlus 2.0 spec are `reference_image`,
+   * `reference_video`, `reference_audio`. Legacy 1.x omits the
+   * role entirely on image_url and still accepts trailing
+   * `--flag` tokens inline in the prompt text.
    */
   content: Array<Record<string, unknown>>;
+  /* ── Top-level generation params (Seedance 2.0 spec). ──
+   *  1.x ignores these and reads the same values from inline
+   *  prompt flags instead — callers that target 1.x should leave
+   *  these undefined and rely on buildSeedanceContent's flag mode. */
+  ratio?: string;
+  duration?: number;
+  resolution?: string;
+  generate_audio?: boolean;
+  watermark?: boolean;
+  seed?: number;
 }
 
 export interface SeedanceTaskCreateResponse {
@@ -94,7 +106,7 @@ export interface SeedanceTaskStatus {
 
 export interface SeedanceParams {
   prompt: string;
-  /** Resolution flag — Volcengine accepts "480p" | "720p" | "1080p". */
+  /** Resolution — "480p" | "720p" | "1080p". */
   resolution?: string;
   /** Aspect ratio — "16:9" | "9:16" | "1:1" | "4:3" | "21:9" | "adaptive". */
   ratio?: string;
@@ -102,7 +114,7 @@ export interface SeedanceParams {
   duration?: number;
   /** Generate audio track (Seedance 1.5+ / 2.0). */
   generateAudio?: boolean;
-  /** Lock camera position (no auto pan/zoom). */
+  /** Lock camera position (no auto pan/zoom). 1.x only — 2.0 ignores. */
   cameraFixed?: boolean;
   /** Optional seed for reproducibility. */
   seed?: number;
@@ -114,10 +126,89 @@ export interface SeedanceParams {
   endFrameUrl?: string;
   /** Seedance 2.0 multimodal reference video URL. */
   referenceVideoUrl?: string;
+  /** Seedance 2.0 multimodal reference audio URL. */
+  referenceAudioUrl?: string;
 }
 
-/** Build the Volcengine Ark "content" array from prompt + params. */
-export function buildSeedanceContent(p: SeedanceParams): Array<Record<string, unknown>> {
+/** Result of `buildSeedanceContent` — `content` plus optional
+ *  top-level fields the v2 spec expects beside the array. Spread
+ *  these straight into the body of `submitSeedanceTask` and let
+ *  the legacy fields stay `undefined` for 1.x callers. */
+export interface BuiltSeedanceBody {
+  content: Array<Record<string, unknown>>;
+  ratio?: string;
+  duration?: number;
+  resolution?: string;
+  generate_audio?: boolean;
+  watermark?: boolean;
+  seed?: number;
+}
+
+/**
+ * Build the Ark task body. The shape diverges between Seedance 1.x
+ * and 2.0:
+ *
+ *   - 1.x → inline `--flag value` tokens trailing the prompt text
+ *           (BytePlus parses them server-side); image_url has no role.
+ *   - 2.0 → top-level fields (`ratio`, `duration`, `generate_audio`,
+ *           `watermark`, `seed`) sit beside `content`; ref images
+ *           carry `role: "reference_image"`, video carries
+ *           `role: "reference_video"`, audio carries
+ *           `role: "reference_audio"`. (Confirmed against the
+ *           BytePlus official curl examples on 2026-04-30.)
+ *
+ * Pass `{ v2: true }` for the dreamina-seedance-* family; default
+ * stays on 1.x flag-encoding for backwards compatibility.
+ */
+export function buildSeedanceContent(
+  p: SeedanceParams,
+  opts?: { v2?: boolean },
+): BuiltSeedanceBody {
+  if (opts?.v2) {
+    // ── Seedance 2.0 — top-level fields + named-role multimodal refs.
+    const content: Array<Record<string, unknown>> = [
+      { type: "text", text: p.prompt.trim() },
+    ];
+    if (p.startFrameUrl) {
+      content.push({
+        type: "image_url",
+        image_url: { url: p.startFrameUrl },
+        role: "reference_image",
+      });
+    }
+    if (p.endFrameUrl) {
+      content.push({
+        type: "image_url",
+        image_url: { url: p.endFrameUrl },
+        role: "reference_image",
+      });
+    }
+    if (p.referenceVideoUrl) {
+      content.push({
+        type: "video_url",
+        video_url: { url: p.referenceVideoUrl },
+        role: "reference_video",
+      });
+    }
+    if (p.referenceAudioUrl) {
+      content.push({
+        type: "audio_url",
+        audio_url: { url: p.referenceAudioUrl },
+        role: "reference_audio",
+      });
+    }
+    return {
+      content,
+      ratio: p.ratio,
+      duration: p.duration,
+      resolution: p.resolution,
+      generate_audio: p.generateAudio,
+      watermark: p.watermark ?? false,
+      seed: p.seed,
+    };
+  }
+
+  // ── Legacy 1.x — flag tokens inlined in the prompt text.
   const flags: string[] = [];
   if (p.resolution) flags.push(`--resolution ${p.resolution}`);
   if (p.ratio) flags.push(`--ratio ${p.ratio}`);
@@ -136,25 +227,16 @@ export function buildSeedanceContent(p: SeedanceParams): Array<Record<string, un
     content.push({
       type: "image_url",
       image_url: { url: p.startFrameUrl },
-      role: "first_frame",
     });
   }
   if (p.endFrameUrl) {
     content.push({
       type: "image_url",
       image_url: { url: p.endFrameUrl },
-      role: "last_frame",
-    });
-  }
-  if (p.referenceVideoUrl) {
-    content.push({
-      type: "video_url",
-      video_url: { url: p.referenceVideoUrl },
-      role: "reference_video",
     });
   }
 
-  return content;
+  return { content };
 }
 
 export interface SeedanceCredentials {
