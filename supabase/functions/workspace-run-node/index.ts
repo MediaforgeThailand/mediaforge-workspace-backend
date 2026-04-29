@@ -283,6 +283,11 @@ interface ProviderResult {
   outputs: Record<string, string>;
   output_type: "video_url" | "image_url" | "text" | "audio_url";
   provider_meta?: Record<string, unknown>;
+  /** Number of distinct media units produced this run. Default 1.
+   *  Set by executors that can emit multiple outputs per call (e.g.
+   *  Banana / GPT-Image with n>1) so usage logging records the true
+   *  unit count instead of undercounting cost. */
+  output_count?: number;
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -1498,6 +1503,13 @@ async function executeChatAi(params: Record<string, unknown>): Promise<ProviderR
   }
 
   let content: string;
+  // Captured per-provider so analytics can record cost-driving token
+  // counts. Both OpenAI Chat Completions and Gemini generateContent
+  // return usage metadata — fold whichever shape the provider gives us
+  // into a normalized {tokens_in, tokens_out, tokens_total} shape.
+  let tokensIn: number | null = null;
+  let tokensOut: number | null = null;
+  let tokensTotal: number | null = null;
 
   if (model.startsWith("google/")) {
     const GOOGLE_KEY = Deno.env.get("GOOGLE_AI_STUDIO_KEY");
@@ -1529,6 +1541,15 @@ async function executeChatAi(params: Record<string, unknown>): Promise<ProviderR
     }
     const data = await res.json();
     content = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    // Gemini usage shape: usageMetadata.{promptTokenCount, candidatesTokenCount, totalTokenCount}
+    const usage = data.usageMetadata as
+      | { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number }
+      | undefined;
+    if (usage) {
+      if (typeof usage.promptTokenCount === "number") tokensIn = usage.promptTokenCount;
+      if (typeof usage.candidatesTokenCount === "number") tokensOut = usage.candidatesTokenCount;
+      if (typeof usage.totalTokenCount === "number") tokensTotal = usage.totalTokenCount;
+    }
   } else if (model.startsWith("openai/")) {
     const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY");
     if (!OPENAI_KEY) throw new Error("OPENAI_API_KEY is not configured");
@@ -1545,11 +1566,30 @@ async function executeChatAi(params: Record<string, unknown>): Promise<ProviderR
     }
     const data = await res.json();
     content = data.choices?.[0]?.message?.content ?? "";
+    // OpenAI usage shape: usage.{prompt_tokens, completion_tokens, total_tokens}
+    const usage = data.usage as
+      | { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+      | undefined;
+    if (usage) {
+      if (typeof usage.prompt_tokens === "number") tokensIn = usage.prompt_tokens;
+      if (typeof usage.completion_tokens === "number") tokensOut = usage.completion_tokens;
+      if (typeof usage.total_tokens === "number") tokensTotal = usage.total_tokens;
+    }
   } else {
     throw new Error(`Unsupported model: ${model}`);
   }
 
-  return { result_url: content, outputs: { output_text: content }, output_type: "text", provider_meta: { model } };
+  const providerMeta: Record<string, unknown> = { model };
+  if (tokensIn !== null) providerMeta.tokens_in = tokensIn;
+  if (tokensOut !== null) providerMeta.tokens_out = tokensOut;
+  if (tokensTotal !== null) providerMeta.tokens_total = tokensTotal;
+
+  return {
+    result_url: content,
+    outputs: { output_text: content },
+    output_type: "text",
+    provider_meta: providerMeta,
+  };
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -4033,23 +4073,22 @@ serve(async (req) => {
     );
 
     // Record an analytics event. Wrapped helper is best-effort and never
-    // throws — a failed insert must not fail the user's run. Skipped for
-    // text-only outputs (chat / video-to-prompt) since the analytics
-    // surface is purely media-volume oriented today; we'd just be
-    // inflating row counts with no business signal.
-    if (result.output_type !== "text") {
-      await recordGenerationEvent({
-        supabase,
-        userId: user.id,
-        provider,
-        nodeType,
-        params,
-        result,
-        workspaceId: body.workspace_id ?? null,
-        canvasId: body.canvas_id ?? null,
-        nodeId: body.node_id ?? null,
-      });
-    }
+    // throws — a failed insert must not fail the user's run. Logs every
+    // output_type now (text included) so chat-AI usage gets billed for
+    // CMO-agency seats. Helper maps text → feature="chat_ai" to align
+    // with credit_costs naming, and pulls token counts out of
+    // provider_meta when the executor exposes them.
+    await recordGenerationEvent({
+      supabase,
+      userId: user.id,
+      provider,
+      nodeType,
+      params,
+      result,
+      workspaceId: body.workspace_id ?? null,
+      canvasId: body.canvas_id ?? null,
+      nodeId: body.node_id ?? null,
+    });
 
     // Surface text outputs at the top level so the frontend's `r.text`
     // path picks them up (used by Chat AI, Video to Prompt, etc.).

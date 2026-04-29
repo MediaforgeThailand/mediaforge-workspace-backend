@@ -24,6 +24,11 @@ export interface ProviderResultLike {
   outputs: Record<string, unknown>;
   output_type: "video_url" | "image_url" | "text" | "audio_url";
   provider_meta?: Record<string, unknown>;
+  /** Number of distinct media units the provider produced for this run.
+   *  Defaults to 1 when omitted. Multi-image providers (Banana / GPT
+   *  Image with n>1) should set this so usage logging doesn't undercount
+   *  cost — every billable output unit gets its own per-row weight. */
+  output_count?: number;
 }
 
 /** Bucket image dimensions / video resolution into the four output tiers
@@ -63,11 +68,14 @@ export function deriveAnalyticsFromRun(
   aspect_ratio: string | null;
 } {
   // Feature: derive from output type, falling back to nodeType keyword.
+  // Text outputs map to "chat_ai" so the analytics row joins cleanly to
+  // credit_costs (whose chat-AI rates use feature="chat_ai") — keeping
+  // the two surfaces aligned means a future $/run rollup just works.
   let feature: string;
   if (result.output_type === "video_url") feature = "video";
   else if (result.output_type === "image_url") feature = "image";
   else if (result.output_type === "audio_url") feature = "audio";
-  else if (result.output_type === "text") feature = "text";
+  else if (result.output_type === "text") feature = "chat_ai";
   else if (/audio/i.test(nodeType)) feature = "audio";
   else if (/3d|tripo/i.test(nodeType)) feature = "model_3d";
   else feature = "image";
@@ -154,6 +162,16 @@ export const COST_PARAM_KEYS = [
   "has_audio",
   "format",
   "output_format",
+  // Chat-AI billing fields. Token counts come straight from provider
+  // response; max_tokens / temperature are user-tunable knobs that
+  // affect cost. Keeping them in the same whitelist means we don't
+  // touch the schema and the params jsonb stays cost-relevant only.
+  "model_name",
+  "max_tokens",
+  "temperature",
+  "tokens_in",
+  "tokens_out",
+  "tokens_total",
 ] as const;
 
 export function pickCostParams(
@@ -193,6 +211,30 @@ export async function recordGenerationEvent(args: {
       args.params,
       args.result,
     );
+
+    // Output count: trust the executor when it reports >1 (Banana,
+    // GPT-Image with n>1, etc). Default to 1 so single-output flows
+    // still record correctly. Guard against bad values by clamping
+    // negative / NaN to 1 — undercount is preferable to a poison row.
+    const rawCount = args.result.output_count;
+    const outputCount =
+      typeof rawCount === "number" && Number.isFinite(rawCount) && rawCount > 0
+        ? Math.floor(rawCount)
+        : 1;
+
+    // Merge token usage from provider_meta into params jsonb so the
+    // chat-AI analytics surface can compute cost without a schema
+    // change. Mutating a shallow copy keeps the caller's params
+    // object untouched.
+    const meta = (args.result.provider_meta ?? {}) as Record<string, unknown>;
+    const enrichedParams: Record<string, unknown> = { ...args.params };
+    for (const key of ["tokens_in", "tokens_out", "tokens_total"]) {
+      const v = meta[key];
+      if (typeof v === "number" && Number.isFinite(v) && v >= 0) {
+        enrichedParams[key] = v;
+      }
+    }
+
     const { error } = await args.supabase
       .from("workspace_generation_events")
       .insert({
@@ -204,7 +246,7 @@ export async function recordGenerationEvent(args: {
         model: a.model,
         provider: args.provider,
         output_tier: a.output_tier,
-        output_count: 1,
+        output_count: outputCount,
         width: a.width,
         height: a.height,
         duration_seconds: a.duration_seconds,
@@ -214,7 +256,9 @@ export async function recordGenerationEvent(args: {
         // Whitelisted cost-driving settings — see COST_PARAM_KEYS for
         // the full list and the migration 20260429180000 for the
         // reasoning. Null when no whitelisted keys are present.
-        params: pickCostParams(args.params),
+        // For chat_ai feature this also carries tokens_in/out merged
+        // from provider_meta above.
+        params: pickCostParams(enrichedParams),
       });
     if (error) {
       console.warn(
