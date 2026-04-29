@@ -57,6 +57,66 @@ const CORS_HEADERS = {
 const MULTIPLIER_KEYS = ["image", "video", "chat", "audio"] as const;
 type MultiplierKey = (typeof MULTIPLIER_KEYS)[number];
 const MULTIPLIER_PREFIX = "markup_multiplier_";
+const FLOW_CREDITS_PER_THB = 125;
+const WORKSPACE_CREDITS_PER_THB = 50;
+const FLOW_TO_WORKSPACE_RATIO = WORKSPACE_CREDITS_PER_THB / FLOW_CREDITS_PER_THB;
+
+type CreditCostWriteRow = {
+  feature: string;
+  model: string | null;
+  label: string;
+  cost: number;
+  pricing_type: string | null;
+  duration_seconds?: number | null;
+  has_audio?: boolean | null;
+  provider?: string | null;
+  price_key?: string | null;
+  resolution?: string | null;
+  quality?: string | null;
+  source?: string | null;
+  source_url?: string | null;
+  source_ratio?: number | null;
+  provider_unit?: string | null;
+  notes?: string | null;
+};
+
+const GPT_IMAGE_2_ROWS: CreditCostWriteRow[] = [
+  ["1k", "low", 3], ["1k", "medium", 20], ["1k", "high", 80],
+  ["2k", "low", 8], ["2k", "medium", 50], ["2k", "high", 200],
+  ["4k", "low", 18], ["4k", "medium", 120], ["4k", "high", 480],
+].map(([tier, quality, cost]) => ({
+  feature: "generate_openai_image",
+  model: `gpt-image-2:${tier}:${quality}`,
+  label: `GPT Image 2 ${String(tier).toUpperCase()} ${String(quality)[0].toUpperCase()}${String(quality).slice(1)}`,
+  cost: Number(cost),
+  pricing_type: "per_operation",
+  provider: "openai",
+  price_key: `gpt-image-2:${tier}:${quality}`,
+  resolution: String(tier).toUpperCase(),
+  quality: String(quality),
+  source: tier === "1k" ? "flow_erp_converted" : "workspace_catalog",
+  source_url: "https://platform.openai.com/docs/pricing",
+  source_ratio: FLOW_TO_WORKSPACE_RATIO,
+  provider_unit: "per image",
+  notes:
+    tier === "1k"
+      ? "Flow ERP quality row converted from 125 credits/THB to Workspace 50 credits/THB."
+      : "Workspace recommended tier. Keep this easy to override after invoice reconciliation.",
+}));
+
+const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
+  ...GPT_IMAGE_2_ROWS,
+  { feature: "generate_openai_image", model: "gpt-image-2-low", label: "GPT Image 2 Low (fallback)", cost: 3, pricing_type: "per_operation", provider: "openai", price_key: "gpt-image-2:1k:low", resolution: "1K", quality: "low", source: "flow_erp_converted", source_url: "https://platform.openai.com/docs/pricing", source_ratio: FLOW_TO_WORKSPACE_RATIO, provider_unit: "per image" },
+  { feature: "generate_openai_image", model: "gpt-image-2-medium", label: "GPT Image 2 Medium (fallback)", cost: 20, pricing_type: "per_operation", provider: "openai", price_key: "gpt-image-2:1k:medium", resolution: "1K", quality: "medium", source: "flow_erp_converted", source_url: "https://platform.openai.com/docs/pricing", source_ratio: FLOW_TO_WORKSPACE_RATIO, provider_unit: "per image" },
+  { feature: "generate_openai_image", model: "gpt-image-2-high", label: "GPT Image 2 High (fallback)", cost: 80, pricing_type: "per_operation", provider: "openai", price_key: "gpt-image-2:1k:high", resolution: "1K", quality: "high", source: "flow_erp_converted", source_url: "https://platform.openai.com/docs/pricing", source_ratio: FLOW_TO_WORKSPACE_RATIO, provider_unit: "per image" },
+  { feature: "text_to_speech", model: "google-tts-studio", label: "Google Cloud TTS Studio / 1K chars", cost: 280, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-studio", quality: "studio", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
+  { feature: "text_to_speech", model: "google-tts-neural2", label: "Google Cloud TTS Neural2 / 1K chars", cost: 28, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-neural2", quality: "neural2", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
+  { feature: "text_to_speech", model: "google-tts-wavenet", label: "Google Cloud TTS WaveNet / 1K chars", cost: 28, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-wavenet", quality: "wavenet", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
+  { feature: "video_to_prompt", model: "gemini-video-understanding", label: "Video to Prompt (Gemini)", cost: 10, pricing_type: "per_operation", provider: "google", price_key: "gemini-video-understanding", source: "workspace_catalog", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per analysis" },
+  { feature: "model_3d", model: "tripo3d-v3.1", label: "Tripo3D v3.1", cost: 80, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v3.1", quality: "detailed", source: "workspace_catalog", source_url: "https://www.tripo3d.ai/", provider_unit: "per model" },
+  { feature: "model_3d", model: "tripo3d-p1", label: "Tripo3D P1", cost: 120, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-p1", quality: "premium", source: "workspace_catalog", source_url: "https://www.tripo3d.ai/", provider_unit: "per model" },
+  { feature: "model_3d", model: "tripo3d-turbo", label: "Tripo3D Turbo", cost: 50, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-turbo", quality: "fast", source: "workspace_catalog", source_url: "https://www.tripo3d.ai/", provider_unit: "per model" },
+];
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -154,6 +214,151 @@ async function tryAudit(
   }
 }
 
+async function saveCreditCostRow(
+  client: SupabaseClient,
+  row: CreditCostWriteRow,
+): Promise<unknown> {
+  const duration = row.duration_seconds ?? null;
+  const hasAudio = row.has_audio ?? false;
+  let query = client
+    .from("credit_costs")
+    .select("id")
+    .eq("feature", row.feature)
+    .eq("has_audio", hasAudio)
+    .limit(1);
+  query = row.model === null ? query.is("model", null) : query.eq("model", row.model);
+  query = duration === null
+    ? query.is("duration_seconds", null)
+    : query.eq("duration_seconds", duration);
+  const { data: existing, error: readErr } = await query.maybeSingle();
+  if (readErr) throw new Error(`credit_costs lookup failed: ${readErr.message}`);
+
+  const payload = {
+    feature: row.feature,
+    model: row.model,
+    label: row.label,
+    cost: row.cost,
+    pricing_type: row.pricing_type,
+    duration_seconds: duration,
+    has_audio: hasAudio,
+    provider: row.provider ?? null,
+    price_key: row.price_key ?? null,
+    resolution: row.resolution ?? null,
+    quality: row.quality ?? null,
+    source: row.source ?? null,
+    source_url: row.source_url ?? null,
+    source_ratio: row.source_ratio ?? null,
+    provider_unit: row.provider_unit ?? null,
+    notes: row.notes ?? null,
+    updated_at: new Date().toISOString(),
+  };
+
+  if ((existing as { id?: string } | null)?.id) {
+    const { data, error } = await client
+      .from("credit_costs")
+      .update(payload)
+      .eq("id", (existing as { id: string }).id)
+      .select()
+      .single();
+    if (error) throw new Error(`credit_costs update failed: ${error.message}`);
+    return data;
+  }
+
+  const { data, error } = await client
+    .from("credit_costs")
+    .insert(payload)
+    .select()
+    .single();
+  if (error) throw new Error(`credit_costs insert failed: ${error.message}`);
+  return data;
+}
+
+async function seedWorkspacePricingCatalog(
+  client: SupabaseClient,
+  audit: { adminUserId: string | null },
+): Promise<{ data: { written: number; ratio: number; rows: unknown[] } }> {
+  const rows: unknown[] = [];
+  for (const row of RECOMMENDED_WORKSPACE_PRICING) {
+    rows.push(await saveCreditCostRow(client, row));
+  }
+  await tryAudit(client, {
+    adminUserId: audit.adminUserId,
+    action: "workspace_pricing_catalog.seed",
+    targetTable: "credit_costs",
+    details: { written: rows.length, ratio: FLOW_TO_WORKSPACE_RATIO },
+  });
+  return { data: { written: rows.length, ratio: FLOW_TO_WORKSPACE_RATIO, rows } };
+}
+
+async function importFlowCreditCosts(
+  client: SupabaseClient,
+  audit: { adminUserId: string | null },
+): Promise<{ data: { imported: number; ratio: number; rows: unknown[] } }> {
+  const bridgeUrl = Deno.env.get("MAIN_BRIDGE_URL") ?? "";
+  const secret = Deno.env.get("ERP_BRIDGE_SECRET") ?? "";
+  if (!bridgeUrl || !secret) {
+    throw new Error("MAIN_BRIDGE_URL and ERP_BRIDGE_SECRET must be configured before importing Flow ERP pricing.");
+  }
+  const u = new URL(bridgeUrl);
+  u.pathname = "/functions/v1/erp-bridge";
+  const res = await fetch(u.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${secret}`,
+      "x-erp-secret": secret,
+    },
+    body: JSON.stringify({ action: "fetch_credit_costs", secret, payload: {} }),
+  });
+  const raw = await res.text();
+  let parsed: unknown = null;
+  try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = null; }
+  if (!res.ok) {
+    throw new Error(`Flow ERP import failed (${res.status}): ${raw.slice(0, 300)}`);
+  }
+  const maybe = parsed as { data?: unknown; ok?: boolean; error?: unknown };
+  const sourceRows = Array.isArray(maybe.data)
+    ? maybe.data
+    : Array.isArray(parsed)
+      ? parsed as unknown[]
+      : [];
+  if (maybe.ok === false) {
+    throw new Error(typeof maybe.error === "string" ? maybe.error : "Flow ERP bridge returned failure");
+  }
+
+  const written: unknown[] = [];
+  for (const rawRow of sourceRows) {
+    const r = rawRow as Record<string, unknown>;
+    const cost = Math.max(1, Math.ceil(Number(r.cost ?? 0) * FLOW_TO_WORKSPACE_RATIO));
+    if (!r.feature || !Number.isFinite(cost)) continue;
+    written.push(await saveCreditCostRow(client, {
+      feature: String(r.feature),
+      model: r.model == null ? null : String(r.model),
+      label: String(r.label ?? r.model ?? r.feature),
+      cost,
+      pricing_type: r.pricing_type == null ? "per_operation" : String(r.pricing_type),
+      duration_seconds: r.duration_seconds == null ? null : Number(r.duration_seconds),
+      has_audio: Boolean(r.has_audio),
+      provider: r.provider == null ? null : String(r.provider),
+      price_key: r.price_key == null ? null : String(r.price_key),
+      resolution: r.resolution == null ? null : String(r.resolution),
+      quality: r.quality == null ? null : String(r.quality),
+      source: "flow_erp_converted",
+      source_url: "Flow ERP",
+      source_ratio: FLOW_TO_WORKSPACE_RATIO,
+      provider_unit: r.provider_unit == null ? null : String(r.provider_unit),
+      notes: `Imported from Flow ERP and converted ${FLOW_CREDITS_PER_THB}->${WORKSPACE_CREDITS_PER_THB} credits/THB.`,
+    }));
+  }
+  await tryAudit(client, {
+    adminUserId: audit.adminUserId,
+    action: "flow_credit_costs.import",
+    targetTable: "credit_costs",
+    details: { imported: written.length, ratio: FLOW_TO_WORKSPACE_RATIO },
+  });
+  return { data: { imported: written.length, ratio: FLOW_TO_WORKSPACE_RATIO, rows: written } };
+}
+
 // ── Mutation handlers ────────────────────────────────────────────────
 
 async function upsertCreditCost(
@@ -181,6 +386,14 @@ async function upsertCreditCost(
       ? null
       : Number(body.duration_seconds);
   const has_audio = Boolean(body.has_audio);
+  const optionalText = (key: string) =>
+    body[key] === null || body[key] === undefined
+      ? null
+      : String(body[key]).trim() || null;
+  const source_ratio =
+    body.source_ratio === null || body.source_ratio === undefined
+      ? null
+      : Number(body.source_ratio);
 
   if (!feature) throw new Error("`feature` is required");
   if (!label) throw new Error("`label` is required");
@@ -202,6 +415,16 @@ async function upsertCreditCost(
     pricing_type,
     duration_seconds,
     has_audio,
+    provider: optionalText("provider"),
+    price_key: optionalText("price_key"),
+    resolution: optionalText("resolution"),
+    quality: optionalText("quality"),
+    source: optionalText("source"),
+    source_url: optionalText("source_url"),
+    source_ratio: source_ratio !== null && Number.isFinite(source_ratio) ? source_ratio : null,
+    provider_unit: optionalText("provider_unit"),
+    notes: optionalText("notes"),
+    updated_at: new Date().toISOString(),
   };
 
   if (id) {
@@ -398,6 +621,18 @@ Deno.serve(async (req: Request) => {
       case "get_markup_multipliers":
         return json(await getMarkupMultipliers(admin));
 
+      case "get_pricing_catalog":
+        return json({
+          data: {
+            ratios: {
+              flow_credits_per_thb: FLOW_CREDITS_PER_THB,
+              workspace_credits_per_thb: WORKSPACE_CREDITS_PER_THB,
+              flow_to_workspace_ratio: FLOW_TO_WORKSPACE_RATIO,
+            },
+            rows: RECOMMENDED_WORKSPACE_PRICING,
+          },
+        });
+
       // ── Mutations ──────────────────────────────────────────────────
       case "upsert_credit_cost":
         return json(await upsertCreditCost(admin, body, auditCtx));
@@ -410,6 +645,12 @@ Deno.serve(async (req: Request) => {
 
       case "recalculate_all_prices":
         return json(recalculateAllPrices());
+
+      case "seed_workspace_pricing_catalog":
+        return json(await seedWorkspacePricingCatalog(admin, auditCtx));
+
+      case "import_flow_credit_costs":
+        return json(await importFlowCreditCosts(admin, auditCtx));
 
       default:
         return json({ error: `Unknown action: ${action}` }, 400);

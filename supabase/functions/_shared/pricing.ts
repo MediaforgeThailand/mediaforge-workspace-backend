@@ -19,7 +19,20 @@ export class PricingConfigError extends Error {
   }
 }
 
-export type ProviderKey = "kling" | "banana" | "chat_ai" | "remove_bg" | "merge_audio" | "mp3_input";
+export type ProviderKey =
+  | "kling"
+  | "seedance"
+  | "banana"
+  | "openai"
+  | "seedream"
+  | "chat_ai"
+  | "remove_bg"
+  | "merge_audio"
+  | "mp3_input"
+  | "tripo3d"
+  | "google_tts"
+  | "gemini_tts"
+  | "video_understanding";
 export type OutputType = "video_url" | "image_url" | "text" | "audio_url";
 
 export interface ProviderDef {
@@ -31,17 +44,72 @@ export interface ProviderDef {
 
 export const NODE_TYPE_REGISTRY: Record<string, ProviderDef> = {
   klingVideoNode:        { provider: "kling",     feature: "generate_freepik_video", output_type: "video_url", is_async: true },
+  videoGenNode:          { provider: "kling",     feature: "generate_freepik_video", output_type: "video_url", is_async: true },
   bananaProNode:         { provider: "banana",    feature: "generate_freepik_image", output_type: "image_url", is_async: false },
+  imageGenNode:          { provider: "banana",    feature: "generate_freepik_image", output_type: "image_url", is_async: false },
   chatAiNode:            { provider: "chat_ai",   feature: "chat_ai",                output_type: "text",      is_async: false },
   removeBackgroundNode:  { provider: "remove_bg", feature: "remove_background",      output_type: "image_url", is_async: false },
   mergeAudioNode:        { provider: "merge_audio", feature: "merge_audio_video",    output_type: "video_url", is_async: true },
   mp3InputNode:          { provider: "mp3_input", feature: "mp3_input",              output_type: "audio_url", is_async: false },
+  audioGenNode:          { provider: "google_tts", feature: "text_to_speech",         output_type: "audio_url", is_async: false },
+  imageTo3dNode:         { provider: "tripo3d",    feature: "model_3d",               output_type: "image_url", is_async: true },
+  videoToPromptNode:     { provider: "video_understanding", feature: "video_to_prompt", output_type: "text", is_async: false },
 };
 
 /* ─── Default model slugs when params don't specify one ─── */
 const DEFAULT_IMAGE_MODEL = "nano-banana-pro";
 const DEFAULT_CHAT_MODEL = "google/gemini-3.1-pro-preview";
 const DEFAULT_VIDEO_MODEL = "kling-v2-6-pro";
+
+function normaliseResolutionTier(size: string): "1k" | "2k" | "4k" | "auto" {
+  const s = size.toLowerCase().trim();
+  if (!s || s === "auto") return "auto";
+  const m = s.match(/^(\d+)x(\d+)$/);
+  if (!m) {
+    if (s.includes("4k")) return "4k";
+    if (s.includes("2k")) return "2k";
+    return "1k";
+  }
+  const maxEdge = Math.max(Number(m[1]), Number(m[2]));
+  if (maxEdge >= 3000) return "4k";
+  if (maxEdge >= 1900) return "2k";
+  return "1k";
+}
+
+function openAiImagePriceKeys(params: Record<string, unknown>): string[] {
+  const baseModel = String(params.model_name ?? params.model ?? "gpt-image-2").toLowerCase();
+  const rawQuality = String(params.quality ?? "medium").toLowerCase();
+  const quality = ["low", "medium", "high"].includes(rawQuality) ? rawQuality : "medium";
+  const rawSize = String(params.size ?? "1024x1024").toLowerCase();
+  const size = rawSize === "auto" ? "1024x1024" : rawSize;
+  const tier = normaliseResolutionTier(size);
+
+  return Array.from(new Set([
+    `${baseModel}:${size}:${quality}`,
+    `${baseModel}:${tier}:${quality}`,
+    `${baseModel}-${quality}`,
+    baseModel,
+  ]));
+}
+
+async function firstCostByModelKeys(
+  supabase: ReturnType<typeof createClient>,
+  feature: string,
+  keys: string[],
+): Promise<{ cost: number; pricing_type?: string | null } | null> {
+  const { data, error } = await supabase
+    .from("credit_costs")
+    .select("cost, pricing_type, model")
+    .eq("feature", feature)
+    .in("model", keys);
+  if (error) throw new PricingConfigError(`Pricing read failed for ${feature}: ${error.message}`);
+  const rows = (data ?? []) as Array<{ cost: number; pricing_type?: string | null; model?: string | null }>;
+  for (const key of keys) {
+    const match = rows.find((row) => row.model === key);
+    if (match) return match;
+  }
+  return null;
+}
 
 /* ─── Base cost lookup from credit_costs table — STRICT, no fallbacks ─── */
 
@@ -54,15 +122,96 @@ export async function lookupBaseCost(
   /* ── Image (Banana / Freepik) ── */
   if (providerDef.provider === "banana") {
     const model = String(params.model_name ?? params.model ?? DEFAULT_IMAGE_MODEL);
+    const imageSize = String(params.image_size ?? params.resolution ?? "").toLowerCase();
+    const keys = imageSize ? [`${model}:${imageSize}`, model] : [model];
+    const match = await firstCostByModelKeys(supabase, "generate_freepik_image", keys);
+
+    if (!match) {
+      throw new PricingConfigError(
+        `Pricing configuration missing for image model: ${model}`
+      );
+    }
+    return match.cost;
+  }
+
+  /* ── Image (OpenAI gpt-image-2 / DALL-E) ── */
+  if (providerDef.provider === "openai") {
+    const keys = openAiImagePriceKeys(params);
+    const match = await firstCostByModelKeys(supabase, "generate_openai_image", keys);
+
+    if (!match) {
+      throw new PricingConfigError(
+        `Pricing configuration missing for OpenAI image model: ${keys[0]}`
+      );
+    }
+    return match.cost;
+  }
+
+  /* ── Image (SeedDream / future port) ── */
+  if (providerDef.provider === "seedream") {
+    const model = String(params.model_name ?? params.model ?? "seedream-5-0-260128");
+    const size = String(params.size ?? params.resolution ?? "2K").toLowerCase();
+    const keys = [`${model}:${size}`, model];
+    const match = await firstCostByModelKeys(supabase, "generate_seedream_image", keys);
+
+    if (!match) {
+      throw new PricingConfigError(
+        `Pricing configuration missing for SeedDream image model: ${model}`
+      );
+    }
+    return match.cost;
+  }
+
+  /* ── Image to 3D (Tripo3D) ── */
+  if (providerDef.provider === "tripo3d") {
+    const model = String(params.model_name ?? params.model ?? "tripo3d-v3.1");
     const { data } = await supabase
       .from("credit_costs").select("cost")
-      .eq("feature", "generate_freepik_image")
+      .eq("feature", "model_3d")
       .eq("model", model)
       .limit(1).maybeSingle();
 
     if (!data) {
       throw new PricingConfigError(
-        `Pricing configuration missing for image model: ${model}`
+        `Pricing configuration missing for 3D model: ${model}`
+      );
+    }
+    return data.cost;
+  }
+
+  /* ── Text to speech ── */
+  if (providerDef.provider === "google_tts" || providerDef.provider === "gemini_tts") {
+    const model = String(params.model_name ?? params.model ?? "google-tts-studio");
+    const { data } = await supabase
+      .from("credit_costs").select("cost, pricing_type")
+      .eq("feature", "text_to_speech")
+      .eq("model", model)
+      .limit(1).maybeSingle();
+
+    if (!data) {
+      throw new PricingConfigError(
+        `Pricing configuration missing for text-to-speech model: ${model}`
+      );
+    }
+    if (data.pricing_type === "per_1k_chars") {
+      const text = String(params.prompt ?? params.text ?? params.script ?? "");
+      return Math.max(1, Math.ceil(data.cost * Math.max(text.length, 1) / 1000));
+    }
+    return data.cost;
+  }
+
+  /* ── Video to Prompt / video understanding ── */
+  if (providerDef.provider === "video_understanding") {
+    const model = String(params.model_name ?? params.model ?? "gemini-video-understanding");
+    const { data } = await supabase
+      .from("credit_costs").select("cost")
+      .eq("feature", "video_to_prompt")
+      .eq("model", model)
+      .limit(1).maybeSingle();
+
+    if (!data) {
+      throw new PricingConfigError(
+        `Pricing configuration missing for video-to-prompt model: ${model}`
       );
     }
     return data.cost;
@@ -178,6 +327,40 @@ export async function lookupBaseCost(
     );
   }
 
+  const { data: exactMatchLate } = await supabase
+    .from("credit_costs").select("cost")
+    .eq("feature", "generate_freepik_video")
+    .eq("model", model)
+    .eq("pricing_type", "fixed")
+    .eq("duration_seconds", duration)
+    .eq("has_audio", hasAudio)
+    .limit(1).maybeSingle();
+
+  if (exactMatchLate) return exactMatchLate.cost;
+
+  const { data: durationMatchLate } = await supabase
+    .from("credit_costs").select("cost")
+    .eq("feature", "generate_freepik_video")
+    .eq("model", model)
+    .eq("pricing_type", "fixed")
+    .eq("duration_seconds", duration)
+    .limit(1).maybeSingle();
+
+  if (durationMatchLate) return durationMatchLate.cost;
+
+  const { data: perSecondExact } = await supabase
+    .from("credit_costs").select("cost, pricing_type")
+    .eq("feature", "generate_freepik_video")
+    .eq("model", model)
+    .eq("pricing_type", "per_second")
+    .eq("has_audio", hasAudio)
+    .limit(1).maybeSingle();
+
+  if (perSecondExact) {
+    const effectiveDuration = isMotion && duration <= 0 ? 5 : duration;
+    return Math.ceil(perSecondExact.cost * effectiveDuration);
+  }
+
   const { data } = await supabase
     .from("credit_costs").select("cost, pricing_type")
     .eq("feature", "generate_freepik_video")
@@ -280,6 +463,7 @@ export interface FeatureMultipliers {
   image: number;
   video: number;
   chat: number;
+  audio?: number;
 }
 
 function getMultiplierForNode(nodeType: string, featureMultipliers?: FeatureMultipliers): number {
@@ -288,10 +472,17 @@ function getMultiplierForNode(nodeType: string, featureMultipliers?: FeatureMult
   if (!def) return 4.0;
   switch (def.provider) {
     case "banana": return featureMultipliers.image;
+    case "openai": return featureMultipliers.image;
+    case "seedream": return featureMultipliers.image;
     case "kling": return featureMultipliers.video;
+    case "seedance": return featureMultipliers.video;
     case "chat_ai": return featureMultipliers.chat;
     case "remove_bg": return featureMultipliers.image;
     case "merge_audio": return featureMultipliers.video;
+    case "tripo3d": return featureMultipliers.image;
+    case "google_tts": return featureMultipliers.audio ?? 1.0;
+    case "gemini_tts": return featureMultipliers.audio ?? 1.0;
+    case "video_understanding": return featureMultipliers.chat;
     case "mp3_input": return 1.0;
     default: return 4.0;
   }

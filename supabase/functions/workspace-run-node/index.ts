@@ -3,7 +3,13 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { rejectIfOrgUser } from "../_shared/orgUserGuard.ts";
-import { refundCreditsAtomic } from "../_shared/pricing.ts";
+import {
+  lookupBaseCost,
+  PricingConfigError,
+  refundCreditsAtomic,
+  type ProviderDef,
+  type ProviderKey,
+} from "../_shared/pricing.ts";
 import { logApiUsage } from "../_shared/posthogCapture.ts";
 import {
   executeWithInlineBudget,
@@ -2905,6 +2911,215 @@ function getProviderForNodeType(
   throw new Error(`Workspace: no provider mapping for node_type "${nodeType}"`);
 }
 
+function workspaceProviderDef(
+  nodeType: string,
+  provider: string,
+): ProviderDef {
+  const p = provider as ProviderKey;
+  const output: ProviderDef["output_type"] =
+    p === "kling" || p === "seedance" || p === "merge_audio"
+      ? "video_url"
+      : p === "chat_ai" || p === "video_understanding"
+        ? "text"
+        : p === "google_tts" || p === "gemini_tts" || p === "mp3_input"
+          ? "audio_url"
+          : "image_url";
+  const feature =
+    p === "openai" ? "generate_openai_image" :
+    p === "seedream" ? "generate_seedream_image" :
+    p === "banana" ? "generate_freepik_image" :
+    p === "kling" || p === "seedance" ? "generate_freepik_video" :
+    p === "remove_bg" ? "remove_background" :
+    p === "merge_audio" ? "merge_audio_video" :
+    p === "chat_ai" ? "chat_ai" :
+    p === "tripo3d" ? "model_3d" :
+    p === "google_tts" || p === "gemini_tts" ? "text_to_speech" :
+    p === "video_understanding" ? "video_to_prompt" :
+    nodeType;
+  return {
+    provider: p,
+    feature,
+    output_type: output,
+    is_async: p === "kling" || p === "seedance" || p === "tripo3d" || p === "merge_audio",
+  };
+}
+
+function shouldChargeWorkspaceProvider(provider: string): boolean {
+  // Gemini TTS proxies to text-to-speech, which still owns its legacy
+  // credit deduction. Charging here too would double-bill.
+  return provider !== "gemini_tts" && provider !== "mp3_input";
+}
+
+type WorkspaceCreditCharge = {
+  amount: number;
+  teamId: string | null;
+  referenceId: string;
+  feature: string;
+};
+
+function buildChargeParams(
+  body: WorkspaceRunBody,
+): Record<string, unknown> {
+  const params: Record<string, unknown> = { ...(body.params ?? {}) };
+  const inputs = body.inputs ?? {};
+  if (
+    typeof inputs.text === "string" &&
+    !String(params.prompt ?? "").trim()
+  ) {
+    params.prompt = inputs.text;
+  }
+  return params;
+}
+
+async function resolveWorkspaceTeamId(
+  supabase: ReturnType<typeof createClient>,
+  workspaceId?: string | null,
+): Promise<string | null> {
+  if (!workspaceId) return null;
+  try {
+    const { data, error } = await supabase.rpc("workspace_team_id", {
+      p_workspace_id: workspaceId,
+    });
+    if (error) {
+      console.warn("[workspace-credits] workspace_team_id skipped:", error.message);
+      return null;
+    }
+    return typeof data === "string" && data ? data : null;
+  } catch (err) {
+    console.warn(
+      "[workspace-credits] workspace_team_id unavailable:",
+      err instanceof Error ? err.message : String(err),
+    );
+    return null;
+  }
+}
+
+async function consumeWorkspaceCredits(args: {
+  supabase: ReturnType<typeof createClient>;
+  userId: string;
+  body: WorkspaceRunBody;
+  nodeType: string;
+  provider: string;
+  params: Record<string, unknown>;
+}): Promise<WorkspaceCreditCharge | null> {
+  if (args.body.skip_credit_charge || !shouldChargeWorkspaceProvider(args.provider)) {
+    return null;
+  }
+  const def = workspaceProviderDef(args.nodeType, args.provider);
+  const amount = await lookupBaseCost(args.supabase, def, args.params);
+  if (amount <= 0) return null;
+
+  const teamId = await resolveWorkspaceTeamId(args.supabase, args.body.workspace_id ?? null);
+  const referenceId = String(
+    args.body.job_id ??
+      args.body.node_id ??
+      crypto.randomUUID(),
+  );
+  const description = `${args.nodeType} ${String(args.params.model_name ?? args.params.model ?? args.provider)}`;
+  const { data, error } = await args.supabase.rpc("consume_credits_for", {
+    p_user_id: args.userId,
+    p_team_id: teamId,
+    p_amount: amount,
+    p_feature: def.feature,
+    p_description: description,
+    p_reference_id: referenceId,
+    p_workspace_id: args.body.workspace_id ?? null,
+    p_canvas_id: args.body.canvas_id ?? null,
+  });
+  if (error) {
+    if (/function .*consume_credits_for/i.test(error.message)) {
+      const fallback = await args.supabase.rpc("consume_credits", {
+        p_user_id: args.userId,
+        p_amount: amount,
+        p_feature: def.feature,
+        p_description: description,
+        p_reference_id: referenceId,
+      });
+      if (fallback.error) {
+        throw new Error(`Credit deduction failed: ${fallback.error.message}`);
+      }
+      if (fallback.data !== true) {
+        throw new Error("INSUFFICIENT_CREDITS");
+      }
+    } else {
+      throw new Error(`Credit deduction failed: ${error.message}`);
+    }
+  } else if (data !== true) {
+    throw new Error("INSUFFICIENT_CREDITS");
+  }
+
+  console.log(
+    `[workspace-credits] charged ${amount} credits user=${args.userId} team=${teamId ?? "personal"} ref=${referenceId}`,
+  );
+  return { amount, teamId, referenceId, feature: def.feature };
+}
+
+async function refundWorkspaceCredits(args: {
+  supabase: ReturnType<typeof createClient>;
+  userId: string;
+  charge: WorkspaceCreditCharge | null;
+  reason: string;
+  workspaceId?: string | null;
+  canvasId?: string | null;
+}): Promise<void> {
+  if (!args.charge || args.charge.amount <= 0) return;
+  try {
+    const { error } = await args.supabase.rpc("refund_credits_for", {
+      p_user_id: args.userId,
+      p_team_id: args.charge.teamId,
+      p_amount: args.charge.amount,
+      p_reason: args.reason,
+      p_reference_id: args.charge.referenceId,
+      p_workspace_id: args.workspaceId ?? null,
+      p_canvas_id: args.canvasId ?? null,
+    });
+    if (!error) return;
+    if (!/function .*refund_credits_for/i.test(error.message)) {
+      throw error;
+    }
+    await refundCreditsAtomic(
+      args.supabase,
+      args.userId,
+      args.charge.amount,
+      args.reason,
+      args.charge.referenceId,
+    );
+  } catch (err) {
+    console.error(
+      "[workspace-credits] refund failed:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+async function refundWorkspaceJobCharge(args: {
+  supabase: ReturnType<typeof createClient>;
+  job: WorkspaceJobRow;
+  reason: string;
+}): Promise<void> {
+  const charged = Number(args.job.credits_charged ?? 0);
+  const refunded = Number(args.job.credits_refunded ?? 0);
+  const remaining = charged - refunded;
+  if (!Number.isFinite(remaining) || remaining <= 0) return;
+  await refundWorkspaceCredits({
+    supabase: args.supabase,
+    userId: args.job.user_id,
+    charge: {
+      amount: remaining,
+      teamId: args.job.credit_team_id ?? null,
+      referenceId: args.job.id,
+      feature: String(args.job.provider ?? args.job.node_type),
+    },
+    reason: args.reason,
+    workspaceId: args.job.workspace_id ?? null,
+    canvasId: args.job.canvas_id ?? null,
+  });
+  await args.supabase
+    .from("workspace_generation_jobs")
+    .update({ credits_refunded: refunded + remaining })
+    .eq("id", args.job.id);
+}
+
 /**
  * Provider-aware @-mention rewriter for the workspace V2 handler.
  *
@@ -3254,7 +3469,14 @@ interface WorkspaceRunBody {
    *  Frontend resends after the initial Run returned a `task_id`
    *  and an empty URL. Each provider has its own action so we can
    *  whitelist the upstream URL per provider. */
-  action?: "poll_kling" | "poll_seedance" | "poll_tripo3d" | "mirror_tripo_url";
+  action?:
+    | "enqueue_workspace_job"
+    | "get_workspace_job"
+    | "poll_kling"
+    | "poll_seedance"
+    | "poll_tripo3d"
+    | "mirror_tripo_url";
+  job_id?: string;
   task_id?: string;
   poll_endpoint?: string;
   /** For action="mirror_tripo_url": the Tripo3D CDN URL to mirror
@@ -3268,6 +3490,310 @@ interface WorkspaceRunBody {
   workspace_id?: string;
   canvas_id?: string;
   node_id?: string;
+  /** Internal: background jobs are charged once at enqueue time, so
+   *  the worker replays the request with charging disabled. */
+  skip_credit_charge?: boolean;
+  precharged_credits?: number;
+}
+
+const WORKSPACE_JOB_MAX_MS = 30 * 60_000;
+const WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS = 140_000;
+const WORKSPACE_JOB_BACKOFF_MS = [3_000, 5_000, 10_000, 15_000, 30_000, 60_000];
+
+type WorkspaceJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "permanent_failed";
+
+type WorkspaceJobRow = {
+  id: string;
+  user_id: string;
+  workspace_id?: string | null;
+  canvas_id?: string | null;
+  node_id?: string | null;
+  node_type: string;
+  provider?: string | null;
+  model?: string | null;
+  request: WorkspaceRunBody;
+  status: WorkspaceJobStatus;
+  attempts: number;
+  max_attempts: number;
+  result?: Record<string, unknown> | null;
+  error?: string | null;
+  last_error?: string | null;
+  credits_charged?: number | null;
+  credits_refunded?: number | null;
+  credit_team_id?: string | null;
+};
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isPermanentWorkspaceJobError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    classifyError(msg) === "permanent" ||
+    /authentication|unauthor(ized|ised)|invalid.*api.?key/i.test(msg) ||
+    /content[\s_-]*polic|moderation|blocked|safety system/i.test(msg) ||
+    /unsupported node type|No executor for provider/i.test(msg) ||
+    /\bnot configured\b|missing.*key|credentials missing/i.test(msg) ||
+    /is not defined|is not a function|cannot read prop(?:erty|erties) of (?:undefined|null)/i.test(msg) ||
+    /ReferenceError|TypeError|SyntaxError/i.test(msg) ||
+    /HTTP 4\d\d/i.test(msg) ||
+    /(prompt|input|argument).*required|Validation/i.test(msg)
+  );
+}
+
+async function readJsonSafe(res: Response): Promise<Record<string, unknown>> {
+  const text = await res.text().catch(() => "");
+  if (!text) return {};
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return { error: text };
+  }
+}
+
+async function invokeWorkspaceRunOnce(args: {
+  functionUrl: string;
+  authHeader: string;
+  body: WorkspaceRunBody;
+}): Promise<Record<string, unknown>> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS);
+  const gatewayApiKey =
+    Deno.env.get("SUPABASE_ANON_KEY") ??
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ??
+    "";
+  try {
+    const res = await fetch(args.functionUrl, {
+      method: "POST",
+      headers: {
+        authorization: args.authHeader,
+        ...(gatewayApiKey ? { apikey: gatewayApiKey } : {}),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(args.body),
+      signal: controller.signal,
+    });
+    const payload = await readJsonSafe(res);
+    if (!res.ok || payload.error) {
+      throw new Error(String(payload.error ?? `workspace-run-node HTTP ${res.status}`));
+    }
+    return payload;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function pollWorkspaceAsyncResult(args: {
+  functionUrl: string;
+  authHeader: string;
+  response: Record<string, unknown>;
+  budgetEndsAt: number;
+}): Promise<Record<string, unknown>> {
+  const taskId = String(args.response.task_id ?? "").trim();
+  const providerMeta =
+    args.response.provider_meta && typeof args.response.provider_meta === "object"
+      ? (args.response.provider_meta as Record<string, unknown>)
+      : {};
+  const pollEndpoint = String(providerMeta.poll_endpoint ?? "").trim();
+  if (!taskId || args.response.url || !pollEndpoint) return args.response;
+
+  const provider = String(providerMeta.provider ?? "kling").toLowerCase();
+  const pollAction =
+    provider === "tripo3d"
+      ? "poll_tripo3d"
+      : provider === "seedance"
+        ? "poll_seedance"
+        : "poll_kling";
+  const intervalMs = provider === "tripo3d" ? 4_000 : 5_000;
+  const successStatuses = new Set([
+    "succeed",
+    "success",
+    "succeeded",
+    "completed",
+    "complete",
+    "done",
+  ]);
+  const failedStatuses = new Set([
+    "failed",
+    "fail",
+    "error",
+    "errored",
+    "cancelled",
+    "canceled",
+  ]);
+  let lastStatus = "submitted";
+  let lastMessage = "";
+
+  while (Date.now() + intervalMs < args.budgetEndsAt) {
+    await sleep(intervalMs);
+    const pollResp = await invokeWorkspaceRunOnce({
+      functionUrl: args.functionUrl,
+      authHeader: args.authHeader,
+      body: {
+        action: pollAction,
+        task_id: taskId,
+        poll_endpoint: pollEndpoint,
+      } as WorkspaceRunBody,
+    });
+    lastStatus = String(pollResp.status ?? "").toLowerCase();
+    lastMessage = String(pollResp.message ?? "");
+    if (lastStatus === "polling_error") continue;
+
+    if (successStatuses.has(lastStatus)) {
+      const url = String(pollResp.url ?? "");
+      if (!url) {
+        throw new Error(`${provider} task succeeded but returned no URL`);
+      }
+      const nextProviderMeta = {
+        ...providerMeta,
+        ...(pollResp.model_url ? { model_url: pollResp.model_url } : {}),
+        ...(pollResp.preview_image ? { rendered_image: pollResp.preview_image } : {}),
+      };
+      return {
+        ...args.response,
+        url,
+        provider_meta: nextProviderMeta,
+      };
+    }
+
+    if (failedStatuses.has(lastStatus)) {
+      throw new Error(`${provider} task failed: ${lastMessage || "no detail"}`);
+    }
+  }
+
+  throw new Error(`${provider} polling timed out (last status: ${lastStatus || "empty"})`);
+}
+
+async function processWorkspaceGenerationJob(args: {
+  supabase: any;
+  jobId: string;
+  userId: string;
+  functionUrl: string;
+  authHeader: string;
+}): Promise<void> {
+  const { data: jobRaw, error: jobErr } = await args.supabase
+    .from("workspace_generation_jobs")
+    .select("*")
+    .eq("id", args.jobId)
+    .eq("user_id", args.userId)
+    .maybeSingle();
+
+  if (jobErr || !jobRaw) {
+    console.error("[workspace-job] missing job", args.jobId, jobErr);
+    return;
+  }
+
+  const job = jobRaw as WorkspaceJobRow;
+  const request = job.request ?? {};
+  const startedAt = Date.now();
+  const budgetEndsAt = startedAt + WORKSPACE_JOB_MAX_MS;
+  let attempt = Number(job.attempts ?? 0);
+  let lastError = "";
+
+  await args.supabase
+    .from("workspace_generation_jobs")
+    .update({
+      status: "running",
+      started_at: new Date().toISOString(),
+      error: null,
+    })
+    .eq("id", job.id);
+
+  while (Date.now() < budgetEndsAt && attempt < (job.max_attempts || 18)) {
+    attempt += 1;
+    await args.supabase
+      .from("workspace_generation_jobs")
+      .update({ status: "running", attempts: attempt })
+      .eq("id", job.id);
+
+    try {
+      const initial = await invokeWorkspaceRunOnce({
+        functionUrl: args.functionUrl,
+        authHeader: args.authHeader,
+        body: request,
+      });
+      const finalResult = await pollWorkspaceAsyncResult({
+        functionUrl: args.functionUrl,
+        authHeader: args.authHeader,
+        response: initial,
+        budgetEndsAt,
+      });
+      const charged = Number(job.credits_charged ?? 0);
+      const finalResultWithCredits = {
+        ...finalResult,
+        credits_spent: Number.isFinite(charged) ? charged : 0,
+      };
+
+      await args.supabase
+        .from("workspace_generation_jobs")
+        .update({
+          status: "completed",
+          result: finalResultWithCredits,
+          error: null,
+          last_error: null,
+          completed_at: new Date().toISOString(),
+        })
+        .eq("id", job.id);
+      console.log(`[workspace-job] completed job=${job.id} attempts=${attempt}`);
+      return;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      const permanent = isPermanentWorkspaceJobError(lastError);
+      await args.supabase
+        .from("workspace_generation_jobs")
+        .update({
+          status: permanent ? "permanent_failed" : "running",
+          last_error: lastError.substring(0, 1000),
+          ...(permanent
+            ? {
+                error: lastError.substring(0, 1000),
+                completed_at: new Date().toISOString(),
+              }
+            : {}),
+        })
+        .eq("id", job.id);
+      if (permanent) {
+        console.warn(`[workspace-job] permanent failure job=${job.id}: ${lastError}`);
+        await refundWorkspaceJobCharge({
+          supabase: args.supabase,
+          job: { ...job, attempts: attempt, last_error: lastError },
+          reason: `workspace job failed: ${lastError.substring(0, 160)}`,
+        });
+        return;
+      }
+
+      const remaining = budgetEndsAt - Date.now();
+      const backoff = WORKSPACE_JOB_BACKOFF_MS[
+        Math.min(attempt - 1, WORKSPACE_JOB_BACKOFF_MS.length - 1)
+      ];
+      if (remaining < backoff + 1_000) break;
+      await sleep(backoff);
+    }
+  }
+
+  await args.supabase
+    .from("workspace_generation_jobs")
+    .update({
+      status: "failed",
+      error:
+        lastError.substring(0, 1000) ||
+        `Generation timed out after ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes`,
+      last_error: lastError.substring(0, 1000) || null,
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", job.id);
+  await refundWorkspaceJobCharge({
+    supabase: args.supabase,
+    job: { ...job, attempts: attempt, last_error: lastError },
+    reason:
+      lastError.substring(0, 160) ||
+      `workspace job timed out after ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes`,
+  });
+  console.warn(`[workspace-job] failed job=${job.id} attempts=${attempt}: ${lastError}`);
 }
 
 serve(async (req) => {
@@ -3279,6 +3805,9 @@ serve(async (req) => {
   const startTime = Date.now();
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
   const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  let activeCreditCharge: WorkspaceCreditCharge | null = null;
+  let activeUserId: string | null = null;
+  let activeBody: WorkspaceRunBody | null = null;
 
   try {
     /* ─── Auth ─────────────────────────────────────────────── */
@@ -3298,9 +3827,180 @@ serve(async (req) => {
         { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
     }
+    activeUserId = user.id;
 
     /* ─── Parse body ───────────────────────────────────────── */
     const body = (await req.json()) as WorkspaceRunBody;
+    activeBody = body;
+
+    if (body.action === "get_workspace_job") {
+      const jobId = String(body.job_id ?? "").trim();
+      if (!jobId) {
+        return new Response(
+          JSON.stringify({ error: "job_id required" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const { data: job, error } = await supabase
+        .from("workspace_generation_jobs")
+        .select("*")
+        .eq("id", jobId)
+        .eq("user_id", user.id)
+        .maybeSingle();
+      if (error) {
+        return new Response(
+          JSON.stringify({ error: error.message }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      if (!job) {
+        return new Response(
+          JSON.stringify({ error: "job not found" }),
+          { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({ job }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    if (body.action === "enqueue_workspace_job") {
+      const nodeType = String(body.node_type ?? "").trim();
+      if (!nodeType) {
+        return new Response(
+          JSON.stringify({ error: "node_type is required" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const { action: _action, job_id: _jobId, ...runRequest } = body;
+      const provider = getProviderForNodeType(
+        nodeType,
+        runRequest.params?.model_name as string | undefined,
+      );
+      if (provider === "seedream") {
+        return new Response(
+          JSON.stringify({
+            error:
+              "SeedDream is not available in Workspace runtime yet. Pick Banana, GPT Image 2, Kling, Seedance, TTS, or 3D for now.",
+          }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const model = String(
+        runRequest.params?.model_name ??
+          runRequest.params?.model ??
+          nodeType,
+      );
+      let jobCharge: WorkspaceCreditCharge | null = null;
+      try {
+        jobCharge = await consumeWorkspaceCredits({
+          supabase,
+          userId: user.id,
+          body: runRequest,
+          nodeType,
+          provider,
+          params: buildChargeParams(runRequest),
+        });
+      } catch (chargeErr) {
+        const msg = chargeErr instanceof Error ? chargeErr.message : String(chargeErr);
+        const status = msg === "INSUFFICIENT_CREDITS" ? 402 : 400;
+        return new Response(
+          JSON.stringify({
+            error:
+              msg === "INSUFFICIENT_CREDITS"
+                ? "เครดิตไม่พอสำหรับการเจนนี้"
+                : msg,
+          }),
+          { status, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const { data: inserted, error: insertErr } = await supabase
+        .from("workspace_generation_jobs")
+        .insert({
+          user_id: user.id,
+          workspace_id: runRequest.workspace_id ?? null,
+          canvas_id: runRequest.canvas_id ?? null,
+          node_id: runRequest.node_id ?? null,
+          node_type: nodeType,
+          provider,
+          model,
+          request: {
+            ...runRequest,
+            skip_credit_charge: true,
+            precharged_credits: jobCharge?.amount ?? 0,
+          },
+          status: "queued",
+          max_attempts: 18,
+          credits_charged: jobCharge?.amount ?? 0,
+          credit_team_id: jobCharge?.teamId ?? null,
+        })
+        .select("id")
+        .single();
+      if (insertErr || !inserted?.id) {
+        await refundWorkspaceCredits({
+          supabase,
+          userId: user.id,
+          charge: jobCharge,
+          reason: "workspace job insert failed",
+          workspaceId: runRequest.workspace_id ?? null,
+          canvasId: runRequest.canvas_id ?? null,
+        });
+        return new Response(
+          JSON.stringify({ error: insertErr?.message ?? "failed to create job" }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const jobId = String(inserted.id);
+      const bgTask = processWorkspaceGenerationJob({
+        supabase,
+        jobId,
+        userId: user.id,
+        functionUrl: `${SUPABASE_URL}/functions/v1/workspace-run-node`,
+        authHeader,
+      }).catch(async (err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[workspace-job] bg crash job=${jobId}: ${msg}`);
+        const { data: crashedJob } = await supabase
+          .from("workspace_generation_jobs")
+          .select("*")
+          .eq("id", jobId)
+          .maybeSingle();
+        if (crashedJob) {
+          await refundWorkspaceJobCharge({
+            supabase,
+            job: crashedJob as WorkspaceJobRow,
+            reason: `workspace job crashed: ${msg.substring(0, 160)}`,
+          });
+        }
+        await supabase
+          .from("workspace_generation_jobs")
+          .update({
+            status: "failed",
+            error: msg.substring(0, 1000),
+            last_error: msg.substring(0, 1000),
+            completed_at: new Date().toISOString(),
+          })
+          .eq("id", jobId);
+      });
+      const er = (globalThis as { EdgeRuntime?: { waitUntil: (p: Promise<unknown>) => void } }).EdgeRuntime;
+      if (er?.waitUntil) er.waitUntil(bgTask);
+      else bgTask.catch((e) => console.error("[workspace-job][bg-fallback]", e));
+
+      return new Response(
+        JSON.stringify({
+          job_id: jobId,
+          status: "queued",
+          background: true,
+          node_type: nodeType,
+          provider,
+          model,
+          credits_spent: jobCharge?.amount ?? 0,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
 
     /* ─── On-demand Tripo URL mirror ──────────────────────────
      *
@@ -4003,6 +4703,22 @@ serve(async (req) => {
     }
 
     /* ─── Dispatch ────────────────────────────────────────── */
+    if (provider === "seedream") {
+      throw new Error(
+        `Provider "${provider}" not yet implemented in workspace-run-node. ` +
+          `Pick a Banana / Kling / GPT Image 2 / Seedance model for now.`,
+      );
+    }
+
+    activeCreditCharge = await consumeWorkspaceCredits({
+      supabase,
+      userId: user.id,
+      body,
+      nodeType,
+      provider,
+      params,
+    });
+
     let result: ProviderResult;
     switch (provider) {
       case "banana":
@@ -4078,6 +4794,11 @@ serve(async (req) => {
     // CMO-agency seats. Helper maps text → feature="chat_ai" to align
     // with credit_costs naming, and pulls token counts out of
     // provider_meta when the executor exposes them.
+    const creditsSpent =
+      activeCreditCharge?.amount ??
+      (Number.isFinite(Number(body.precharged_credits))
+        ? Number(body.precharged_credits)
+        : 0);
     await recordGenerationEvent({
       supabase,
       userId: user.id,
@@ -4088,6 +4809,7 @@ serve(async (req) => {
       workspaceId: body.workspace_id ?? null,
       canvasId: body.canvas_id ?? null,
       nodeId: body.node_id ?? null,
+      creditsSpent,
     });
 
     // Surface text outputs at the top level so the frontend's `r.text`
@@ -4109,15 +4831,35 @@ serve(async (req) => {
         prompt_source: promptSource,
         provider_meta: result.provider_meta,
         node_type: nodeType,
+        credits_spent: creditsSpent,
       }),
       { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error("[workspace-run-node] error:", msg);
+    if (activeCreditCharge && activeUserId) {
+      const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+      await refundWorkspaceCredits({
+        supabase,
+        userId: activeUserId,
+        charge: activeCreditCharge,
+        reason: `workspace run failed: ${msg.substring(0, 160)}`,
+        workspaceId: activeBody?.workspace_id ?? null,
+        canvasId: activeBody?.canvas_id ?? null,
+      });
+    }
+    const status =
+      msg === "INSUFFICIENT_CREDITS"
+        ? 402
+        : e instanceof PricingConfigError
+          ? 400
+          : 500;
     return new Response(
-      JSON.stringify({ error: msg }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      JSON.stringify({
+        error: msg === "INSUFFICIENT_CREDITS" ? "เครดิตไม่พอสำหรับการเจนนี้" : msg,
+      }),
+      { status, headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
   }
 });

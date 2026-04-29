@@ -21,8 +21,10 @@
  * SEEDANCE_MODEL_MAP and the pricing migration in tandem.
  */
 
-/** Volcengine Ark base URL — text/image-to-video endpoint. */
-export const SEEDANCE_BASE = "https://ark.cn-beijing.volces.com";
+/** BytePlus ModelArk base URL (international) — text/image-to-video endpoint.
+ *  Domestic-China deployments would use https://ark.cn-beijing.volces.com,
+ *  but our workspace integration uses the BytePlus international gateway. */
+export const SEEDANCE_BASE = "https://ark.ap-southeast.bytepluses.com";
 export const SEEDANCE_TASKS_PATH = "/api/v3/contents/generations/tasks";
 
 /** Map UI model slug → Ark model ID + capability flags. */
@@ -150,7 +152,7 @@ export function loadSeedanceCredentials(): SeedanceCredentials {
     throw new Error(
       "Seedance credentials missing — set SEEDANCE_API_KEY (or ARK_API_KEY) " +
         "in Supabase project secrets (workspace dev). Provision the key in the " +
-        "Volcengine Ark console: https://console.volcengine.com/ark.",
+        "BytePlus ModelArk console: https://console.byteplus.com/ark.",
     );
   }
   return { apiKey };

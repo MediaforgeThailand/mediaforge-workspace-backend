@@ -203,6 +203,7 @@ export async function recordGenerationEvent(args: {
   workspaceId?: string | null;
   canvasId?: string | null;
   nodeId?: string | null;
+  creditsSpent?: number | null;
 }): Promise<void> {
   try {
     const a = deriveAnalyticsFromRun(
@@ -251,6 +252,7 @@ export async function recordGenerationEvent(args: {
         height: a.height,
         duration_seconds: a.duration_seconds,
         aspect_ratio: a.aspect_ratio,
+        credits_spent: args.creditsSpent ?? null,
         status: "completed",
         task_id: args.result.task_id ?? null,
         // Whitelisted cost-driving settings — see COST_PARAM_KEYS for
