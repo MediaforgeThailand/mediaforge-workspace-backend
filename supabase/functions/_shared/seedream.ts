@@ -13,7 +13,7 @@
  * Body shape mirrors the OpenAI Images API spec that BytePlus
  * intentionally implements for drop-in compatibility:
  *   {
- *     "model": "seedream-5-0.260128",
+ *     "model": "seedream-5-0-260128",
  *     "prompt": "...",
  *     "size":  "1024x1024",
  *     "response_format": "url"
@@ -47,9 +47,9 @@ export const SEEDREAM_MODEL_MAP: Record<string, SeedreamModelEntry> = {
   // BytePlus ModelArk Seedream 5.0 — verified in ap-southeast-1
   // console on 2026-04-30. Pricing row in credit_costs uses the
   // verbatim BytePlus ID as the `model` column.
-  "seedream-5-0":          { model: "seedream-5-0.260128", tier: "v5", maxSize: "2048x2048" },
-  "seedream-5-0.260128":   { model: "seedream-5-0.260128", tier: "v5", maxSize: "2048x2048" },
-  "seedream-5":            { model: "seedream-5-0.260128", tier: "v5", maxSize: "2048x2048" },
+  "seedream-5-0":          { model: "seedream-5-0-260128", tier: "v5", maxSize: "2048x2048" },
+  "seedream-5-0-260128":   { model: "seedream-5-0-260128", tier: "v5", maxSize: "2048x2048" },
+  "seedream-5":            { model: "seedream-5-0-260128", tier: "v5", maxSize: "2048x2048" },
 };
 
 export interface SeedreamGenerateRequest {

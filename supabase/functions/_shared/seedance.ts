@@ -46,14 +46,14 @@ export const SEEDANCE_MODEL_MAP: Record<string, SeedanceModelEntry> = {
   // ap-southeast-1 console on 2026-04-30). The UI slug stays
   // "seedance-2-0-{lite|pro}" so the frontend dropdown doesn't have
   // to change; we forward the BytePlus identifier on the wire.
-  //   - dreamina-seedance-2-0.260128       = Seedance 2.0 Pro (full)
-  //   - dreamina-seedance-2-0-fast.260128  = Seedance 2.0 Fast (lite)
-  "seedance-2-0-lite": { model: "dreamina-seedance-2-0-fast.260128", tier: "lite", supportsAudio: true },
-  "seedance-2-0-pro":  { model: "dreamina-seedance-2-0.260128",      tier: "pro",  supportsAudio: true },
+  //   - dreamina-seedance-2-0-260128       = Seedance 2.0 Pro (full)
+  //   - dreamina-seedance-2-0-fast-260128  = Seedance 2.0 Fast (lite)
+  "seedance-2-0-lite": { model: "dreamina-seedance-2-0-fast-260128", tier: "lite", supportsAudio: true },
+  "seedance-2-0-pro":  { model: "dreamina-seedance-2-0-260128",      tier: "pro",  supportsAudio: true },
   // Direct-ID aliases — let the BytePlus IDs themselves resolve in
   // case any caller already sends the verbatim identifier.
-  "dreamina-seedance-2-0.260128":      { model: "dreamina-seedance-2-0.260128",      tier: "pro",  supportsAudio: true },
-  "dreamina-seedance-2-0-fast.260128": { model: "dreamina-seedance-2-0-fast.260128", tier: "lite", supportsAudio: true },
+  "dreamina-seedance-2-0-260128":      { model: "dreamina-seedance-2-0-260128",      tier: "pro",  supportsAudio: true },
+  "dreamina-seedance-2-0-fast-260128": { model: "dreamina-seedance-2-0-fast-260128", tier: "lite", supportsAudio: true },
 };
 
 export interface SeedanceTaskCreate {
