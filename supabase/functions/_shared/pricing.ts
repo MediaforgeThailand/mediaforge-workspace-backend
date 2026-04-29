@@ -30,10 +30,11 @@ export type ProviderKey =
   | "merge_audio"
   | "mp3_input"
   | "tripo3d"
+  | "hyper3d"
   | "google_tts"
   | "gemini_tts"
   | "video_understanding";
-export type OutputType = "video_url" | "image_url" | "text" | "audio_url";
+export type OutputType = "video_url" | "image_url" | "text" | "audio_url" | "model_3d";
 
 export interface ProviderDef {
   provider: ProviderKey;
@@ -52,7 +53,7 @@ export const NODE_TYPE_REGISTRY: Record<string, ProviderDef> = {
   mergeAudioNode:        { provider: "merge_audio", feature: "merge_audio_video",    output_type: "video_url", is_async: true },
   mp3InputNode:          { provider: "mp3_input", feature: "mp3_input",              output_type: "audio_url", is_async: false },
   audioGenNode:          { provider: "google_tts", feature: "text_to_speech",         output_type: "audio_url", is_async: false },
-  imageTo3dNode:         { provider: "tripo3d",    feature: "model_3d",               output_type: "image_url", is_async: true },
+  imageTo3dNode:         { provider: "tripo3d",    feature: "model_3d",               output_type: "model_3d", is_async: true },
   videoToPromptNode:     { provider: "video_understanding", feature: "video_to_prompt", output_type: "text", is_async: false },
 };
 
@@ -166,8 +167,8 @@ export async function lookupBaseCost(
     return match.cost;
   }
 
-  /* ── Image to 3D (Tripo3D) ── */
-  if (providerDef.provider === "tripo3d") {
+  /* ── Image to 3D (Tripo3D / Hyper3D) ── */
+  if (providerDef.provider === "tripo3d" || providerDef.provider === "hyper3d") {
     const model = String(params.model_name ?? params.model ?? "tripo3d-v3.1");
     const { data } = await supabase
       .from("credit_costs").select("cost")
@@ -484,6 +485,7 @@ function getMultiplierForNode(nodeType: string, featureMultipliers?: FeatureMult
     case "remove_bg": return featureMultipliers.image;
     case "merge_audio": return featureMultipliers.video;
     case "tripo3d": return featureMultipliers.image;
+    case "hyper3d": return featureMultipliers.image;
     case "google_tts": return featureMultipliers.audio ?? 1.0;
     case "gemini_tts": return featureMultipliers.audio ?? 1.0;
     case "video_understanding": return featureMultipliers.chat;

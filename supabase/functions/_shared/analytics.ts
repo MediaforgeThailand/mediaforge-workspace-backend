@@ -22,7 +22,7 @@ export interface ProviderResultLike {
   task_id?: string;
   result_url?: string;
   outputs: Record<string, unknown>;
-  output_type: "video_url" | "image_url" | "text" | "audio_url";
+  output_type: "video_url" | "image_url" | "text" | "audio_url" | "model_3d";
   provider_meta?: Record<string, unknown>;
   /** Number of distinct media units the provider produced for this run.
    *  Defaults to 1 when omitted. Multi-image providers (Banana / GPT
@@ -76,6 +76,7 @@ export function deriveAnalyticsFromRun(
   else if (result.output_type === "image_url") feature = "image";
   else if (result.output_type === "audio_url") feature = "audio";
   else if (result.output_type === "text") feature = "chat_ai";
+  else if (result.output_type === "model_3d") feature = "model_3d";
   else if (/audio/i.test(nodeType)) feature = "audio";
   else if (/3d|tripo/i.test(nodeType)) feature = "model_3d";
   else feature = "image";

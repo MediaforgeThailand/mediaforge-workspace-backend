@@ -39,6 +39,8 @@ import {
   HYPER3D_TASKS_PATH,
   HYPER3D_MODEL_MAP,
   buildHyper3dContent,
+  pickHyper3dModelUrl,
+  pollHyper3dOnce,
   submitHyper3dTask,
 } from "../_shared/hyper3d.ts";
 
@@ -300,7 +302,7 @@ interface ProviderResult {
   result_url?: string;
   /** Structured outputs dict — each key is a named output handle */
   outputs: Record<string, string>;
-  output_type: "video_url" | "image_url" | "text" | "audio_url";
+  output_type: "video_url" | "image_url" | "text" | "audio_url" | "model_3d";
   provider_meta?: Record<string, unknown>;
   /** Number of distinct media units produced this run. Default 1.
    *  Set by executors that can emit multiple outputs per call (e.g.
@@ -3127,6 +3129,8 @@ function workspaceProviderDef(
   const output: ProviderDef["output_type"] =
     p === "kling" || p === "seedance" || p === "merge_audio"
       ? "video_url"
+      : p === "tripo3d" || p === "hyper3d"
+        ? "model_3d"
       : p === "chat_ai" || p === "video_understanding"
         ? "text"
         : p === "google_tts" || p === "gemini_tts" || p === "mp3_input"
@@ -3140,7 +3144,7 @@ function workspaceProviderDef(
     p === "remove_bg" ? "remove_background" :
     p === "merge_audio" ? "merge_audio_video" :
     p === "chat_ai" ? "chat_ai" :
-    p === "tripo3d" ? "model_3d" :
+    p === "tripo3d" || p === "hyper3d" ? "model_3d" :
     p === "google_tts" || p === "gemini_tts" ? "text_to_speech" :
     p === "video_understanding" ? "video_to_prompt" :
     nodeType;
@@ -3148,7 +3152,7 @@ function workspaceProviderDef(
     provider: p,
     feature,
     output_type: output,
-    is_async: p === "kling" || p === "seedance" || p === "tripo3d" || p === "merge_audio",
+    is_async: p === "kling" || p === "seedance" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio",
   };
 }
 
@@ -3712,6 +3716,7 @@ interface WorkspaceRunBody {
     | "get_workspace_job"
     | "poll_kling"
     | "poll_seedance"
+    | "poll_hyper3d"
     | "poll_tripo3d"
     | "mirror_tripo_url";
   job_id?: string;
@@ -3845,10 +3850,12 @@ async function pollWorkspaceAsyncResult(args: {
   const pollAction =
     provider === "tripo3d"
       ? "poll_tripo3d"
+      : provider === "hyper3d"
+        ? "poll_hyper3d"
       : provider === "seedance"
         ? "poll_seedance"
         : "poll_kling";
-  const intervalMs = provider === "tripo3d" ? 4_000 : 5_000;
+  const intervalMs = provider === "tripo3d" ? 4_000 : provider === "hyper3d" ? 6_000 : 5_000;
   const successStatuses = new Set([
     "succeed",
     "success",
@@ -4536,6 +4543,90 @@ serve(async (req) => {
           status: normalised,
           task_id: taskId,
           url: videoUrl,
+          message,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    /* ─── Async poll path (Hyper3D / BytePlus Ark 3D tasks) ───
+     * Same short-poll pattern as Seedance, but the terminal payload
+     * carries a model URL instead of a video URL. */
+    if (body.action === "poll_hyper3d") {
+      const taskId = String(body.task_id ?? "").trim();
+      const pollEndpoint = String(body.poll_endpoint ?? "").trim();
+      if (!taskId || !pollEndpoint) {
+        return new Response(
+          JSON.stringify({ error: "task_id and poll_endpoint required for poll_hyper3d" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let pollUrlOk = false;
+      try {
+        const u = new URL(pollEndpoint);
+        const allowedBase = new URL(HYPER3D_BASE);
+        pollUrlOk =
+          u.protocol === "https:" &&
+          u.hostname === allowedBase.hostname &&
+          u.pathname.replace(/\/+$/, "") === HYPER3D_TASKS_PATH;
+      } catch {
+        pollUrlOk = false;
+      }
+      if (!pollUrlOk) {
+        return new Response(
+          JSON.stringify({ error: "poll_endpoint must be a Hyper3D tasks endpoint" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let creds;
+      try {
+        creds = loadSeedanceCredentials();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({ error: msg }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let statusObj;
+      try {
+        statusObj = await pollHyper3dOnce(taskId, creds.apiKey);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({
+            status: "polling_error",
+            message: msg.substring(0, 300),
+          }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const rawStatus = String(statusObj.status ?? "").toLowerCase();
+      const normalised =
+        rawStatus === "succeeded" || rawStatus === "success"
+          ? "succeed"
+          : rawStatus === "failed" || rawStatus === "fail" || rawStatus === "cancelled"
+            ? "failed"
+            : rawStatus === "running"
+              ? "processing"
+              : rawStatus || "submitted";
+      const modelUrl = normalised === "succeed" ? pickHyper3dModelUrl(statusObj) : "";
+      const previewImage =
+        normalised === "succeed" ? String(statusObj.content?.rendered_image_url ?? "") : "";
+      const message =
+        statusObj.error?.message ?? (normalised === "failed" ? "Task failed" : "");
+
+      return new Response(
+        JSON.stringify({
+          status: normalised,
+          task_id: taskId,
+          url: previewImage || modelUrl,
+          model_url: modelUrl,
+          preview_image: previewImage,
           message,
         }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
