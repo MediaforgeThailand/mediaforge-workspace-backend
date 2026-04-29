@@ -57,6 +57,9 @@ const CORS_HEADERS = {
 const MULTIPLIER_KEYS = ["image", "video", "chat", "audio"] as const;
 type MultiplierKey = (typeof MULTIPLIER_KEYS)[number];
 const MULTIPLIER_PREFIX = "markup_multiplier_";
+const BUFFER_SETTING_KEY = "workspace_infrastructure_buffer_percent";
+const DEFAULT_BUFFER_PERCENT = 40;
+const USD_TO_THB = 35;
 const FLOW_CREDITS_PER_THB = 125;
 const WORKSPACE_CREDITS_PER_THB = 50;
 const FLOW_TO_WORKSPACE_RATIO = WORKSPACE_CREDITS_PER_THB / FLOW_CREDITS_PER_THB;
@@ -80,42 +83,175 @@ type CreditCostWriteRow = {
   notes?: string | null;
 };
 
-const GPT_IMAGE_2_ROWS: CreditCostWriteRow[] = [
-  ["1k", "low", 3], ["1k", "medium", 20], ["1k", "high", 80],
-  ["2k", "low", 8], ["2k", "medium", 50], ["2k", "high", 200],
-  ["4k", "low", 18], ["4k", "medium", 120], ["4k", "high", 480],
-].map(([tier, quality, cost]) => ({
+function creditsFromUsd(usd: number): number {
+  return Math.max(1, Math.ceil(usd * USD_TO_THB * WORKSPACE_CREDITS_PER_THB));
+}
+
+function creditsFromThb(thb: number): number {
+  return Math.max(1, Math.ceil(thb * WORKSPACE_CREDITS_PER_THB));
+}
+
+function gptImage2OutputTokens(width: number, height: number, quality: "low" | "medium" | "high"): number {
+  const qualityBase = { low: 16, medium: 48, high: 96 }[quality];
+  const longEdge = Math.max(width, height);
+  const shortEdge = Math.min(width, height);
+  const shortQualityBase = Math.round((qualityBase * shortEdge) / longEdge);
+  const widthBase = width >= height ? qualityBase : shortQualityBase;
+  const heightBase = width >= height ? shortQualityBase : qualityBase;
+  return Math.ceil(widthBase * heightBase * (2_000_000 + width * height) / 4_000_000);
+}
+
+function gptImage2Credits(width: number, height: number, quality: "low" | "medium" | "high"): number {
+  return creditsFromUsd((gptImage2OutputTokens(width, height, quality) * 30) / 1_000_000);
+}
+
+const QUALITY_LABEL: Record<"low" | "medium" | "high", string> = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+};
+
+const GPT_IMAGE_2_ROWS: CreditCostWriteRow[] = ([
+  ["1k", 1024, 1024],
+  ["2k", 2048, 2048],
+  ["3k", 2880, 2880],
+] as const).flatMap(([tier, width, height]) =>
+  (["low", "medium", "high"] as const).map((quality) => ({
+    feature: "generate_openai_image",
+    model: `gpt-image-2:${tier}:${quality}`,
+    label: `GPT Image 2 ${tier.toUpperCase()} ${QUALITY_LABEL[quality]}`,
+    cost: gptImage2Credits(width, height, quality),
+    pricing_type: "per_operation",
+    provider: "openai",
+    price_key: `gpt-image-2:${tier}:${quality}`,
+    resolution: tier.toUpperCase(),
+    quality,
+    source: "official_docs",
+    source_url: "https://developers.openai.com/api/docs/guides/image-generation#calculating-costs",
+    source_ratio: null,
+    provider_unit: "per image",
+    notes: `Calculated from official gpt-image-2 output-token calculator at ${width}x${height}, then USD -> THB ${USD_TO_THB} and Workspace ${WORKSPACE_CREDITS_PER_THB} credits/THB.`,
+  }))
+);
+
+const GPT_IMAGE_2_FALLBACK_ROWS: CreditCostWriteRow[] = (["low", "medium", "high"] as const).map((quality) => ({
   feature: "generate_openai_image",
-  model: `gpt-image-2:${tier}:${quality}`,
-  label: `GPT Image 2 ${String(tier).toUpperCase()} ${String(quality)[0].toUpperCase()}${String(quality).slice(1)}`,
-  cost: Number(cost),
+  model: `gpt-image-2-${quality}`,
+  label: `GPT Image 2 ${QUALITY_LABEL[quality]} fallback`,
+  cost: gptImage2Credits(1024, 1024, quality),
   pricing_type: "per_operation",
   provider: "openai",
-  price_key: `gpt-image-2:${tier}:${quality}`,
-  resolution: String(tier).toUpperCase(),
-  quality: String(quality),
-  source: tier === "1k" ? "flow_erp_converted" : "workspace_catalog",
-  source_url: "https://platform.openai.com/docs/pricing",
-  source_ratio: FLOW_TO_WORKSPACE_RATIO,
+  price_key: `gpt-image-2:1k:${quality}`,
+  resolution: "1K",
+  quality,
+  source: "official_docs",
+  source_url: "https://developers.openai.com/api/docs/guides/image-generation#calculating-costs",
   provider_unit: "per image",
-  notes:
-    tier === "1k"
-      ? "Flow ERP quality row converted from 125 credits/THB to Workspace 50 credits/THB."
-      : "Workspace recommended tier. Keep this easy to override after invoice reconciliation.",
+  notes: "Runtime fallback row for older callers that only pass quality.",
+}));
+
+const NANO_BANANA_ROWS: CreditCostWriteRow[] = [
+  { model: "nano-banana-2", mappedModel: "gemini-3.1-flash-image-preview", label: "Nano Banana 2", prices: { "1k": 0.067, "2k": 0.101, "4k": 0.151 } },
+  { model: "nano-banana-pro", mappedModel: "gemini-3-pro-image-preview", label: "Nano Banana Pro", prices: { "1k": 0.134, "2k": 0.134, "4k": 0.24 } },
+].flatMap((def) =>
+  Object.entries(def.prices).map(([tier, usd]) => ({
+    feature: "generate_freepik_image",
+    model: `${def.model}:${tier}`,
+    label: `${def.label} ${tier.toUpperCase()}`,
+    cost: creditsFromUsd(usd),
+    pricing_type: "per_operation",
+    provider: "google",
+    price_key: `${def.mappedModel}:${tier}`,
+    resolution: tier.toUpperCase(),
+    quality: null,
+    source: "official_docs",
+    source_url: "https://ai.google.dev/gemini-api/docs/pricing",
+    provider_unit: "per image",
+    notes: `Workspace ${def.model} maps to Google ${def.mappedModel}; ${usd} USD/image -> ${USD_TO_THB} THB/USD -> ${WORKSPACE_CREDITS_PER_THB} credits/THB.`,
+  }))
+);
+
+const NANO_BANANA_FALLBACK_ROWS: CreditCostWriteRow[] = [
+  { model: "nano-banana-2", label: "Nano Banana 2 fallback", cost: creditsFromUsd(0.067), priceKey: "gemini-3.1-flash-image-preview:1k" },
+  { model: "nano-banana-pro", label: "Nano Banana Pro fallback", cost: creditsFromUsd(0.134), priceKey: "gemini-3-pro-image-preview:1k" },
+].map((row) => ({
+  feature: "generate_freepik_image",
+  model: row.model,
+  label: row.label,
+  cost: row.cost,
+  pricing_type: "per_operation",
+  provider: "google",
+  price_key: row.priceKey,
+  resolution: "1K",
+  source: "official_docs",
+  source_url: "https://ai.google.dev/gemini-api/docs/pricing",
+  provider_unit: "per image",
+  notes: "Runtime fallback row when the image node does not pass an explicit resolution.",
+}));
+
+const KLING_ROWS: CreditCostWriteRow[] = [
+  { model: "kling-v2-6-pro", label: "Kling 2.6 Pro", cost: creditsFromThb(10), audio: false, source: "flow_erp_converted", notes: "Existing Flow ERP cost is 10 THB/second. Converted from 125 credits/THB to Workspace 50 credits/THB." },
+  { model: "kling-v2-6-pro", label: "Kling 2.6 Pro + audio", cost: creditsFromThb(20), audio: true, source: "flow_erp_converted", notes: "Audio SKU uses the existing Flow convention of 2x video-only cost, converted to Workspace ratio." },
+  { model: "kling-v2-6-motion-pro", label: "Kling 2.6 Motion Pro", cost: creditsFromThb(10), audio: false, source: "flow_erp_converted", notes: "Existing Flow ERP cost is 10 THB/second. Converted from 125 credits/THB to Workspace 50 credits/THB." },
+  { model: "kling-v2-6-motion-pro", label: "Kling 2.6 Motion Pro + audio", cost: creditsFromThb(20), audio: true, source: "flow_erp_converted", notes: "Audio SKU uses the existing Flow convention of 2x video-only cost, converted to Workspace ratio." },
+  { model: "kling-v3-pro", label: "Kling 3 Pro", cost: 1, audio: false, source: "unverified_placeholder", notes: "Official provider SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
+  { model: "kling-v3-motion-pro", label: "Kling 3 Motion Pro", cost: 1, audio: false, source: "unverified_placeholder", notes: "Official provider SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
+  { model: "kling-v3-omni", label: "Kling 3 Omni", cost: 1, audio: false, source: "unverified_placeholder", notes: "Official provider SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
+  { model: "kling-v3-omni-video-ref", label: "Kling 3 Omni Video Reference", cost: 1, audio: false, source: "unverified_placeholder", notes: "Official provider SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
+].map((row) => ({
+  feature: "generate_freepik_video",
+  model: row.model,
+  label: row.label,
+  cost: row.cost,
+  pricing_type: "per_second",
+  has_audio: row.audio,
+  provider: "kling",
+  price_key: `${row.model}:${row.audio ? "audio" : "video"}`,
+  source: row.source,
+  source_url: row.source === "flow_erp_converted" ? "Flow ERP" : null,
+  source_ratio: row.source === "flow_erp_converted" ? FLOW_TO_WORKSPACE_RATIO : null,
+  provider_unit: "per second",
+  notes: row.notes,
+}));
+
+const SEEDANCE_ROWS: CreditCostWriteRow[] = [
+  "seedance-1-0-pro-250528",
+  "seedance-1-0-pro-fast-251015",
+  "seedance-1-5-pro-251215",
+].map((model) => ({
+  feature: "generate_freepik_video",
+  model,
+  label: model.replace(/-/g, " "),
+  cost: 1,
+  pricing_type: "per_second",
+  has_audio: false,
+  provider: "seedance",
+  price_key: `${model}:video`,
+  source: "unverified_placeholder",
+  provider_unit: "per second",
+  notes: "Official provider SKU price was not found in public docs during setup. Placeholder set to 1 by request.",
 }));
 
 const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   ...GPT_IMAGE_2_ROWS,
-  { feature: "generate_openai_image", model: "gpt-image-2-low", label: "GPT Image 2 Low (fallback)", cost: 3, pricing_type: "per_operation", provider: "openai", price_key: "gpt-image-2:1k:low", resolution: "1K", quality: "low", source: "flow_erp_converted", source_url: "https://platform.openai.com/docs/pricing", source_ratio: FLOW_TO_WORKSPACE_RATIO, provider_unit: "per image" },
-  { feature: "generate_openai_image", model: "gpt-image-2-medium", label: "GPT Image 2 Medium (fallback)", cost: 20, pricing_type: "per_operation", provider: "openai", price_key: "gpt-image-2:1k:medium", resolution: "1K", quality: "medium", source: "flow_erp_converted", source_url: "https://platform.openai.com/docs/pricing", source_ratio: FLOW_TO_WORKSPACE_RATIO, provider_unit: "per image" },
-  { feature: "generate_openai_image", model: "gpt-image-2-high", label: "GPT Image 2 High (fallback)", cost: 80, pricing_type: "per_operation", provider: "openai", price_key: "gpt-image-2:1k:high", resolution: "1K", quality: "high", source: "flow_erp_converted", source_url: "https://platform.openai.com/docs/pricing", source_ratio: FLOW_TO_WORKSPACE_RATIO, provider_unit: "per image" },
+  ...GPT_IMAGE_2_FALLBACK_ROWS,
+  ...NANO_BANANA_ROWS,
+  ...NANO_BANANA_FALLBACK_ROWS,
+  ...KLING_ROWS,
+  ...SEEDANCE_ROWS,
+  { feature: "chat_ai", model: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", cost: 1, pricing_type: "per_operation", provider: "google", price_key: "gemini-3.1-pro-preview", source: "unverified_placeholder", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per operation", notes: "Chat billing is token-based; Workspace runtime currently charges fixed operation rows. Placeholder set to 1 by request." },
+  { feature: "chat_ai", model: "google/gemini-3-flash-preview", label: "Gemini 3 Flash Preview", cost: 1, pricing_type: "per_operation", provider: "google", price_key: "gemini-3-flash-preview", source: "unverified_placeholder", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per operation", notes: "Chat billing is token-based; Workspace runtime currently charges fixed operation rows. Placeholder set to 1 by request." },
   { feature: "text_to_speech", model: "google-tts-studio", label: "Google Cloud TTS Studio / 1K chars", cost: 280, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-studio", quality: "studio", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
   { feature: "text_to_speech", model: "google-tts-neural2", label: "Google Cloud TTS Neural2 / 1K chars", cost: 28, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-neural2", quality: "neural2", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
-  { feature: "text_to_speech", model: "google-tts-wavenet", label: "Google Cloud TTS WaveNet / 1K chars", cost: 28, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-wavenet", quality: "wavenet", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
-  { feature: "video_to_prompt", model: "gemini-video-understanding", label: "Video to Prompt (Gemini)", cost: 10, pricing_type: "per_operation", provider: "google", price_key: "gemini-video-understanding", source: "workspace_catalog", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per analysis" },
-  { feature: "model_3d", model: "tripo3d-v3.1", label: "Tripo3D v3.1", cost: 80, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v3.1", quality: "detailed", source: "workspace_catalog", source_url: "https://www.tripo3d.ai/", provider_unit: "per model" },
-  { feature: "model_3d", model: "tripo3d-p1", label: "Tripo3D P1", cost: 120, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-p1", quality: "premium", source: "workspace_catalog", source_url: "https://www.tripo3d.ai/", provider_unit: "per model" },
-  { feature: "model_3d", model: "tripo3d-turbo", label: "Tripo3D Turbo", cost: 50, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-turbo", quality: "fast", source: "workspace_catalog", source_url: "https://www.tripo3d.ai/", provider_unit: "per model" },
+  { feature: "text_to_speech", model: "google-tts-wavenet", label: "Google Cloud TTS WaveNet / 1K chars", cost: 7, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-wavenet", quality: "wavenet", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
+  { feature: "text_to_speech", model: "google-tts-chirp3-hd", label: "Google Cloud TTS Chirp 3 HD / 1K chars", cost: 53, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-chirp3-hd", quality: "chirp3-hd", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
+  { feature: "video_to_prompt", model: "gemini-video-understanding", label: "Video to Prompt (Gemini)", cost: 1, pricing_type: "per_operation", provider: "google", price_key: "gemini-video-understanding", source: "unverified_placeholder", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per analysis", notes: "Token-based video input cost depends on duration and prompt payload; placeholder set to 1 by request until runtime supports token metering." },
+  { feature: "model_3d", model: "tripo3d-v3.1", label: "Tripo3D v3.1", cost: 1, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v3.1", quality: "detailed", source: "unverified_placeholder", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Official API SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
+  { feature: "model_3d", model: "tripo3d-p1", label: "Tripo3D P1", cost: 1, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-p1", quality: "premium", source: "unverified_placeholder", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Official API SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
+  { feature: "model_3d", model: "tripo3d-turbo", label: "Tripo3D Turbo", cost: 1, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-turbo", quality: "fast", source: "unverified_placeholder", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Official API SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
+  { feature: "remove_background", model: "replicate-birefnet", label: "Remove Background (BiRefNet)", cost: 1, pricing_type: "per_operation", provider: "replicate", price_key: "replicate-birefnet", source: "unverified_placeholder", provider_unit: "per image", notes: "Provider SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
+  { feature: "merge_audio_video", model: "shotstack", label: "Merge Audio + Video (Shotstack)", cost: 1, pricing_type: "per_operation", provider: "shotstack", price_key: "shotstack", source: "unverified_placeholder", provider_unit: "per operation", notes: "Infrastructure-only operation. Placeholder set to 1 by request." },
+  { feature: "mp3_input", model: "mp3-input", label: "MP3 Input", cost: 1, pricing_type: "per_operation", provider: "internal", price_key: "mp3-input", source: "unverified_placeholder", provider_unit: "per file", notes: "Infrastructure-only operation. Placeholder set to 1 by request." },
 ];
 
 function json(body: unknown, status = 200) {
@@ -158,12 +294,15 @@ async function getMarkupMultipliers(
     throw new Error(`subscription_settings read failed: ${error.message}`);
   }
 
-  // Defaults match what Pricing Manager falls back to when nothing is set.
+  const buffer = await getPricingBuffer(client);
+  const defaultMultiplier = 1 + buffer.data.buffer_percent / 100;
+  // Legacy compatibility: old admin pages expect per-feature multipliers,
+  // while Workspace now uses one infrastructure buffer for every feature.
   const out: Record<MultiplierKey, number> = {
-    image: 4.0,
-    video: 4.0,
-    chat: 4.0,
-    audio: 4.0,
+    image: defaultMultiplier,
+    video: defaultMultiplier,
+    chat: defaultMultiplier,
+    audio: defaultMultiplier,
   };
   for (const row of data ?? []) {
     const key = String((row as { key: string }).key ?? "");
@@ -179,6 +318,47 @@ async function getMarkupMultipliers(
     }
   }
   return { data: out };
+}
+
+async function getPricingBuffer(
+  client: SupabaseClient,
+): Promise<{ data: { buffer_percent: number; multiplier: number } }> {
+  const { data, error } = await client
+    .from("subscription_settings")
+    .select("value")
+    .eq("key", BUFFER_SETTING_KEY)
+    .maybeSingle();
+  if (error) {
+    throw new Error(`subscription_settings read failed: ${error.message}`);
+  }
+  const parsed = Number((data as { value?: string } | null)?.value);
+  const bufferPercent = Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_BUFFER_PERCENT;
+  return { data: { buffer_percent: bufferPercent, multiplier: 1 + bufferPercent / 100 } };
+}
+
+async function setPricingBuffer(
+  client: SupabaseClient,
+  body: Record<string, unknown>,
+  audit: { adminUserId: string | null },
+): Promise<{ data: { buffer_percent: number; multiplier: number } }> {
+  const raw = body.buffer_percent ?? body.infrastructure_buffer_percent ?? body.percent;
+  const bufferPercent = Number(raw);
+  if (!Number.isFinite(bufferPercent) || bufferPercent < 0 || bufferPercent > 500) {
+    throw new Error("`buffer_percent` must be a number between 0 and 500");
+  }
+  const { error } = await client
+    .from("subscription_settings")
+    .upsert([{ key: BUFFER_SETTING_KEY, value: String(bufferPercent) }], { onConflict: "key" });
+  if (error) {
+    throw new Error(`subscription_settings upsert failed: ${error.message}`);
+  }
+  await tryAudit(client, {
+    adminUserId: audit.adminUserId,
+    action: "workspace_pricing_buffer.set",
+    targetTable: "subscription_settings",
+    details: { buffer_percent: bufferPercent },
+  });
+  return getPricingBuffer(client);
 }
 
 // Best-effort audit row. Skipped silently if the table is missing or the
@@ -281,11 +461,17 @@ async function seedWorkspacePricingCatalog(
   for (const row of RECOMMENDED_WORKSPACE_PRICING) {
     rows.push(await saveCreditCostRow(client, row));
   }
+  const buffer = await getPricingBuffer(client);
+  if (buffer.data.buffer_percent === DEFAULT_BUFFER_PERCENT) {
+    await client
+      .from("subscription_settings")
+      .upsert([{ key: BUFFER_SETTING_KEY, value: String(DEFAULT_BUFFER_PERCENT) }], { onConflict: "key" });
+  }
   await tryAudit(client, {
     adminUserId: audit.adminUserId,
     action: "workspace_pricing_catalog.seed",
     targetTable: "credit_costs",
-    details: { written: rows.length, ratio: FLOW_TO_WORKSPACE_RATIO },
+    details: { written: rows.length, ratio: FLOW_TO_WORKSPACE_RATIO, buffer_percent: buffer.data.buffer_percent },
   });
   return { data: { written: rows.length, ratio: FLOW_TO_WORKSPACE_RATIO, rows } };
 }
@@ -488,10 +674,10 @@ async function setMarkupMultipliers(
   // We only touch the four canonical keys — anything else in the body is
   // silently ignored.
   const out: Record<MultiplierKey, number> = {
-    image: 4.0,
-    video: 4.0,
-    chat: 4.0,
-    audio: 4.0,
+    image: 1 + DEFAULT_BUFFER_PERCENT / 100,
+    video: 1 + DEFAULT_BUFFER_PERCENT / 100,
+    chat: 1 + DEFAULT_BUFFER_PERCENT / 100,
+    audio: 1 + DEFAULT_BUFFER_PERCENT / 100,
   };
   const rows: { key: string; value: string }[] = [];
   for (const k of MULTIPLIER_KEYS) {
@@ -524,6 +710,14 @@ async function setMarkupMultipliers(
   // the upsert (in case other keys were already there with different
   // values that we didn't pass in this call).
   const fresh = await getMarkupMultipliers(client);
+  const values = Object.values(fresh.data);
+  if (values.length > 0 && values.every((value) => Math.abs(value - values[0]) < 0.0001)) {
+    await setPricingBuffer(
+      client,
+      { buffer_percent: Math.max(0, Math.round((values[0] - 1) * 10000) / 100) },
+      audit,
+    );
+  }
 
   await tryAudit(client, {
     adminUserId: audit.adminUserId,
@@ -621,7 +815,11 @@ Deno.serve(async (req: Request) => {
       case "get_markup_multipliers":
         return json(await getMarkupMultipliers(admin));
 
-      case "get_pricing_catalog":
+      case "get_pricing_buffer":
+        return json(await getPricingBuffer(admin));
+
+      case "get_pricing_catalog": {
+        const buffer = await getPricingBuffer(admin);
         return json({
           data: {
             ratios: {
@@ -629,9 +827,11 @@ Deno.serve(async (req: Request) => {
               workspace_credits_per_thb: WORKSPACE_CREDITS_PER_THB,
               flow_to_workspace_ratio: FLOW_TO_WORKSPACE_RATIO,
             },
+            buffer: buffer.data,
             rows: RECOMMENDED_WORKSPACE_PRICING,
           },
         });
+      }
 
       // ── Mutations ──────────────────────────────────────────────────
       case "upsert_credit_cost":
@@ -642,6 +842,9 @@ Deno.serve(async (req: Request) => {
 
       case "set_markup_multipliers":
         return json(await setMarkupMultipliers(admin, body, auditCtx));
+
+      case "set_pricing_buffer":
+        return json(await setPricingBuffer(admin, body, auditCtx));
 
       case "recalculate_all_prices":
         return json(recalculateAllPrices());

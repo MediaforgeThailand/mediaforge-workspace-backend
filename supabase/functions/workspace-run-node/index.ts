@@ -4,9 +4,11 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { rejectIfOrgUser } from "../_shared/orgUserGuard.ts";
 import {
+  fetchFeatureMultipliers,
   lookupBaseCost,
   PricingConfigError,
   refundCreditsAtomic,
+  type FeatureMultipliers,
   type ProviderDef,
   type ProviderKey,
 } from "../_shared/pricing.ts";
@@ -2950,6 +2952,33 @@ function shouldChargeWorkspaceProvider(provider: string): boolean {
   return provider !== "gemini_tts" && provider !== "mp3_input";
 }
 
+function workspaceMultiplierForProvider(
+  def: ProviderDef,
+  multipliers: FeatureMultipliers,
+): number {
+  switch (def.provider) {
+    case "banana":
+    case "openai":
+    case "seedream":
+    case "remove_bg":
+    case "tripo3d":
+      return multipliers.image;
+    case "kling":
+    case "seedance":
+    case "merge_audio":
+      return multipliers.video;
+    case "chat_ai":
+    case "video_understanding":
+      return multipliers.chat;
+    case "google_tts":
+    case "gemini_tts":
+    case "mp3_input":
+      return multipliers.audio ?? multipliers.chat;
+    default:
+      return multipliers.chat;
+  }
+}
+
 type WorkspaceCreditCharge = {
   amount: number;
   teamId: string | null;
@@ -3006,7 +3035,9 @@ async function consumeWorkspaceCredits(args: {
     return null;
   }
   const def = workspaceProviderDef(args.nodeType, args.provider);
-  const amount = await lookupBaseCost(args.supabase, def, args.params);
+  const baseAmount = await lookupBaseCost(args.supabase, def, args.params);
+  const multipliers = await fetchFeatureMultipliers(args.supabase);
+  const amount = Math.max(1, Math.ceil(baseAmount * workspaceMultiplierForProvider(def, multipliers)));
   if (amount <= 0) return null;
 
   const teamId = await resolveWorkspaceTeamId(args.supabase, args.body.workspace_id ?? null);

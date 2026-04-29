@@ -60,18 +60,22 @@ export const NODE_TYPE_REGISTRY: Record<string, ProviderDef> = {
 const DEFAULT_IMAGE_MODEL = "nano-banana-pro";
 const DEFAULT_CHAT_MODEL = "google/gemini-3.1-pro-preview";
 const DEFAULT_VIDEO_MODEL = "kling-v2-6-pro";
+const DEFAULT_INFRASTRUCTURE_BUFFER_PERCENT = 40;
+const DEFAULT_WORKSPACE_MULTIPLIER = 1 + DEFAULT_INFRASTRUCTURE_BUFFER_PERCENT / 100;
 
-function normaliseResolutionTier(size: string): "1k" | "2k" | "4k" | "auto" {
+function normaliseResolutionTier(size: string): "1k" | "2k" | "3k" | "4k" | "auto" {
   const s = size.toLowerCase().trim();
   if (!s || s === "auto") return "auto";
   const m = s.match(/^(\d+)x(\d+)$/);
   if (!m) {
     if (s.includes("4k")) return "4k";
+    if (s.includes("3k")) return "3k";
     if (s.includes("2k")) return "2k";
     return "1k";
   }
   const maxEdge = Math.max(Number(m[1]), Number(m[2]));
-  if (maxEdge >= 3000) return "4k";
+  if (maxEdge >= 3600) return "4k";
+  if (maxEdge >= 2800) return "3k";
   if (maxEdge >= 1900) return "2k";
   return "1k";
 }
@@ -467,9 +471,9 @@ export interface FeatureMultipliers {
 }
 
 function getMultiplierForNode(nodeType: string, featureMultipliers?: FeatureMultipliers): number {
-  if (!featureMultipliers) return 4.0;
+  if (!featureMultipliers) return DEFAULT_WORKSPACE_MULTIPLIER;
   const def = NODE_TYPE_REGISTRY[nodeType];
-  if (!def) return 4.0;
+  if (!def) return DEFAULT_WORKSPACE_MULTIPLIER;
   switch (def.provider) {
     case "banana": return featureMultipliers.image;
     case "openai": return featureMultipliers.image;
@@ -483,28 +487,33 @@ function getMultiplierForNode(nodeType: string, featureMultipliers?: FeatureMult
     case "google_tts": return featureMultipliers.audio ?? 1.0;
     case "gemini_tts": return featureMultipliers.audio ?? 1.0;
     case "video_understanding": return featureMultipliers.chat;
-    case "mp3_input": return 1.0;
-    default: return 4.0;
+    case "mp3_input": return featureMultipliers.audio ?? DEFAULT_WORKSPACE_MULTIPLIER;
+    default: return DEFAULT_WORKSPACE_MULTIPLIER;
   }
 }
 
-/** Fetch platform multipliers from subscription_settings */
+/** Fetch the Workspace infrastructure buffer as a feature multiplier. */
 export async function fetchFeatureMultipliers(
   supabase: ReturnType<typeof createClient>,
 ): Promise<FeatureMultipliers> {
   const { data } = await supabase
     .from("subscription_settings")
     .select("key, value")
-    .in("key", ["markup_multiplier_image", "markup_multiplier_video", "markup_multiplier_chat"]);
+    .in("key", ["workspace_infrastructure_buffer_percent"]);
 
-  const map: Record<string, number> = {};
-  (data || []).forEach((r: { key: string; value: string }) => {
-    map[r.key] = parseFloat(r.value) || 4.0;
-  });
+  const rawBuffer = (data || []).find((r: { key: string; value: string }) =>
+    r.key === "workspace_infrastructure_buffer_percent"
+  )?.value;
+  const parsedBuffer = Number(rawBuffer);
+  const bufferPercent = Number.isFinite(parsedBuffer) && parsedBuffer >= 0
+    ? parsedBuffer
+    : DEFAULT_INFRASTRUCTURE_BUFFER_PERCENT;
+  const multiplier = 1 + bufferPercent / 100;
   return {
-    image: map.markup_multiplier_image ?? 4.0,
-    video: map.markup_multiplier_video ?? 4.0,
-    chat: map.markup_multiplier_chat ?? 4.0,
+    image: multiplier,
+    video: multiplier,
+    chat: multiplier,
+    audio: multiplier,
   };
 }
 
