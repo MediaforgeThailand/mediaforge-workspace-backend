@@ -272,7 +272,7 @@ interface ProviderResult {
   result_url?: string;
   /** Structured outputs dict — each key is a named output handle */
   outputs: Record<string, string>;
-  output_type: "video_url" | "image_url" | "text";
+  output_type: "video_url" | "image_url" | "text" | "audio_url";
   provider_meta?: Record<string, unknown>;
 }
 
@@ -1674,6 +1674,240 @@ async function executeMergeAudio(params: Record<string, unknown>): Promise<Provi
   };
 }
 
+/* ═══════════════════════════════════════════════════════════
+   Audio gen — Google Cloud Text-to-Speech provider
+   ───────────────────────────────────────────────────────────
+
+   Two providers feed `audioGenNode`:
+
+     1. google_tts → executeGoogleTts (default, this section).
+        Calls texttospeech.googleapis.com directly with the
+        user-picked voice id (e.g. en-US-Studio-O). Studio /
+        Neural2 / WaveNet are differentiated by the `model_name`
+        param ONLY for billing — the voice id alone tells Google
+        which family to render. The `model_name` flag controls
+        which voices the picker exposes; the API treats them all
+        the same.
+
+     2. gemini_tts → executeGeminiTts (legacy fallback). Proxies
+        to the existing `text-to-speech` edge function which
+        wraps Gemini 2.5 TTS. Kept available so the legacy
+        Gemini star-name catalog still works as an "advanced"
+        toggle when the user picks a `gemini-2.5-*-tts` model.
+
+   Output: an `audio_url` pointing at a public-read MP3 stored in
+   the `user_assets` Supabase bucket. The frontend renders this
+   URL directly in an <audio> element on the node body and via
+   the NodePreviewLightbox dialog.
+   ═══════════════════════════════════════════════════════════ */
+
+async function executeGoogleTts(
+  params: Record<string, unknown>,
+  supabaseClient: ReturnType<typeof createClient>,
+  userId: string,
+): Promise<ProviderResult> {
+  const apiKey = Deno.env.get("GOOGLE_TTS_API_KEY");
+  if (!apiKey) {
+    // Surface a clear missing-key message so the frontend's
+    // permanent-error matcher sees `not configured` and stops the
+    // 30-min retry loop. Without that match the user would wait
+    // half an hour before getting an error toast.
+    throw new Error(
+      "Google Cloud TTS not configured — set GOOGLE_TTS_API_KEY in Supabase project secrets (workspace dev).",
+    );
+  }
+
+  const text = String(params.prompt ?? params.text ?? "").trim();
+  if (!text) throw new Error("Audio Generation requires a script (prompt).");
+  if (text.length > 5000) {
+    throw new Error("Script too long — max 5,000 characters per audio gen.");
+  }
+
+  const voiceId = String(params.voice ?? "en-US-Studio-O");
+
+  // Infer language code from the voice id ("en-US-Studio-O" → "en-US").
+  // Google requires both the languageCode AND the voice name; if they
+  // disagree the API 400s. Splitting from the id avoids the user
+  // needing to pick the language separately.
+  const langMatch = voiceId.match(/^([a-z]{2}-[A-Z]{2})-/);
+  const languageCode = langMatch?.[1] ?? "en-US";
+
+  // Optional style hint → SSML <prosody>. Conservative mapping —
+  // recognise a handful of keywords ("calm", "fast", "slow", "warm").
+  // Anything else gets passed as a plain raw <speak> wrapper without
+  // prosody so the Google TTS request stays valid.
+  const styleHint = String(params.style_prompt ?? "").trim().toLowerCase();
+  let inputBody: { text?: string; ssml?: string };
+  if (styleHint) {
+    const rate = /\bslow\b/.test(styleHint) ? "slow"
+      : /\bfast\b/.test(styleHint) ? "fast"
+      : "medium";
+    const pitch = /\b(deep|low)\b/.test(styleHint) ? "-2st"
+      : /\b(high|bright|youthful)\b/.test(styleHint) ? "+2st"
+      : "0st";
+    // Escape XML special chars so user text can't break the SSML.
+    const escaped = text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&apos;");
+    inputBody = {
+      ssml: `<speak><prosody rate="${rate}" pitch="${pitch}">${escaped}</prosody></speak>`,
+    };
+  } else {
+    inputBody = { text };
+  }
+
+  // Audio encoding — MP3 is universally supported and small. WAV is
+  // available but ~10x larger for no perceptible quality gain at
+  // speech bitrates. The frontend's <audio> element renders MP3
+  // natively on every modern browser.
+  const ttsRes = await fetch(
+    `https://texttospeech.googleapis.com/v1/text:synthesize?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        input: inputBody,
+        voice: { languageCode, name: voiceId },
+        audioConfig: {
+          audioEncoding: "MP3",
+          // Google's defaults are tuned for broadcast read; keep
+          // them unless the style hint already adjusted prosody.
+          speakingRate: 1.0,
+          pitch: 0,
+        },
+      }),
+    },
+  );
+
+  if (!ttsRes.ok) {
+    const errText = await ttsRes.text();
+    console.error(`[google-tts] HTTP ${ttsRes.status} body=${errText.slice(0, 500)}`);
+    // Translate common Google API errors into the frontend's
+    // permanent-error patterns where possible. INVALID_ARGUMENT
+    // usually means a stale voice id; surface it as Validation.
+    if (ttsRes.status === 400) {
+      throw new Error(`Validation: Google TTS rejected the request — ${errText.slice(0, 200)}`);
+    }
+    if (ttsRes.status === 401 || ttsRes.status === 403) {
+      throw new Error(`Google TTS authentication failed — check GOOGLE_TTS_API_KEY (HTTP ${ttsRes.status}).`);
+    }
+    throw new Error(`Google TTS failed (HTTP ${ttsRes.status})`);
+  }
+
+  const json = await ttsRes.json();
+  const audioContentB64 = String(json.audioContent ?? "");
+  if (!audioContentB64) {
+    throw new Error("Google TTS returned no audio content.");
+  }
+
+  // Decode base64 → Uint8Array → upload as MP3.
+  const binary = atob(audioContentB64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+  const fileName = `tts/${userId}/${Date.now()}_${voiceId}.mp3`;
+  const { error: uploadErr } = await supabaseClient.storage
+    .from("user_assets")
+    .upload(fileName, bytes, { contentType: "audio/mpeg", upsert: true });
+  if (uploadErr) {
+    console.error("[google-tts] upload error:", uploadErr);
+    throw new Error("Failed to save audio. Please try again.");
+  }
+
+  const { data: signedData, error: signErr } = await supabaseClient.storage
+    .from("user_assets")
+    .createSignedUrl(fileName, 86400); // 24h
+  if (signErr || !signedData?.signedUrl) {
+    console.error("[google-tts] signed URL error:", signErr);
+    throw new Error("Failed to save audio. Please try again.");
+  }
+
+  const audioUrl = signedData.signedUrl;
+
+  // Mirror the legacy text-to-speech edge fn's user_assets row so
+  // the asset library + downstream Merge Audio nodes pick it up.
+  await supabaseClient.from("user_assets").insert({
+    user_id: userId,
+    name: `TTS: ${text.slice(0, 40)}${text.length > 40 ? "..." : ""}`,
+    file_url: audioUrl,
+    file_type: "audio",
+    source: "ai_generated",
+    metadata: {
+      voice: voiceId,
+      language: languageCode,
+      provider: "google_tts",
+      text_length: text.length,
+      style_prompt: styleHint || null,
+    },
+  });
+
+  return {
+    result_url: audioUrl,
+    outputs: { audio_url: audioUrl },
+    output_type: "audio_url" as const,
+    provider_meta: {
+      provider: "google_tts",
+      voice: voiceId,
+      language: languageCode,
+      model: String(params.model_name ?? "google-tts-studio"),
+    },
+  };
+}
+
+/**
+ * executeGeminiTts — legacy fallback for the gemini-2.5-*-tts
+ * models. Proxies to the existing `text-to-speech` edge function
+ * which already handles the Gemini API call + WAV encoding +
+ * storage upload + credit consumption.
+ *
+ * We pass through the user's auth header so the downstream
+ * function sees the SAME user (and bills SAME credits) the
+ * workspace-run-node call would have. Service-role bypass would
+ * skip the credit check.
+ */
+async function executeGeminiTts(
+  params: Record<string, unknown>,
+  authHeader: string,
+): Promise<ProviderResult> {
+  const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+  const text = String(params.prompt ?? params.text ?? "").trim();
+  if (!text) throw new Error("Audio Generation requires a script (prompt).");
+
+  const voice = String(params.voice ?? "Charon");
+
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/text-to-speech`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: authHeader,
+    },
+    body: JSON.stringify({ text, voice }),
+  });
+
+  const json = await res.json();
+  if (!res.ok) {
+    const errMsg = String(json?.error || `text-to-speech failed (${res.status})`);
+    throw new Error(errMsg);
+  }
+
+  const audioUrl = String(json.audioUrl ?? "");
+  if (!audioUrl) throw new Error("text-to-speech returned no audio URL.");
+
+  return {
+    result_url: audioUrl,
+    outputs: { audio_url: audioUrl },
+    output_type: "audio_url" as const,
+    provider_meta: {
+      provider: "gemini_tts",
+      voice,
+      model: String(params.model_name ?? "gemini-2.5-flash-preview-tts"),
+    },
+  };
+}
+
 
 /* ═══════════════════════════════════════════════════════════
    @mention resolver — Provider-Aware
@@ -2506,6 +2740,14 @@ function getProviderForNodeType(
   if (nodeType === "chatAiNode") return "chat_ai";
   if (nodeType === "videoToPromptNode") return "video_understanding";
   if (nodeType === "imageTo3dNode") return "tripo3d";
+
+  // Audio generation — provider chosen by model_name. Default to
+  // google_tts (Studio / Neural2 / WaveNet); fall back to the legacy
+  // gemini_tts proxy when the user picks a `gemini-2.5-*-tts` model.
+  if (nodeType === "audioGenNode") {
+    if (m.startsWith("gemini-")) return "gemini_tts";
+    return "google_tts";
+  }
 
   throw new Error(`Workspace: no provider mapping for node_type "${nodeType}"`);
 }
@@ -3552,6 +3794,19 @@ serve(async (req) => {
       case "tripo3d":
         result = await executeTripo3D(params, supabase);
         break;
+      case "google_tts":
+        // Pass the service-role supabase client + user id so the
+        // executor can upload the MP3 and insert into user_assets
+        // without going through another auth round-trip.
+        result = await executeGoogleTts(params, supabase, user.id);
+        break;
+      case "gemini_tts":
+        // Legacy path — proxies to the standalone text-to-speech
+        // edge fn which handles its own auth + credit consumption.
+        // Forward the user's auth header so credit billing follows
+        // them, not the service role.
+        result = await executeGeminiTts(params, authHeader);
+        break;
       case "seedream":
       case "seedance":
         // Not yet ported from the legacy editor — fail loud rather than
@@ -3568,6 +3823,7 @@ serve(async (req) => {
     const responseType =
       result.output_type === "video_url" ? "video" :
       result.output_type === "text"      ? "text"  :
+      result.output_type === "audio_url" ? "audio" :
       "image";
 
     const promptUsed = String(params.prompt ?? params.system_prompt ?? "");
