@@ -1227,15 +1227,18 @@ async function executeSeedance(
       : durationRaw
         ? parseInt(String(durationRaw), 10) || 5
         : 5;
-  // Seedance 2.0 r2v rejects very short clips with InvalidParameter
-  // ("the parameter duration specified in the request is not valid
-  //  for model dreamina-seedance-2-0 in r2v"). Floor < 5s requests
-  // to 5s and cap > 12s requests to 12s for v2 — the legacy 1.x
+  // Seedance 2.0 (dreamina-seedance-*) accepts 4-14s per the
+  // BytePlus duration dropdown (matching the upstream Freepik UI).
+  // BytePlus returns `InvalidParameter` outside that range with
+  // "the parameter duration specified in the request is not valid
+  //  for model dreamina-seedance-2-0 in r2v". Server-side clamp
+  // is a defensive net for legacy frontend versions or direct API
+  // callers that still send 1.x-era values like 3s; legacy 1.x
   // models accept 2-12s and stay untouched.
   const isV2DurationGuard = entry.model.startsWith("dreamina-seedance");
   if (isV2DurationGuard) {
-    if (!Number.isFinite(duration) || duration < 5) duration = 5;
-    else if (duration > 12) duration = 12;
+    if (!Number.isFinite(duration) || duration < 4) duration = 4;
+    else if (duration > 14) duration = 14;
   }
   const generateAudioRaw = params.generate_audio ?? params.has_audio;
   const generateAudio = entry.supportsAudio
