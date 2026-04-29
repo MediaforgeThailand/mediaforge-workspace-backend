@@ -161,7 +161,31 @@ export interface SeedanceCredentials {
   apiKey: string;
 }
 
-export function loadSeedanceCredentials(): SeedanceCredentials {
+/**
+ * Load BytePlus Ark credentials.
+ *
+ * Pass `{ v2: true }` when the caller is hitting a Seedance 2.0
+ * model that lives behind a *custom* inference endpoint provisioned
+ * in the BytePlus console — those endpoints are billed against a
+ * dedicated API key (`SEEDANCE_V2_API_KEY`) that may be scoped to
+ * only that endpoint. Falling back to the default account key when
+ * the v2 key isn't set keeps the function usable for ad-hoc tests
+ * before the secret is provisioned.
+ *
+ * Default (no opts) returns the account-wide key Seedream + Hyper3D
+ * "auto" endpoints share with the legacy 1.x Seedance models.
+ */
+export function loadSeedanceCredentials(opts?: { v2?: boolean }): SeedanceCredentials {
+  if (opts?.v2) {
+    const v2Key =
+      Deno.env.get("SEEDANCE_V2_API_KEY") ??
+      Deno.env.get("BYTEPLUS_SEEDANCE_V2_API_KEY");
+    if (v2Key) return { apiKey: v2Key };
+    // fall through to the default key — better to attempt the call
+    // (and surface the BytePlus error) than fail outright while the
+    // operator is mid-rollout.
+  }
+
   const apiKey =
     Deno.env.get("SEEDANCE_API_KEY") ??
     Deno.env.get("ARK_API_KEY") ??
