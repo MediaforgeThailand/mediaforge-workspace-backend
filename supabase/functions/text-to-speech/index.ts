@@ -7,10 +7,46 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-const GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts";
-const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TTS_MODEL}:generateContent`;
+const DEFAULT_GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview";
+const LEGACY_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts";
+const GEMINI_TTS_MODELS = new Set([
+  "gemini-3.1-flash-tts-preview",
+  "gemini-2.5-flash-preview-tts",
+  "gemini-2.5-pro-preview-tts",
+]);
 
-// Available voices: Aoede, Charon, Fenrir, Kore, Puck, Leda, Orus, Zephyr
+const GEMINI_TTS_VOICES = new Set([
+  "Achernar",
+  "Achird",
+  "Algenib",
+  "Algieba",
+  "Alnilam",
+  "Aoede",
+  "Autonoe",
+  "Callirrhoe",
+  "Charon",
+  "Despina",
+  "Enceladus",
+  "Erinome",
+  "Fenrir",
+  "Gacrux",
+  "Iapetus",
+  "Kore",
+  "Laomedeia",
+  "Leda",
+  "Orus",
+  "Puck",
+  "Pulcherrima",
+  "Rasalgethi",
+  "Sadachbia",
+  "Sadaltager",
+  "Schedar",
+  "Sulafat",
+  "Umbriel",
+  "Vindemiatrix",
+  "Zephyr",
+  "Zubenelgenubi",
+]);
 const DEFAULT_VOICE = "Kore";
 
 function pcmToWav(pcmData: Uint8Array, sampleRate: number, numChannels: number, bitsPerSample: number): Uint8Array {
@@ -51,8 +87,12 @@ serve(async (req) => {
   let loggedUserId: string | null = null;
   let loggedTtsCost = 0;
   try {
-    const GOOGLE_AI_STUDIO_KEY = Deno.env.get("GOOGLE_AI_STUDIO_KEY");
-    if (!GOOGLE_AI_STUDIO_KEY) throw new Error("GOOGLE_AI_STUDIO_KEY is not configured");
+    const GEMINI_API_KEY =
+      Deno.env.get("GOOGLE_AI_STUDIO_KEY") ??
+      Deno.env.get("GEMINI_API_KEY");
+    if (!GEMINI_API_KEY) {
+      throw new Error("Gemini API key is not configured");
+    }
 
     // Auth
     const authHeader = req.headers.get("authorization");
@@ -86,7 +126,7 @@ serve(async (req) => {
       });
     }
 
-    const { text, voice } = await req.json();
+    const { text, voice, model, style_prompt } = await req.json();
     if (!text || typeof text !== "string") {
       return new Response(JSON.stringify({ error: "Text is required" }), {
         status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -98,25 +138,51 @@ serve(async (req) => {
       });
     }
 
-    const validVoices = ["Aoede", "Charon", "Fenrir", "Kore", "Puck", "Leda", "Orus", "Zephyr"];
-    if (voice && !validVoices.includes(voice)) {
+    const requestedVoice = typeof voice === "string" ? voice.trim() : "";
+    if (requestedVoice && !GEMINI_TTS_VOICES.has(requestedVoice)) {
       return new Response(JSON.stringify({ error: "Invalid voice selection" }), {
         status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    const voiceName = voice || DEFAULT_VOICE;
+    const requestedModel = typeof model === "string" ? model.trim() : "";
+    if (requestedModel && !GEMINI_TTS_MODELS.has(requestedModel)) {
+      return new Response(JSON.stringify({ error: "Invalid Gemini TTS model" }), {
+        status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const voiceName = requestedVoice || DEFAULT_VOICE;
+    const modelName = requestedModel || DEFAULT_GEMINI_TTS_MODEL;
+    const stylePrompt =
+      typeof style_prompt === "string" ? style_prompt.trim() : "";
 
     // Deduct credits using consume_credits RPC
     const supabaseAdmin = createClient(supabaseUrl, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
     
     // Fetch TTS credit cost from DB
-    const { data: costRows } = await supabaseAdmin
+    const { data: exactCostRow } = await supabaseAdmin
       .from("credit_costs")
-      .select("cost")
+      .select("cost, pricing_type")
       .eq("feature", "text_to_speech")
-      .limit(1);
-    const ttsCost = costRows?.[0]?.cost || 5;
+      .eq("model", modelName)
+      .limit(1)
+      .maybeSingle();
+    let fallbackCostRows: Array<{ cost: number; pricing_type?: string | null }> | null = null;
+    if (!exactCostRow) {
+      const { data } = await supabaseAdmin
+        .from("credit_costs")
+        .select("cost, pricing_type")
+        .eq("feature", "text_to_speech")
+        .limit(1);
+      fallbackCostRows = (data ?? null) as Array<{ cost: number; pricing_type?: string | null }> | null;
+    }
+    const costRow = exactCostRow ?? fallbackCostRows?.[0] ?? null;
+    const baseTtsCost = Number(costRow?.cost ?? 5);
+    const ttsCost =
+      costRow?.pricing_type === "per_1k_chars"
+        ? Math.max(1, Math.ceil((baseTtsCost * Math.max(text.length, 1)) / 1000))
+        : baseTtsCost;
 
     loggedUserId = user.id;
     loggedTtsCost = ttsCost;
@@ -136,20 +202,25 @@ serve(async (req) => {
       });
     }
 
-    console.log(`TTS request: voice=${voiceName}, text length=${text.length}`);
+    console.log(`TTS request: model=${modelName}, voice=${voiceName}, text length=${text.length}`);
 
     // Call Gemini TTS API
     // Call Gemini TTS API with retry logic
     let audioData: any = null;
     const maxRetries = 3;
+    const spokenPrompt = stylePrompt
+      ? `${stylePrompt}\n\nRead the following text aloud exactly as written, without adding any extra words or commentary:\n\n${text}`
+      : `Please read the following text aloud exactly as written, without adding any extra words or commentary:\n\n${text}`;
     
     for (let attempt = 0; attempt < maxRetries; attempt++) {
-      const response = await fetch(`${GEMINI_API_URL}?key=${GOOGLE_AI_STUDIO_KEY}`, {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`,
+        {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [
-            { role: "user", parts: [{ text: `Please read the following text aloud exactly as written, without adding any extra words or commentary:\n\n${text}` }] }
+            { role: "user", parts: [{ text: spokenPrompt }] }
           ],
           generationConfig: {
             responseModalities: ["AUDIO"],
@@ -229,21 +300,26 @@ serve(async (req) => {
       file_url: audioUrl,
       file_type: "audio",
       source: "ai_generated",
-      metadata: { voice: voiceName, text_length: text.length },
+      metadata: {
+        voice: voiceName,
+        model: modelName,
+        text_length: text.length,
+        style_prompt: stylePrompt || null,
+      },
     });
 
     await logApiUsage(supabaseAdmin, {
       user_id: user.id,
       endpoint: "text-to-speech",
       feature: "tts",
-      model: GEMINI_TTS_MODEL,
+      model: modelName,
       status: "success",
       credits_used: ttsCost,
       duration_ms: Date.now() - startTime,
-      request_metadata: { voice: voiceName, text_length: text.length },
+      request_metadata: { voice: voiceName, text_length: text.length, style_prompt: stylePrompt || null },
     });
 
-    return new Response(JSON.stringify({ audioUrl, voice: voiceName }), {
+    return new Response(JSON.stringify({ audioUrl, voice: voiceName, model: modelName }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
 
@@ -279,7 +355,7 @@ serve(async (req) => {
       console.error("[REFUND] TTS refund failed:", refundErr);
     }
     const msg = e instanceof Error ? e.message : "Voice generation failed. Please try again.";
-    const safeMessages = ["Text is required", "Text too long", "Invalid voice selection", "Voice generation failed. Please try again.", "Failed to save audio. Please try again.", "No audio data in Gemini response after retries"];
+    const safeMessages = ["Text is required", "Text too long", "Invalid voice selection", "Invalid Gemini TTS model", "Voice generation failed. Please try again.", "Failed to save audio. Please try again.", "No audio data in Gemini response after retries"];
     const clientMsg = safeMessages.some(s => msg.includes(s)) ? msg : "Voice generation failed. Please try again.";
 
     try {
@@ -292,7 +368,7 @@ serve(async (req) => {
         user_id: loggedUserId ?? "system",
         endpoint: "text-to-speech",
         feature: "tts",
-        model: GEMINI_TTS_MODEL,
+        model: LEGACY_GEMINI_TTS_MODEL,
         status: "error",
         credits_used: loggedTtsCost,
         credits_refunded: loggedTtsCost,

@@ -117,6 +117,7 @@ const GPT_IMAGE_2_ROWS: CreditCostWriteRow[] = ([
   ["1k", 1024, 1024],
   ["2k", 2048, 2048],
   ["3k", 2880, 2880],
+  ["4k", 3840, 2160],
 ] as const).flatMap(([tier, width, height]) =>
   (["low", "medium", "high"] as const).map((quality) => ({
     feature: "generate_openai_image",
@@ -196,10 +197,12 @@ const KLING_ROWS: CreditCostWriteRow[] = [
   { model: "kling-v2-6-pro", label: "Kling 2.6 Pro + audio", cost: creditsFromThb(20), audio: true, source: "flow_erp_converted", notes: "Audio SKU uses the existing Flow convention of 2x video-only cost, converted to Workspace ratio." },
   { model: "kling-v2-6-motion-pro", label: "Kling 2.6 Motion Pro", cost: creditsFromThb(10), audio: false, source: "flow_erp_converted", notes: "Existing Flow ERP cost is 10 THB/second. Converted from 125 credits/THB to Workspace 50 credits/THB." },
   { model: "kling-v2-6-motion-pro", label: "Kling 2.6 Motion Pro + audio", cost: creditsFromThb(20), audio: true, source: "flow_erp_converted", notes: "Audio SKU uses the existing Flow convention of 2x video-only cost, converted to Workspace ratio." },
-  { model: "kling-v3-pro", label: "Kling 3 Pro", cost: 1, audio: false, source: "unverified_placeholder", notes: "Official provider SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
-  { model: "kling-v3-motion-pro", label: "Kling 3 Motion Pro", cost: 1, audio: false, source: "unverified_placeholder", notes: "Official provider SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
-  { model: "kling-v3-omni", label: "Kling 3 Omni", cost: 1, audio: false, source: "unverified_placeholder", notes: "Official provider SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
-  { model: "kling-v3-omni-video-ref", label: "Kling 3 Omni Video Reference", cost: 1, audio: false, source: "unverified_placeholder", notes: "Official provider SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
+  { model: "kling-v3-pro", label: "Kling 3 Pro", cost: 185, audio: false, source: "master_pricing_sheet", notes: "Master Pricing Sheet: Kling 3 Pro 1080p no audio = 185 credits/sec." },
+  { model: "kling-v3-pro", label: "Kling 3 Pro + audio", cost: 275, audio: true, source: "master_pricing_sheet", notes: "Master Pricing Sheet: Kling 3 Pro 1080p with audio = 275 credits/sec." },
+  { model: "kling-v3-motion-pro", label: "Kling 3 Motion Pro", cost: 275, audio: false, source: "master_pricing_sheet", notes: "Master Pricing Sheet: Motion/pro tier recommended at 275 credits/sec." },
+  { model: "kling-v3-omni", label: "Kling 3 Omni", cost: 280, audio: false, source: "master_pricing_sheet", notes: "Master Pricing Sheet: Kling 3 Omni no audio = 280 credits/sec." },
+  { model: "kling-v3-omni", label: "Kling 3 Omni + audio", cost: 370, audio: true, source: "master_pricing_sheet", notes: "Master Pricing Sheet: Kling 3 Omni with audio = 370 credits/sec." },
+  { model: "kling-v3-omni-video-ref", label: "Kling 3 Omni Video Reference", cost: 370, audio: false, source: "master_pricing_sheet", notes: "Master Pricing Sheet: video-reference default = 370 credits/sec. Omni disables audio when a reference video is present." },
 ].map((row) => ({
   feature: "generate_freepik_video",
   model: row.model,
@@ -217,21 +220,38 @@ const KLING_ROWS: CreditCostWriteRow[] = [
 }));
 
 const SEEDANCE_ROWS: CreditCostWriteRow[] = [
-  "seedance-1-0-pro-250528",
-  "seedance-1-0-pro-fast-251015",
-  "seedance-1-5-pro-251215",
-].map((model) => ({
+  { model: "seedance-1-0-pro-250528", label: "Seedance 1.0 Pro 720p", cost: 90, resolution: "720p", audio: false, notes: "Master Pricing Sheet: 720p approx 90 credits/sec." },
+  { model: "seedance-1-0-pro-250528", label: "Seedance 1.0 Pro 1080p", cost: 200, resolution: "1080p", audio: false, notes: "Master Pricing Sheet: 1080p approx 200 credits/sec." },
+  { model: "seedance-1-0-pro-250528", label: "Seedance 1.0 Pro fallback", cost: 200, resolution: null, audio: false, notes: "Fallback when runtime receives no resolution; uses conservative 1080p rate." },
+  { model: "seedance-1-0-pro-fast-251015", label: "Seedance 1.0 Pro Fast 720p", cost: 35, resolution: "720p", audio: false, notes: "Master Pricing Sheet: 720p approx 35 credits/sec." },
+  { model: "seedance-1-0-pro-fast-251015", label: "Seedance 1.0 Pro Fast 1080p", cost: 80, resolution: "1080p", audio: false, notes: "Master Pricing Sheet: 1080p approx 80 credits/sec." },
+  { model: "seedance-1-0-pro-fast-251015", label: "Seedance 1.0 Pro Fast fallback", cost: 80, resolution: null, audio: false, notes: "Fallback when runtime receives no resolution; uses conservative 1080p rate." },
+  { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro 720p no audio", cost: 100, resolution: "720p", audio: false, notes: "Master Pricing Sheet: no audio approx 100 credits/sec." },
+  { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro 720p + audio", cost: 200, resolution: "720p", audio: true, notes: "Master Pricing Sheet: with audio approx 200 credits/sec." },
+  { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro 1080p no audio", cost: 100, resolution: "1080p", audio: false, notes: "Master Pricing Sheet: 1080p no audio approx 100 credits/sec." },
+  { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro 1080p + audio", cost: 200, resolution: "1080p", audio: true, notes: "Master Pricing Sheet: 1080p with audio approx 200 credits/sec." },
+  { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro fallback", cost: 100, resolution: null, audio: false, notes: "Fallback when runtime receives no resolution; uses no-audio base rate." },
+  { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro + audio fallback", cost: 200, resolution: null, audio: true, notes: "Fallback when runtime receives audio without a resolution split." },
+  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast 720p", cost: 200, resolution: "720p", audio: false, notes: "Master Pricing Sheet: 720p text/image-to-video without video input approx 200 credits/sec." },
+  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast fallback", cost: 200, resolution: null, audio: false, notes: "Fallback for Seedance 2.0 Fast when runtime receives no resolution." },
+  { model: "dreamina-seedance-2-0-fast-260128", label: "Seedance 2.0 Fast direct-id fallback", cost: 200, resolution: null, audio: false, notes: "Direct BytePlus model id alias for Seedance 2.0 Fast." },
+  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 720p", cost: 250, resolution: "720p", audio: false, notes: "Master Pricing Sheet: 720p text/image-to-video without video input approx 250 credits/sec." },
+  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 1080p", cost: 615, resolution: "1080p", audio: false, notes: "Master Pricing Sheet: 1080p no-video-input approx 615 credits/sec." },
+  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro fallback", cost: 250, resolution: null, audio: false, notes: "Fallback when runtime receives no resolution; uses 720p default rate." },
+  { model: "dreamina-seedance-2-0-260128", label: "Seedance 2.0 Pro direct-id fallback", cost: 250, resolution: null, audio: false, notes: "Direct BytePlus model id alias for Seedance 2.0 Pro." },
+].map((row) => ({
   feature: "generate_freepik_video",
-  model,
-  label: model.replace(/-/g, " "),
-  cost: 1,
+  model: row.model,
+  label: row.label,
+  cost: row.cost,
   pricing_type: "per_second",
-  has_audio: false,
+  has_audio: row.audio,
   provider: "seedance",
-  price_key: `${model}:video`,
-  source: "unverified_placeholder",
+  price_key: `${row.model}:${row.resolution ?? "default"}:${row.audio ? "audio" : "video"}`,
+  resolution: row.resolution,
+  source: "master_pricing_sheet",
   provider_unit: "per second",
-  notes: "Official provider SKU price was not found in public docs during setup. Placeholder set to 1 by request.",
+  notes: row.notes,
 }));
 
 const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
@@ -241,18 +261,25 @@ const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   ...NANO_BANANA_FALLBACK_ROWS,
   ...KLING_ROWS,
   ...SEEDANCE_ROWS,
-  { feature: "chat_ai", model: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", cost: 1, pricing_type: "per_operation", provider: "google", price_key: "gemini-3.1-pro-preview", source: "unverified_placeholder", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per operation", notes: "Chat billing is token-based; Workspace runtime currently charges fixed operation rows. Placeholder set to 1 by request." },
-  { feature: "chat_ai", model: "google/gemini-3-flash-preview", label: "Gemini 3 Flash Preview", cost: 1, pricing_type: "per_operation", provider: "google", price_key: "gemini-3-flash-preview", source: "unverified_placeholder", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per operation", notes: "Chat billing is token-based; Workspace runtime currently charges fixed operation rows. Placeholder set to 1 by request." },
+  { feature: "generate_seedream_image", model: "seedream-5-0-260128", label: "Seedream 5.0", cost: 60, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-5-0-260128", source: "master_pricing_sheet", source_url: "https://www.byteplus.com/en/product/modelark", provider_unit: "per image", notes: "Master Pricing Sheet: $0.035/image -> approx 60 credits/image at Workspace ratio." },
+  { feature: "generate_seedream_image", model: "seedream-5-0", label: "Seedream 5.0 alias", cost: 60, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-5-0-260128", source: "master_pricing_sheet", source_url: "https://www.byteplus.com/en/product/modelark", provider_unit: "per image", notes: "Runtime alias for Seedream 5.0." },
+  { feature: "generate_seedream_image", model: "seedream-5-0-lite-260128", label: "Seedream 5.0 Lite", cost: 60, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-5-0-lite-260128", source: "master_pricing_sheet", source_url: "https://www.byteplus.com/en/product/modelark", provider_unit: "per image", notes: "Master Pricing Sheet: Seedream 5.0 Lite official $0.035/image -> 60 credits/image." },
+  { feature: "generate_seedream_image", model: "seedream-4-5-251128", label: "Seedream 4.5", cost: 1, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-4-5-251128", source: "unverified_placeholder", provider_unit: "per image", notes: "Existing UI model without a supplied SKU price in the master sheet. Placeholder set to 1 until a confirmed price is provided." },
+  { feature: "chat_ai", model: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", cost: 100, pricing_type: "per_operation", provider: "google", price_key: "gemini-3.1-pro-preview", source: "master_pricing_sheet", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per operation", notes: "Master Pricing Sheet fixed-operation placeholder: 100 credits/op. Token-price reference: input about 2 USD / 1M tokens, output about 12 USD / 1M tokens at <=200k context." },
+  { feature: "chat_ai", model: "google/gemini-3-flash-preview", label: "Gemini 3 Flash Preview", cost: 20, pricing_type: "per_operation", provider: "google", price_key: "gemini-3-flash-preview", source: "master_pricing_sheet", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per operation", notes: "Master Pricing Sheet fixed-operation placeholder: 20 credits/op. Token-price reference: input about 0.50 USD / 1M tokens, output about 3 USD / 1M tokens." },
   { feature: "text_to_speech", model: "google-tts-studio", label: "Google Cloud TTS Studio / 1K chars", cost: 280, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-studio", quality: "studio", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
   { feature: "text_to_speech", model: "google-tts-neural2", label: "Google Cloud TTS Neural2 / 1K chars", cost: 28, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-neural2", quality: "neural2", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
   { feature: "text_to_speech", model: "google-tts-wavenet", label: "Google Cloud TTS WaveNet / 1K chars", cost: 7, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-wavenet", quality: "wavenet", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
   { feature: "text_to_speech", model: "google-tts-chirp3-hd", label: "Google Cloud TTS Chirp 3 HD / 1K chars", cost: 53, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-chirp3-hd", quality: "chirp3-hd", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
-  { feature: "video_to_prompt", model: "gemini-video-understanding", label: "Video to Prompt (Gemini)", cost: 1, pricing_type: "per_operation", provider: "google", price_key: "gemini-video-understanding", source: "unverified_placeholder", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per analysis", notes: "Token-based video input cost depends on duration and prompt payload; placeholder set to 1 by request until runtime supports token metering." },
-  { feature: "model_3d", model: "tripo3d-v3.1", label: "Tripo3D v3.1", cost: 1, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v3.1", quality: "detailed", source: "unverified_placeholder", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Official API SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
-  { feature: "model_3d", model: "tripo3d-p1", label: "Tripo3D P1", cost: 1, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-p1", quality: "premium", source: "unverified_placeholder", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Official API SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
-  { feature: "model_3d", model: "tripo3d-turbo", label: "Tripo3D Turbo", cost: 1, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-turbo", quality: "fast", source: "unverified_placeholder", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Official API SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
+  { feature: "video_to_prompt", model: "gemini-video-understanding", label: "Video to Prompt (Gemini)", cost: 50, pricing_type: "per_operation", provider: "google", price_key: "gemini-video-understanding", source: "master_pricing_sheet", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per analysis", notes: "Master Pricing Sheet: fixed 50 credits/analysis for short to medium Flash video analysis until runtime supports token metering." },
+  { feature: "video_to_prompt", model: "gemini-3.1-pro-preview", label: "Video to Prompt (Gemini 3.1 Pro)", cost: 50, pricing_type: "per_operation", provider: "google", price_key: "gemini-3.1-pro-preview:video", source: "master_pricing_sheet", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per analysis", notes: "Matches workspace Video to Prompt model selector; fixed short/medium analysis price." },
+  { feature: "video_to_prompt", model: "gemini-3-flash-preview", label: "Video to Prompt (Gemini 3 Flash)", cost: 50, pricing_type: "per_operation", provider: "google", price_key: "gemini-3-flash-preview:video", source: "master_pricing_sheet", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per analysis", notes: "Matches workspace Video to Prompt model selector; fixed short/medium analysis price." },
+  { feature: "model_3d", model: "tripo3d-v3.1", label: "Tripo3D v3.1 Detailed", cost: 900, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v3.1", quality: "detailed", source: "master_pricing_sheet", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Master Pricing Sheet: detailed/high-quality generation approx 900 credits/model." },
+  { feature: "model_3d", model: "tripo3d-p1", label: "Tripo3D P1", cost: 850, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-p1", quality: "premium", source: "master_pricing_sheet", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Master Pricing Sheet: P1 approx 850 credits/model." },
+  { feature: "model_3d", model: "tripo3d-turbo", label: "Tripo3D Turbo", cost: 500, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-turbo", quality: "fast", source: "master_pricing_sheet", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Master Pricing Sheet: Turbo approx 500 credits/model." },
   { feature: "remove_background", model: "replicate-birefnet", label: "Remove Background (BiRefNet)", cost: 1, pricing_type: "per_operation", provider: "replicate", price_key: "replicate-birefnet", source: "unverified_placeholder", provider_unit: "per image", notes: "Provider SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
-  { feature: "merge_audio_video", model: "shotstack", label: "Merge Audio + Video (Shotstack)", cost: 1, pricing_type: "per_operation", provider: "shotstack", price_key: "shotstack", source: "unverified_placeholder", provider_unit: "per operation", notes: "Infrastructure-only operation. Placeholder set to 1 by request." },
+  { feature: "merge_audio_video", model: "shotstack", label: "Merge Audio + Video (Shotstack short clip)", cost: 100, pricing_type: "per_operation", provider: "shotstack", price_key: "shotstack:short-op", source: "master_pricing_sheet", provider_unit: "per short operation", notes: "Master Pricing Sheet: use 100 credits/op for short clips <=10s until runtime tracks media duration per minute." },
+  { feature: "merge_audio_video", model: "shotstack:per-minute", label: "Merge Audio + Video (Shotstack per minute)", cost: 500, pricing_type: "per_minute", provider: "shotstack", price_key: "shotstack:per-minute", source: "master_pricing_sheet", provider_unit: "per minute", notes: "Master Pricing Sheet: Shotstack PAYG/subscription blended recommendation = 500 credits/minute." },
   { feature: "mp3_input", model: "mp3-input", label: "MP3 Input", cost: 1, pricing_type: "per_operation", provider: "internal", price_key: "mp3-input", source: "unverified_placeholder", provider_unit: "per file", notes: "Infrastructure-only operation. Placeholder set to 1 by request." },
 ];
 
@@ -458,6 +485,12 @@ async function saveCreditCostRow(
   query = duration === null
     ? query.is("duration_seconds", null)
     : query.eq("duration_seconds", duration);
+  query = row.resolution == null
+    ? query.is("resolution", null)
+    : query.eq("resolution", row.resolution);
+  query = row.quality == null
+    ? query.is("quality", null)
+    : query.eq("quality", row.quality);
   const { data: existing, error: readErr } = await query.maybeSingle();
   if (readErr) throw new Error(`credit_costs lookup failed: ${readErr.message}`);
 
@@ -510,11 +543,6 @@ async function cleanupLegacyPricingRows(client: SupabaseClient): Promise<number>
       .eq("feature", "generate_freepik_video")
       .in("model", ["kling-v2-6-pro", "kling-v2-6-motion-pro"])
       .eq("pricing_type", "fixed"),
-    client
-      .from("credit_costs")
-      .delete()
-      .eq("feature", "generate_openai_image")
-      .in("model", ["gpt-image-2:4k:low", "gpt-image-2:4k:medium", "gpt-image-2:4k:high"]),
     client
       .from("credit_costs")
       .delete()
