@@ -28,7 +28,7 @@ values
     'Digital Media Design',
     'dmd.mediaforge.co',
     'active',
-    '/dmd-logo-placeholder.png', -- swap for the real Storage URL once the user uploads via /app/org-admin/branding
+    '/dmd-logo-placeholder.svg', -- swap for the real Storage URL once the user uploads via /app/org-admin/branding
     '#FF3D8E',
     'DMD'
   )
