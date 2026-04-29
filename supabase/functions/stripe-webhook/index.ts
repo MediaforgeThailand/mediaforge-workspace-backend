@@ -501,6 +501,8 @@ serve(async (req) => {
           stripe_subscription_id: subscriptionId || null,
           stripe_customer_id: customerId || null,
           billing_interval: billingCycle,
+          subscription_billing_cycle: billingCycle,
+          current_period_start: new Date().toISOString(),
           current_period_end: periodEnd,
           current_plan_id: planId || null,
           subscription_plan_id: planId || null,
@@ -623,9 +625,19 @@ serve(async (req) => {
 
       if (profile) {
         const periodEnd = new Date(subscription.current_period_end * 1000).toISOString();
+        const periodStart = new Date(subscription.current_period_start * 1000).toISOString();
+        // Best-effort: derive cycle from the active price's recurring interval.
+        let cycle: "monthly" | "annual" | null = null;
+        try {
+          const interval = subscription.items?.data?.[0]?.price?.recurring?.interval;
+          if (interval === "year") cycle = "annual";
+          else if (interval === "month") cycle = "monthly";
+        } catch (_) { /* noop */ }
         await supabase.from("profiles").update({
           stripe_subscription_id: subscription.id,
           current_period_end: periodEnd,
+          current_period_start: periodStart,
+          ...(cycle ? { subscription_billing_cycle: cycle, billing_interval: cycle } : {}),
         }).eq("user_id", profile.user_id);
 
         console.log(`[STRIPE-WEBHOOK] Subscription updated for user ${profile.user_id}`);
@@ -649,10 +661,12 @@ serve(async (req) => {
         await supabase.from("profiles").update({
           subscription_status: "free",
           stripe_subscription_id: null,
+          current_period_start: null,
           current_period_end: null,
           current_plan_id: null,
           subscription_plan_id: null,
           billing_interval: "monthly",
+          subscription_billing_cycle: null,
         }).eq("user_id", profile.user_id);
 
         console.log(`[STRIPE-WEBHOOK] Subscription cancelled for user ${profile.user_id}`);
@@ -893,6 +907,8 @@ serve(async (req) => {
         await supabase.from("profiles").update({
           subscription_status: newStatus,
           billing_interval: finalBillingCycle,
+          subscription_billing_cycle: finalBillingCycle,
+          current_period_start: new Date().toISOString(),
           current_period_end: periodEnd.toISOString(),
           current_plan_id: planId,
           subscription_plan_id: planId,
