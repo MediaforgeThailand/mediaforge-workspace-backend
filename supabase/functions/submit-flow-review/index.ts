@@ -1,4 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { rejectIfOrgUser } from "../_shared/orgUserGuard.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -15,6 +16,9 @@ function json(body: unknown, status = 200) {
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+
+  const orgBlock = await rejectIfOrgUser(req);
+  if (orgBlock) return orgBlock;
 
   try {
     const authHeader = req.headers.get("Authorization");

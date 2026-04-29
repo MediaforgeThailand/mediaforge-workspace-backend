@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { rejectIfOrgUser } from "../_shared/orgUserGuard.ts";
 import { getAuthUser } from "../_shared/auth.ts";
 
 const corsHeaders = {
@@ -20,6 +21,9 @@ serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
+
+  const orgBlock = await rejectIfOrgUser(req);
+  if (orgBlock) return orgBlock;
 
   try {
     const authUser = await getAuthUser(req);
@@ -117,6 +121,10 @@ serve(async (req) => {
     }
 
     // ── Step 3: Check monthly budget ──
+    // Admin-issued links carry bypass_budget=true and skip the cap.
+    // Without this, even a super-admin handing out demos for a partner
+    // event would hit the monthly ceiling once normal sales redemptions
+    // had filled it up.
     const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
     const { data: budget } = await supabase
       .from("demo_budget")
@@ -127,8 +135,9 @@ serve(async (req) => {
     const creditsToGrant = demoLink.credits_budget || 500;
     const totalGranted = budget?.total_credits_granted || 0;
     const maxMonthly = budget?.max_monthly_credits || 100000;
+    const bypassBudget = (demoLink as Record<string, unknown>).bypass_budget === true;
 
-    if (totalGranted + creditsToGrant > maxMonthly) {
+    if (!bypassBudget && totalGranted + creditsToGrant > maxMonthly) {
       return respond(false, "เครดิต Demo ประจำเดือนหมดแล้ว กรุณาลองใหม่เดือนหน้า");
     }
 
@@ -183,21 +192,27 @@ serve(async (req) => {
     }
 
     // ── Step 6: Update monthly budget ──
-    if (budget) {
-      await supabase
-        .from("demo_budget")
-        .update({
-          total_credits_granted: totalGranted + creditsToGrant,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", budget.id);
-    } else {
-      await supabase
-        .from("demo_budget")
-        .insert({
-          month: currentMonth,
-          total_credits_granted: creditsToGrant,
-        });
+    // bypass_budget links don't add to total_credits_granted either —
+    // otherwise admin demos would inflate the rolling tally and make
+    // it look like sales has used more of the cap than they actually
+    // have.
+    if (!bypassBudget) {
+      if (budget) {
+        await supabase
+          .from("demo_budget")
+          .update({
+            total_credits_granted: totalGranted + creditsToGrant,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", budget.id);
+      } else {
+        await supabase
+          .from("demo_budget")
+          .insert({
+            month: currentMonth,
+            total_credits_granted: creditsToGrant,
+          });
+      }
     }
 
     console.log(`[REDEEM-DEMO] Granted ${creditsToGrant} credits to ${user_id} (${user_email || "no-email"}) token=${token}`);

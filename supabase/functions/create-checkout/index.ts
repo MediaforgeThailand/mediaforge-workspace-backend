@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import Stripe from "https://esm.sh/stripe@18.5.0";
 import { createClient } from "npm:@supabase/supabase-js@2.57.2";
+import { rejectIfOrgUser } from "../_shared/orgUserGuard.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -9,6 +10,9 @@ const corsHeaders = {
 
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+
+  const orgBlock = await rejectIfOrgUser(req);
+  if (orgBlock) return orgBlock;
 
   const supabaseClient = createClient(
     Deno.env.get("SUPABASE_URL") ?? "",
@@ -65,6 +69,40 @@ serve(async (req) => {
       apiVersion: "2025-08-27.basil",
     });
 
+    // ── First-time subscriber 40% discount (Lite plan only) ──
+    // "First-time SUBSCRIBER" = user has no completed payment_transactions row
+    // whose package_id points to any row in subscription_plans. Top-ups
+    // (which also live in payment_transactions but reference topup_packages)
+    // do NOT disqualify a user from the Lite first-subscription discount.
+    // Coupon `5NOgQ3VT` is a Stripe coupon (40% off, duration=once).
+    const FIRST_TIME_COUPON = "5NOgQ3VT";
+    const FIRST_TIME_DISCOUNT_PCT = 40;
+    let applyFirstTimeDiscount = false;
+    if (plan.name === "Lite") {
+      const { data: subPlanIdRows } = await supabaseAdmin
+        .from("subscription_plans")
+        .select("id");
+      const subPlanIds = (subPlanIdRows ?? []).map((r: { id: string }) => r.id);
+
+      let priorSubs = 0;
+      if (subPlanIds.length > 0) {
+        const { count } = await supabaseAdmin
+          .from("payment_transactions")
+          .select("id", { count: "exact", head: true })
+          .eq("user_id", user.id)
+          .eq("status", "completed")
+          .in("package_id", subPlanIds);
+        priorSubs = count ?? 0;
+      }
+
+      if (priorSubs === 0) {
+        applyFirstTimeDiscount = true;
+        console.log(`[CREATE-CHECKOUT] First-time Lite subscriber (no prior plan payment) — applying ${FIRST_TIME_DISCOUNT_PCT}% off`);
+      } else {
+        console.log(`[CREATE-CHECKOUT] User has ${priorSubs} prior subscription payment(s) — Lite discount skipped`);
+      }
+    }
+
     // Get or create Stripe customer
     const { data: profile } = await supabaseAdmin
       .from("profiles")
@@ -72,8 +110,9 @@ serve(async (req) => {
       .eq("user_id", user.id)
       .single();
 
-    // Block downgrade
-    if (profile?.current_plan_id) {
+    // Block downgrade — but always allow Lite (entry tier; downgrade-to-Lite
+    // beats churning out entirely).
+    if (profile?.current_plan_id && plan.name !== "Lite") {
       const { data: currentPlan } = await supabaseAdmin
         .from("subscription_plans")
         .select("sort_order")
@@ -121,18 +160,27 @@ serve(async (req) => {
 
     // ── In-app PaymentIntent flow (Stripe Elements, PromptPay + Card) ──
     if (intent) {
-      const amountSatang = Math.round(Number(plan.price_thb) * 100);
-      if (!Number.isFinite(amountSatang) || amountSatang <= 0) {
+      const baseAmountSatang = Math.round(Number(plan.price_thb) * 100);
+      if (!Number.isFinite(baseAmountSatang) || baseAmountSatang <= 0) {
         return new Response(JSON.stringify({ error: "Plan misconfigured (invalid price)" }),
           { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
+
+      // PaymentIntent doesn't natively support coupons — discount the amount inline.
+      const amountSatang = applyFirstTimeDiscount
+        ? Math.round(baseAmountSatang * (1 - FIRST_TIME_DISCOUNT_PCT / 100))
+        : baseAmountSatang;
+
+      const piMetadata = applyFirstTimeDiscount
+        ? { ...metadata, first_time_discount_pct: String(FIRST_TIME_DISCOUNT_PCT), original_amount_satang: String(baseAmountSatang) }
+        : metadata;
 
       const pi = await stripe.paymentIntents.create({
         amount: amountSatang,
         currency: "thb",
         customer: customerId,
         payment_method_types: ["promptpay", "card"],
-        metadata,
+        metadata: piMetadata,
       });
 
       console.log(`[CREATE-CHECKOUT] PaymentIntent created ${pi.id} for plan ${plan.name}`);
@@ -158,8 +206,11 @@ serve(async (req) => {
       metadata,
       payment_intent_data: {
         // Mirror metadata onto PaymentIntent so payment_intent.succeeded webhook works for async PromptPay
-        metadata,
+        metadata: applyFirstTimeDiscount
+          ? { ...metadata, first_time_discount_pct: String(FIRST_TIME_DISCOUNT_PCT) }
+          : metadata,
       },
+      ...(applyFirstTimeDiscount ? { discounts: [{ coupon: FIRST_TIME_COUPON }] } : {}),
     };
 
     if (embedded) {

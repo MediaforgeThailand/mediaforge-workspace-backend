@@ -2,6 +2,7 @@
 /// <reference lib="dom" />
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { rejectIfOrgUser } from "../_shared/orgUserGuard.ts";
 import { refundCreditsAtomic } from "../_shared/pricing.ts";
 import { logApiUsage } from "../_shared/posthogCapture.ts";
 import {
@@ -2859,6 +2860,9 @@ interface WorkspaceRunBody {
 
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+
+  const orgBlock = await rejectIfOrgUser(req);
+  if (orgBlock) return orgBlock;
 
   const startTime = Date.now();
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
