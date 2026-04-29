@@ -133,6 +133,42 @@ export function deriveAnalyticsFromRun(
   };
 }
 
+/** Whitelist of params keys we surface in the admin Recent-Generations
+ *  table. These are the knobs that drive credit cost (e.g. GPT-Image's
+ *  `quality`, Banana's `image_size`, Kling's `duration_seconds` /
+ *  `has_audio`). We deliberately exclude the prompt, uploaded image
+ *  URLs, and any internal flags — the analytics surface is operator-
+ *  facing and shouldn't leak user prompts.
+ *
+ *  Empty strings, null, undefined, and NaN are dropped so the rendered
+ *  pill list stays compact ("quality:high · 2K") instead of showing
+ *  "format:" with an empty value. */
+export const COST_PARAM_KEYS = [
+  "quality",
+  "size",
+  "image_size",
+  "resolution",
+  "aspect_ratio",
+  "duration_seconds",
+  "has_audio",
+  "format",
+  "output_format",
+] as const;
+
+export function pickCostParams(
+  params: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const out: Record<string, unknown> = {};
+  for (const k of COST_PARAM_KEYS) {
+    const v = params[k];
+    if (v === null || v === undefined) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    if (typeof v === "number" && !Number.isFinite(v)) continue;
+    out[k] = v;
+  }
+  return Object.keys(out).length === 0 ? null : out;
+}
+
 /** Insert one analytics row for a successful run. Best-effort: errors
  *  are logged + swallowed. Caller must already have a service-role
  *  supabase client (the dispatcher does — it bypasses RLS for asset
@@ -174,6 +210,10 @@ export async function recordGenerationEvent(args: {
         aspect_ratio: a.aspect_ratio,
         status: "completed",
         task_id: args.result.task_id ?? null,
+        // Whitelisted cost-driving settings — see COST_PARAM_KEYS for
+        // the full list and the migration 20260429180000 for the
+        // reasoning. Null when no whitelisted keys are present.
+        params: pickCostParams(args.params),
       });
     if (error) {
       console.warn(

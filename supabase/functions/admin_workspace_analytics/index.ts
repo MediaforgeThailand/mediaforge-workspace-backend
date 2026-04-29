@@ -13,9 +13,10 @@
 // This function aggregates over that table on demand. Two actions:
 //
 //   - generation_summary   { since?, until?, group_by? }
-//       Totals, by-model, by-tier, 30-day timeseries.
-//   - recent_generations   { limit?, model?, feature? }
-//       Last N rows for the recent-activity table on the admin page.
+//       Totals, by-model, by-tier, timeseries (window-aware).
+//   - recent_generations   { since?, until?, limit?, offset?,
+//                            model?, feature? }
+//       Paged window with exact count for "Showing X of Y" + Load more.
 //
 // Mirrors the style of admin_workspace_pricing / admin_workspace_logs:
 // `verify_jwt: false`, POST + { action, ...payload } shape, service-role
@@ -269,8 +270,13 @@ async function generationSummary(
   };
 }
 
-/** recent_generations — last N rows. Optionally filter by feature/model.
- *  Hard cap at 100 rows so a misbehaving client can't pull megabytes.
+/** recent_generations — paged window into workspace_generation_events.
+ *  Honours the same `since`/`until` window as generation_summary so the
+ *  admin page's date-range picker re-keys both queries together.
+ *
+ *  Hard cap of 100 per page so a misbehaving client can't pull megabytes;
+ *  the frontend uses a 50-per-page accumulator with a "Load more" button.
+ *
  *  Returns user_id only (no email) — the admin-hub joins display names
  *  client-side via its own user-lookup capability when needed. */
 async function recentGenerations(
@@ -291,30 +297,47 @@ async function recentGenerations(
     canvas_id: string | null;
     node_id: string | null;
     task_id: string | null;
+    params: Record<string, unknown> | null;
     created_at: string;
   }>;
+  total: number;
+  limit: number;
+  offset: number;
 }> {
+  const { since, until } = resolveWindow(body.since, body.until);
+
   const limitRaw = Number(body.limit);
   const limit =
     Number.isFinite(limitRaw) && limitRaw > 0
       ? Math.min(Math.floor(limitRaw), 100)
-      : 25;
+      : 50;
+
+  const offsetRaw = Number(body.offset);
+  const offset =
+    Number.isFinite(offsetRaw) && offsetRaw >= 0 ? Math.floor(offsetRaw) : 0;
+
   const featureFilter =
     typeof body.feature === "string" && body.feature ? body.feature : null;
   const modelFilter =
     typeof body.model === "string" && body.model ? body.model : null;
 
+  // Build the query once for the paged read. We ask Postgres for an
+  // exact count alongside the page so the frontend's "Showing X of Y"
+  // counter stays accurate without a second round trip.
   let q = client
     .from("workspace_generation_events")
     .select(
-      "id, user_id, feature, model, provider, output_tier, output_count, credits_spent, duration_seconds, aspect_ratio, canvas_id, node_id, task_id, created_at",
+      "id, user_id, feature, model, provider, output_tier, output_count, credits_spent, duration_seconds, aspect_ratio, canvas_id, node_id, task_id, params, created_at",
+      { count: "exact" },
     )
+    .gte("created_at", since)
+    .lte("created_at", until)
     .order("created_at", { ascending: false })
-    .limit(limit);
+    .range(offset, offset + limit - 1);
   if (featureFilter) q = q.eq("feature", featureFilter);
   if (modelFilter) q = q.eq("model", modelFilter);
 
-  const { data, error } = await q;
+  const { data, error, count } = await q;
   if (error) {
     throw new Error(`workspace_generation_events read failed: ${error.message}`);
   }
@@ -334,8 +357,15 @@ async function recentGenerations(
       canvas_id: r.canvas_id ?? null,
       node_id: r.node_id ?? null,
       task_id: r.task_id ?? null,
+      params:
+        r.params && typeof r.params === "object" && !Array.isArray(r.params)
+          ? (r.params as Record<string, unknown>)
+          : null,
       created_at: String(r.created_at),
     })),
+    total: typeof count === "number" ? count : 0,
+    limit,
+    offset,
   };
 }
 
