@@ -2,7 +2,16 @@
 /// <reference lib="dom" />
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { refundCreditsAtomic } from "../_shared/pricing.ts";
+import {
+  refundCreditsAtomic,
+  lookupBaseCost,
+  calculatePricing,
+  fetchFeatureMultipliers,
+  NODE_TYPE_REGISTRY,
+  PricingConfigError,
+  type ProviderDef,
+  type FeatureMultipliers,
+} from "../_shared/pricing.ts";
 import { logApiUsage } from "../_shared/posthogCapture.ts";
 import {
   executeWithInlineBudget,
@@ -3521,43 +3530,180 @@ serve(async (req) => {
       }
     }
 
+    /* ─── Credit gate (atomic deduct before dispatch) ──────────
+     *
+     * Minimal gate: look up base cost from credit_costs, apply
+     * platform markup, deduct via consume_credits RPC. If provider
+     * fails after deduct, refund. Providers without pricing rows
+     * (tripo3d, video_understanding, seedream, seedance) skip the
+     * gate with a warn log — they need pricing seeded before we can
+     * gate them. Each is a follow-up backlog item.
+     *
+     * Reference for refund: a UUID per request that we attach to both
+     * the consume_credits transaction AND any refund, so the audit
+     * trail joins cleanly even with no idempotency.                  */
+    const creditRefId = (typeof crypto.randomUUID === "function")
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let gatedDeduction = 0;     // amount actually deducted (0 if gate skipped)
+    let gatedFeature: string | null = null;
+    let pricingProvider: ProviderDef | null = null;
+
+    if (NODE_TYPE_REGISTRY[nodeType]) {
+      // Standard providers covered by NODE_TYPE_REGISTRY — banana,
+      // kling, chat_ai, remove_bg, merge_audio, mp3_input.
+      pricingProvider = NODE_TYPE_REGISTRY[nodeType];
+    } else if (provider === "openai") {
+      // OpenAI image gen — pricing rows live under feature
+      // `generate_openai_image`. Build an inline ProviderDef.
+      pricingProvider = {
+        provider: "banana", // unused — only feature/model matter for lookup
+        feature: "generate_openai_image",
+        output_type: "image_url",
+        is_async: false,
+      } as unknown as ProviderDef;
+    }
+
+    if (pricingProvider) {
+      try {
+        // Inline override: openai feeds different feature than NODE_TYPE_REGISTRY,
+        // but lookupBaseCost branches off providerDef.provider. Use a tiny
+        // direct query for openai to stay independent.
+        let baseCost: number;
+        if (pricingProvider.feature === "generate_openai_image") {
+          const model = String(params.model_name ?? params.model ?? "gpt-image-2-medium");
+          const { data: row } = await supabase
+            .from("credit_costs").select("cost")
+            .eq("feature", "generate_openai_image")
+            .eq("model", model)
+            .limit(1).maybeSingle();
+          if (!row) {
+            throw new PricingConfigError(`Pricing missing for openai model: ${model}`);
+          }
+          baseCost = row.cost as number;
+        } else {
+          baseCost = await lookupBaseCost(supabase, pricingProvider, params);
+        }
+
+        const featureMultipliers: FeatureMultipliers = await fetchFeatureMultipliers(supabase);
+        // Pick multiplier per provider category (mirrors run-flow-init)
+        let mult = featureMultipliers.image;
+        if (pricingProvider.provider === "kling" || pricingProvider.feature === "generate_freepik_video" || pricingProvider.feature === "merge_audio_video") {
+          mult = featureMultipliers.video;
+        } else if (pricingProvider.provider === "chat_ai" || pricingProvider.feature === "chat_ai") {
+          mult = featureMultipliers.chat;
+        }
+
+        // Owner detection — workspace-run-node is single-node;
+        // we don't have flow ownership context here. Treat as
+        // consumer_run (no owner discount). Discount = 0 for now.
+        const pricing = calculatePricing(baseCost, mult, /*isOwner*/ false, /*discountPercent*/ 0);
+        gatedDeduction = pricing.deduction;
+        gatedFeature = pricingProvider.feature;
+
+        const { data: ok, error: rpcErr } = await supabase.rpc("consume_credits", {
+          p_user_id: user.id,
+          p_amount: gatedDeduction,
+          p_feature: gatedFeature,
+          p_description: `Workspace node: ${nodeType} (${provider})`,
+          p_reference_id: creditRefId,
+        });
+
+        if (rpcErr) {
+          console.error("[workspace-run-node][credit-gate] RPC error:", rpcErr);
+          return new Response(
+            JSON.stringify({ error: "Credit deduction failed", detail: rpcErr.message }),
+            { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        if (!ok) {
+          const { data: uc } = await supabase.from("user_credits")
+            .select("balance").eq("user_id", user.id).maybeSingle();
+          return new Response(
+            JSON.stringify({
+              error: "Insufficient credits",
+              required: gatedDeduction,
+              balance: uc?.balance ?? 0,
+            }),
+            { status: 402, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        console.log(
+          `[workspace-run-node][credit-gate] deducted=${gatedDeduction} ` +
+          `base=${baseCost} mult=${mult} feature=${gatedFeature} ref=${creditRefId}`,
+        );
+      } catch (err) {
+        if (err instanceof PricingConfigError) {
+          return new Response(
+            JSON.stringify({ error: err.message }),
+            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        throw err;
+      }
+    } else {
+      console.warn(
+        `[workspace-run-node][credit-gate] SKIPPED for provider="${provider}" ` +
+        `nodeType="${nodeType}" — no pricing config; revisit before exposing to customers.`,
+      );
+    }
+
     /* ─── Dispatch ────────────────────────────────────────── */
     let result: ProviderResult;
-    switch (provider) {
-      case "banana":
-        result = await executeBanana(params, supabase);
-        break;
-      case "kling":
-        result = await executeKling(params, supabase, mentioned);
-        break;
-      case "chat_ai":
-        result = await executeChatAi(params);
-        break;
-      case "remove_bg":
-        result = await executeRemoveBg(params, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-        break;
-      case "merge_audio":
-        result = await executeMergeAudio(params);
-        break;
-      case "openai":
-        result = await executeOpenAIImage2(params, supabase);
-        break;
-      case "video_understanding":
-        result = await executeVideoToPrompt(params);
-        break;
-      case "tripo3d":
-        result = await executeTripo3D(params, supabase);
-        break;
-      case "seedream":
-      case "seedance":
-        // Not yet ported from the legacy editor — fail loud rather than
-        // silently falling through to Banana/Kling and producing nonsense.
-        throw new Error(
-          `Provider "${provider}" not yet implemented in workspace-run-node. ` +
-            `Pick a Banana / Kling / GPT Image 2 model for now.`,
-        );
-      default:
-        throw new Error(`No executor for provider "${provider}"`);
+    try {
+      switch (provider) {
+        case "banana":
+          result = await executeBanana(params, supabase);
+          break;
+        case "kling":
+          result = await executeKling(params, supabase, mentioned);
+          break;
+        case "chat_ai":
+          result = await executeChatAi(params);
+          break;
+        case "remove_bg":
+          result = await executeRemoveBg(params, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+          break;
+        case "merge_audio":
+          result = await executeMergeAudio(params);
+          break;
+        case "openai":
+          result = await executeOpenAIImage2(params, supabase);
+          break;
+        case "video_understanding":
+          result = await executeVideoToPrompt(params);
+          break;
+        case "tripo3d":
+          result = await executeTripo3D(params, supabase);
+          break;
+        case "seedream":
+        case "seedance":
+          // Not yet ported from the legacy editor — fail loud rather than
+          // silently falling through to Banana/Kling and producing nonsense.
+          throw new Error(
+            `Provider "${provider}" not yet implemented in workspace-run-node. ` +
+              `Pick a Banana / Kling / GPT Image 2 model for now.`,
+          );
+        default:
+          throw new Error(`No executor for provider "${provider}"`);
+      }
+    } catch (dispatchErr) {
+      // Refund on synchronous provider failure. (Async providers like
+      // Kling that return a task_id are still considered successful at
+      // this point; a follow-up refund-on-poll-failure path is P2.)
+      if (gatedDeduction > 0) {
+        try {
+          await refundCreditsAtomic(
+            supabase, user.id, gatedDeduction,
+            `Refund: ${nodeType}/${provider} dispatch failed`, creditRefId,
+          );
+          console.log(`[workspace-run-node][credit-gate] refunded=${gatedDeduction} ref=${creditRefId}`);
+        } catch (refundErr) {
+          console.error("[workspace-run-node][credit-gate] refund FAILED:", refundErr);
+        }
+      }
+      throw dispatchErr;
     }
 
     /* ─── Format response ─────────────────────────────────── */
