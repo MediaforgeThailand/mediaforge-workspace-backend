@@ -7,13 +7,14 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-const DEFAULT_GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview";
-const LEGACY_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts";
+const DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts";
 const GEMINI_TTS_MODELS = new Set([
-  "gemini-3.1-flash-tts-preview",
   "gemini-2.5-flash-preview-tts",
   "gemini-2.5-pro-preview-tts",
 ]);
+const GEMINI_TTS_MODEL_ALIASES: Record<string, string> = {
+  "gemini-3.1-flash-tts-preview": "gemini-2.5-flash-preview-tts",
+};
 
 const GEMINI_TTS_VOICES = new Set([
   "Achernar",
@@ -86,6 +87,7 @@ serve(async (req) => {
   const startTime = Date.now();
   let loggedUserId: string | null = null;
   let loggedTtsCost = 0;
+  let loggedModelName = DEFAULT_GEMINI_TTS_MODEL;
   try {
     const GEMINI_API_KEY =
       Deno.env.get("GOOGLE_AI_STUDIO_KEY") ??
@@ -145,7 +147,8 @@ serve(async (req) => {
       });
     }
 
-    const requestedModel = typeof model === "string" ? model.trim() : "";
+    const requestedModelRaw = typeof model === "string" ? model.trim() : "";
+    const requestedModel = GEMINI_TTS_MODEL_ALIASES[requestedModelRaw] ?? requestedModelRaw;
     if (requestedModel && !GEMINI_TTS_MODELS.has(requestedModel)) {
       return new Response(JSON.stringify({ error: "Invalid Gemini TTS model" }), {
         status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -154,6 +157,7 @@ serve(async (req) => {
 
     const voiceName = requestedVoice || DEFAULT_VOICE;
     const modelName = requestedModel || DEFAULT_GEMINI_TTS_MODEL;
+    loggedModelName = modelName;
     const stylePrompt =
       typeof style_prompt === "string" ? style_prompt.trim() : "";
 
@@ -368,7 +372,7 @@ serve(async (req) => {
         user_id: loggedUserId ?? "system",
         endpoint: "text-to-speech",
         feature: "tts",
-        model: LEGACY_GEMINI_TTS_MODEL,
+        model: loggedModelName,
         status: "error",
         credits_used: loggedTtsCost,
         credits_refunded: loggedTtsCost,

@@ -59,7 +59,7 @@ export const NODE_TYPE_REGISTRY: Record<string, ProviderDef> = {
 
 /* ─── Default model slugs when params don't specify one ─── */
 const DEFAULT_IMAGE_MODEL = "nano-banana-pro";
-const DEFAULT_CHAT_MODEL = "google/gemini-3.1-pro-preview";
+const DEFAULT_CHAT_MODEL = "google/gemini-3-pro-preview";
 const DEFAULT_VIDEO_MODEL = "kling-v2-6-pro";
 const DEFAULT_INFRASTRUCTURE_BUFFER_PERCENT = 40;
 const DEFAULT_WORKSPACE_MULTIPLIER = 1 + DEFAULT_INFRASTRUCTURE_BUFFER_PERCENT / 100;

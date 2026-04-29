@@ -283,6 +283,18 @@ function normalizeHandle(provider: string, targetHandle: string): HandleDef | nu
   return providerSchema[targetHandle] ?? null;
 }
 
+function normalizeHandleForModel(
+  provider: string,
+  targetHandle: string,
+  modelName?: string,
+): HandleDef | null {
+  const model = String(modelName ?? "").toLowerCase();
+  if (provider === "kling" && targetHandle === "ref_image" && model.includes("motion")) {
+    return HANDLE_SCHEMA.motion_control.ref_image;
+  }
+  return normalizeHandle(provider, targetHandle);
+}
+
 /* ─── URL validation helper ─── */
 const VALID_URL_REGEX = /^(https?:\/\/|data:)/i;
 
@@ -1723,7 +1735,7 @@ async function executeBanana(
 }
 
 async function executeChatAi(params: Record<string, unknown>): Promise<ProviderResult> {
-  const model = String(params.model_name ?? "google/gemini-3.1-pro-preview");
+  const model = String(params.model_name ?? "google/gemini-3-pro-preview");
   const systemPrompt = String(params.system_prompt ?? "You are a helpful AI assistant.");
   const userPrompt = String(params.prompt ?? "");
   const temperature = Number(params.temperature ?? 0.7);
@@ -1751,10 +1763,12 @@ async function executeChatAi(params: Record<string, unknown>): Promise<ProviderR
   let tokensTotal: number | null = null;
 
   if (model.startsWith("google/")) {
-    const GOOGLE_KEY = Deno.env.get("GOOGLE_AI_STUDIO_KEY");
-    if (!GOOGLE_KEY) throw new Error("GOOGLE_AI_STUDIO_KEY is not configured");
+    const GOOGLE_KEY = Deno.env.get("GOOGLE_AI_STUDIO_KEY") ?? Deno.env.get("GEMINI_API_KEY");
+    if (!GOOGLE_KEY) throw new Error("GEMINI_API_KEY (or GOOGLE_AI_STUDIO_KEY) is not configured");
     const geminiModelMap: Record<string, string> = {
-      "google/gemini-3.1-pro-preview": "gemini-3.1-pro-preview",
+      "google/gemini-3-pro-preview": "gemini-3-pro-preview",
+      // Legacy alias from the initial Workspace pricing sheet.
+      "google/gemini-3.1-pro-preview": "gemini-3-pro-preview",
       "google/gemini-3-flash-preview": "gemini-3-flash-preview",
     };
     const geminiModel = geminiModelMap[model] ?? model.replace("google/", "");
@@ -1982,10 +1996,17 @@ async function executeTripo3D(
 /**
  * executeRemoveBg — calls our remove-background edge function (Replicate BiRefNet).
  */
-async function executeRemoveBg(params: Record<string, unknown>, supabaseUrl: string, serviceRoleKey: string): Promise<ProviderResult> {
+async function executeRemoveBg(
+  params: Record<string, unknown>,
+  supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "",
+  serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+): Promise<ProviderResult> {
   const imageUrl = String(params.image_url ?? "");
   if (!imageUrl) {
     throw new Error("Remove Background requires an image input.");
+  }
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error("Remove Background service credentials are not configured.");
   }
 
   console.log(`[remove-bg-pipeline] Calling remove-background edge fn`);
@@ -2269,7 +2290,11 @@ async function executeGeminiTts(
   if (!text) throw new Error("Audio Generation requires a script (prompt).");
 
   const voice = String(params.voice ?? "Charon");
-  const model = String(params.model_name ?? "gemini-3.1-flash-tts-preview");
+  const requestedModel = String(params.model_name ?? "gemini-2.5-flash-preview-tts");
+  const model =
+    requestedModel === "gemini-3.1-flash-tts-preview"
+      ? "gemini-2.5-flash-preview-tts"
+      : requestedModel;
   const stylePrompt = String(params.style_prompt ?? "").trim();
 
   const res = await fetch(`${SUPABASE_URL}/functions/v1/text-to-speech`, {
@@ -2639,7 +2664,11 @@ async function executeOneStep(
       }
       if (!rawValue || !edge.target_handle) continue;
 
-      const handleDef = normalizeHandle(stepDef.provider, edge.target_handle);
+      const handleDef = normalizeHandleForModel(
+        stepDef.provider,
+        edge.target_handle,
+        String(stepParams.model_name ?? stepParams.model ?? ""),
+      );
       if (handleDef) {
         validateEdgeValue(rawValue, handleDef.data_type, edge.target_handle);
         if (handleDef.internal_key === "image_url" && handleDef.data_type === "image") {
@@ -3016,7 +3045,11 @@ async function executeVideoToPrompt(params: Record<string, unknown>): Promise<Pr
     throw new Error("GEMINI_API_KEY (or GOOGLE_AI_STUDIO_KEY) is not configured");
   }
 
-  const model = String(params.model_name ?? "gemini-3.1-pro-preview");
+  const requestedModel = String(params.model_name ?? "gemini-3-pro-preview");
+  const model =
+    requestedModel === "gemini-3.1-pro-preview"
+      ? "gemini-3-pro-preview"
+      : requestedModel;
   const videoUrl = String(params.video_url ?? "");
   if (!videoUrl) {
     throw new Error("Video to Prompt requires a video input.");
@@ -5012,7 +5045,11 @@ serve(async (req) => {
           v !== null && typeof v === "object" && !Array.isArray(v),
       );
       if (objectVals.length > 0 && objectVals.length === values.length) {
-        const handleDef = normalizeHandle(provider, targetHandle);
+        const handleDef = normalizeHandleForModel(
+          provider,
+          targetHandle,
+          String(params.model_name ?? params.model ?? ""),
+        );
         const key = handleDef?.internal_key ?? targetHandle;
         const existing = params[key];
         const merged = Array.isArray(existing)
@@ -5027,7 +5064,11 @@ serve(async (req) => {
       );
       if (stringVals.length === 0) continue;
 
-      const handleDef = normalizeHandle(provider, targetHandle);
+      const handleDef = normalizeHandleForModel(
+        provider,
+        targetHandle,
+        String(params.model_name ?? params.model ?? ""),
+      );
       if (handleDef) {
         for (const v of stringVals) {
           try {
