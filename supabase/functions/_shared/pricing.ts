@@ -33,6 +33,7 @@ export type ProviderKey =
   | "hyper3d"
   | "google_tts"
   | "gemini_tts"
+  | "elevenlabs_tts"
   | "video_understanding";
 export type OutputType = "video_url" | "image_url" | "text" | "audio_url" | "model_3d";
 

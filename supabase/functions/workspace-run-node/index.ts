@@ -2303,6 +2303,169 @@ async function executeGoogleTts(
 }
 
 /**
+ * executeElevenLabsTts — ElevenLabs Text-to-Speech.
+ *
+ * Mirrors executeGoogleTts: synth → upload MP3 → register the row
+ * in user_assets → return signed URL. Differs from Google TTS in
+ * three ways:
+ *
+ *  • Auth — ElevenLabs uses an `xi-api-key` header, not a query
+ *    param. The key is stored as `ELEVENLABS_API_KEY` in Supabase
+ *    project secrets.
+ *  • Voice ids — opaque 20-char tokens (e.g. `21m00Tcm4TlvDq8ikWAM`)
+ *    rather than language-coded strings, so we don't try to infer
+ *    a `languageCode` field from them.
+ *  • Models — the ElevenLabs API distinguishes "model" (acoustic
+ *    weights, like `eleven_turbo_v2_5`) from "voice" (the speaker).
+ *    Our `model_name` param chooses the underlying acoustic model;
+ *    `voice` picks the speaker.
+ *
+ * Style prompts aren't supported by ElevenLabs the same way Google's
+ * SSML <prosody> works — instead, ElevenLabs offers per-request
+ * `voice_settings` (stability / similarity_boost / style /
+ * use_speaker_boost). We map a couple of common style hints onto
+ * those numeric knobs so the UX feels parallel to the other
+ * providers without exposing 4 sliders.
+ */
+async function executeElevenLabsTts(
+  params: Record<string, unknown>,
+  supabaseClient: ReturnType<typeof createClient>,
+  userId: string,
+): Promise<ProviderResult> {
+  const apiKey = Deno.env.get("ELEVENLABS_API_KEY");
+  if (!apiKey) {
+    throw new Error(
+      "ElevenLabs not configured — set ELEVENLABS_API_KEY in Supabase project secrets (workspace dev).",
+    );
+  }
+
+  const text = String(params.prompt ?? params.text ?? "").trim();
+  if (!text) throw new Error("Audio Generation requires a script (prompt).");
+  if (text.length > 5000) {
+    throw new Error("Script too long — max 5,000 characters per audio gen.");
+  }
+
+  // ElevenLabs preset default voice ("Rachel"). Frontend voice picker
+  // populates `voice` with the actual id when the user picks one.
+  const voiceId = String(params.voice ?? "21m00Tcm4TlvDq8ikWAM");
+
+  // Map our model slug to ElevenLabs model_id. Anything starting with
+  // `elevenlabs-` is an in-house alias; we accept the API names too
+  // (e.g. `eleven_multilingual_v2`) for flexibility.
+  const requestedModel = String(params.model_name ?? params.model ?? "elevenlabs-multilingual-v2");
+  const ELEVEN_MODEL_MAP: Record<string, string> = {
+    "elevenlabs-multilingual-v2": "eleven_multilingual_v2",
+    "elevenlabs-turbo-v2-5":      "eleven_turbo_v2_5",
+    "elevenlabs-flash-v2-5":      "eleven_flash_v2_5",
+  };
+  const elevenModelId = ELEVEN_MODEL_MAP[requestedModel] ?? requestedModel;
+
+  // Light style hint mapping — keeps the UI parameter contract
+  // consistent across providers without exposing the full ElevenLabs
+  // numeric knob set.
+  const styleHint = String(params.style_prompt ?? "").trim().toLowerCase();
+  const stability =
+    /\b(steady|stable|formal|narrator)\b/.test(styleHint) ? 0.75
+    : /\b(emotional|expressive|playful)\b/.test(styleHint) ? 0.4
+    : 0.55;
+  const similarityBoost =
+    /\b(crisp|clear|defined)\b/.test(styleHint) ? 0.85 : 0.75;
+
+  console.log(
+    `[elevenlabs-tts] voice=${voiceId} model=${elevenModelId} stab=${stability} sim=${similarityBoost} chars=${text.length}`,
+  );
+
+  const ttsRes = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": apiKey,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+      },
+      body: JSON.stringify({
+        text,
+        model_id: elevenModelId,
+        voice_settings: {
+          stability,
+          similarity_boost: similarityBoost,
+        },
+      }),
+    },
+  );
+
+  if (!ttsRes.ok) {
+    const errText = await ttsRes.text();
+    console.error(`[elevenlabs-tts] HTTP ${ttsRes.status} body=${errText.slice(0, 500)}`);
+    if (ttsRes.status === 400) {
+      throw new Error(`Validation: ElevenLabs rejected the request — ${errText.slice(0, 200)}`);
+    }
+    if (ttsRes.status === 401 || ttsRes.status === 403) {
+      throw new Error(`ElevenLabs authentication failed — check ELEVENLABS_API_KEY (HTTP ${ttsRes.status}).`);
+    }
+    if (ttsRes.status === 422) {
+      throw new Error(`Validation: ElevenLabs voice or model invalid — ${errText.slice(0, 200)}`);
+    }
+    if (ttsRes.status === 429) {
+      throw new Error(`ElevenLabs rate-limited — slow down and retry. (${errText.slice(0, 200)})`);
+    }
+    throw new Error(`ElevenLabs TTS failed (HTTP ${ttsRes.status})`);
+  }
+
+  const buf = await ttsRes.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  if (bytes.byteLength === 0) {
+    throw new Error("ElevenLabs returned no audio content.");
+  }
+
+  const fileName = `tts/${userId}/${Date.now()}_eleven_${voiceId.slice(0, 8)}.mp3`;
+  const { error: uploadErr } = await supabaseClient.storage
+    .from("user_assets")
+    .upload(fileName, bytes, { contentType: "audio/mpeg", upsert: true });
+  if (uploadErr) {
+    console.error("[elevenlabs-tts] upload error:", uploadErr);
+    throw new Error("Failed to save audio. Please try again.");
+  }
+
+  const { data: signedData, error: signErr } = await supabaseClient.storage
+    .from("user_assets")
+    .createSignedUrl(fileName, 86400);
+  if (signErr || !signedData?.signedUrl) {
+    console.error("[elevenlabs-tts] signed URL error:", signErr);
+    throw new Error("Failed to save audio. Please try again.");
+  }
+
+  const audioUrl = signedData.signedUrl;
+
+  await supabaseClient.from("user_assets").insert({
+    user_id: userId,
+    name: `TTS (ElevenLabs): ${text.slice(0, 40)}${text.length > 40 ? "..." : ""}`,
+    file_url: audioUrl,
+    file_type: "audio",
+    source: "ai_generated",
+    metadata: {
+      voice: voiceId,
+      provider: "elevenlabs_tts",
+      model: elevenModelId,
+      text_length: text.length,
+      style_prompt: styleHint || null,
+    },
+  });
+
+  return {
+    result_url: audioUrl,
+    outputs: { audio_url: audioUrl },
+    output_type: "audio_url" as const,
+    provider_meta: {
+      provider: "elevenlabs_tts",
+      voice: voiceId,
+      model: elevenModelId,
+    },
+  };
+}
+
+/**
  * executeGeminiTts — legacy fallback for the gemini-2.5-*-tts
  * models. Proxies to the existing `text-to-speech` edge function
  * which already handles the Gemini API call + WAV encoding +
@@ -3213,9 +3376,13 @@ function getProviderForNodeType(
 
   // Audio generation — provider chosen by model_name. Default to
   // google_tts (Studio / Neural2 / WaveNet); fall back to the legacy
-  // gemini_tts proxy when the user picks a `gemini-2.5-*-tts` model.
+  // gemini_tts proxy when the user picks a `gemini-2.5-*-tts` model;
+  // route to ElevenLabs when the model slug starts with `elevenlabs-`
+  // or matches one of the raw ElevenLabs model_ids
+  // (`eleven_multilingual_v2`, `eleven_turbo_v2_5`, `eleven_flash_v2_5`).
   if (nodeType === "audioGenNode") {
     if (m.startsWith("gemini-")) return "gemini_tts";
+    if (m.startsWith("elevenlabs-") || m.startsWith("eleven_")) return "elevenlabs_tts";
     return "google_tts";
   }
 
@@ -3234,7 +3401,8 @@ function workspaceProviderDef(
         ? "model_3d"
       : p === "chat_ai" || p === "video_understanding"
         ? "text"
-        : p === "google_tts" || p === "gemini_tts" || p === "mp3_input"
+        : p === "google_tts" || p === "gemini_tts" ||
+          p === "elevenlabs_tts" || p === "mp3_input"
           ? "audio_url"
           : "image_url";
   const feature =
@@ -3246,7 +3414,7 @@ function workspaceProviderDef(
     p === "merge_audio" ? "merge_audio_video" :
     p === "chat_ai" ? "chat_ai" :
     p === "tripo3d" || p === "hyper3d" ? "model_3d" :
-    p === "google_tts" || p === "gemini_tts" ? "text_to_speech" :
+    p === "google_tts" || p === "gemini_tts" || p === "elevenlabs_tts" ? "text_to_speech" :
     p === "video_understanding" ? "video_to_prompt" :
     nodeType;
   return {
@@ -3284,6 +3452,7 @@ function workspaceMultiplierForProvider(
       return multipliers.chat;
     case "google_tts":
     case "gemini_tts":
+    case "elevenlabs_tts":
     case "mp3_input":
       return multipliers.audio ?? multipliers.chat;
     default:
@@ -5320,6 +5489,13 @@ serve(async (req) => {
         // Forward the user's auth header so credit billing follows
         // them, not the service role.
         result = await executeGeminiTts(params, authHeader);
+        break;
+      case "elevenlabs_tts":
+        // ElevenLabs TTS — direct call into ElevenLabs API,
+        // mirrors executeGoogleTts in shape (synth → upload →
+        // user_assets row). Requires ELEVENLABS_API_KEY in
+        // Supabase project secrets.
+        result = await executeElevenLabsTts(params, supabase, user.id);
         break;
       case "seedance":
         result = await executeSeedance(params);
