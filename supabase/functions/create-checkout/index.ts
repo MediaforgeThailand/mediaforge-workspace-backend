@@ -45,21 +45,34 @@ serve(async (req) => {
         { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    const priceId = plan.stripe_price_id;
+    // Resolve price + credits per requested billingInterval. Workspace plans expose
+    // separate stripe_price_id_monthly and stripe_price_id_annual columns; falling back
+    // to the legacy single stripe_price_id keeps backwards compatibility with consumer fork rows.
+    const priceId =
+      billingInterval === "annual"
+        ? (plan.stripe_price_id_annual ?? null)
+        : (plan.stripe_price_id_monthly ?? plan.stripe_price_id ?? null);
+
     if (!priceId) {
-      return new Response(JSON.stringify({ error: `No Stripe price configured for this plan` }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      return new Response(
+        JSON.stringify({ error: `No Stripe price configured for this plan (${billingInterval})` }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
     }
 
-    // CRITICAL: validate upfront_credits BEFORE creating session — prevents zero-credit grant downstream
-    const upfrontCredits = Number(plan.upfront_credits);
+    // CRITICAL: validate credits BEFORE creating session — prevents zero-credit grant downstream
+    const upfrontCredits = Number(
+      billingInterval === "annual" && plan.annual_credits != null
+        ? plan.annual_credits
+        : plan.upfront_credits
+    );
     if (!Number.isFinite(upfrontCredits) || upfrontCredits <= 0) {
-      console.error("[CREATE-CHECKOUT] Invalid plan.upfront_credits:", plan.upfront_credits, "for plan", plan.id);
+      console.error("[CREATE-CHECKOUT] Invalid credits for plan:", plan.id, "cycle:", billingInterval);
       return new Response(JSON.stringify({ error: "Plan misconfigured (no credits)" }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
 
-    console.log(`[CREATE-CHECKOUT] Plan: ${plan.name} (${plan.target}/${plan.billing_cycle}), Price: ${priceId}, Credits: ${upfrontCredits}`);
+    console.log(`[CREATE-CHECKOUT] Plan: ${plan.name} (${plan.target}/${billingInterval}), Price: ${priceId}, Credits: ${upfrontCredits}`);
 
     const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") || "", {
       apiVersion: "2025-08-27.basil",
@@ -108,20 +121,26 @@ serve(async (req) => {
       await supabaseAdmin.from("profiles").update({ stripe_customer_id: customerId }).eq("user_id", user.id);
     }
 
-    // LOCKED metadata convention — webhook reads `upfront_credits`
+    // LOCKED metadata convention — webhook reads `upfront_credits` + `billing_cycle`
     const metadata: Record<string, string> = {
       user_id: user.id,
       plan_id: plan.id,
       plan_name: plan.name,
       plan_target: plan.target,
-      billing_cycle: plan.billing_cycle,
+      // `billing_cycle` here reflects the user's chosen cadence (monthly|annual),
+      // NOT plan.billing_cycle (which can be 'metered' for Team).
+      billing_cycle: billingInterval,
       upfront_credits: upfrontCredits.toString(),
       type: "subscription_oneoff",
     };
 
     // ── In-app PaymentIntent flow (Stripe Elements, PromptPay + Card) ──
     if (intent) {
-      const amountSatang = Math.round(Number(plan.price_thb) * 100);
+      const baseThb =
+        billingInterval === "annual" && plan.annual_price_thb != null
+          ? Number(plan.annual_price_thb)
+          : Number(plan.price_thb);
+      const amountSatang = Math.round(baseThb * 100);
       if (!Number.isFinite(amountSatang) || amountSatang <= 0) {
         return new Response(JSON.stringify({ error: "Plan misconfigured (invalid price)" }),
           { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
