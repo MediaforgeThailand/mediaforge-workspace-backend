@@ -2329,6 +2329,32 @@ function clampNum(
   return n;
 }
 
+/** Resolve a default ElevenLabs voice id when the request didn't
+ *  specify one. We prefer the user's actual account voices via
+ *  GET /v1/voices, falling back to the canonical "Rachel" preset
+ *  (21m00Tcm4TlvDq8ikWAM) — that voice ships with every ElevenLabs
+ *  account so it's safe as a last resort. */
+async function pickDefaultElevenLabsVoice(apiKey: string): Promise<string> {
+  const FALLBACK = "21m00Tcm4TlvDq8ikWAM"; // Rachel
+  try {
+    const res = await fetch("https://api.elevenlabs.io/v1/voices", {
+      method: "GET",
+      headers: { "xi-api-key": apiKey, Accept: "application/json" },
+    });
+    if (!res.ok) return FALLBACK;
+    const json = (await res.json()) as {
+      voices?: Array<{ voice_id?: string; category?: string }>;
+    };
+    const voices = json.voices ?? [];
+    // Prefer non-cloned (premade / professional) voices for the
+    // default — those are guaranteed to have audio samples.
+    const premade = voices.find((v) => v.category !== "cloned" && v.voice_id);
+    return premade?.voice_id ?? voices[0]?.voice_id ?? FALLBACK;
+  } catch (_err) {
+    return FALLBACK;
+  }
+}
+
 /**
  * executeElevenLabsTts — ElevenLabs Text-to-Speech.
  *
@@ -2377,9 +2403,20 @@ async function executeElevenLabsTts(
     throw new Error("Script too long — max 5,000 characters per audio gen.");
   }
 
-  const voiceId = String(params.voice ?? "").trim();
-  if (!voiceId || !/^[A-Za-z0-9_-]{8,}$/.test(voiceId)) {
-    throw new Error("Validation: ElevenLabs requires a valid `voice` id.");
+  // Voice id resolution. The canvas audio node no longer surfaces a
+  // picker (the hardcoded preset list was removed), and the
+  // standalone tool only fills `voice` when the user clicks one of
+  // the live /v1/voices tiles. So an empty voice is normal — fall
+  // back to the first account voice via /v1/voices, or to the
+  // canonical default ElevenLabs preset id (21m00Tcm4TlvDq8ikWAM,
+  // "Rachel") if the listing call also fails.
+  let voiceId = String(params.voice ?? "").trim();
+  if (!voiceId) {
+    voiceId = await pickDefaultElevenLabsVoice(apiKey);
+  } else if (!/^[A-Za-z0-9_-]{8,}$/.test(voiceId)) {
+    throw new Error(
+      "Validation: ElevenLabs `voice` id must be an opaque token (e.g. 21m00Tcm4TlvDq8ikWAM).",
+    );
   }
 
   // Map our model slug to ElevenLabs model_id. Anything starting with
