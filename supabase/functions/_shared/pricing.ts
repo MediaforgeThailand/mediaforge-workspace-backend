@@ -114,6 +114,18 @@ function googleModelPriceKeys(rawModel: unknown): string[] {
   return Array.from(new Set(keys));
 }
 
+function textToSpeechModelPriceKeys(rawModel: unknown): string[] {
+  const model = String(rawModel ?? "").trim();
+  if (!model) return [];
+  const aliases: Record<string, string[]> = {
+    "elevenlabs-multilingual-v2": ["elevenlabs-multilingual-v2", "eleven_multilingual_v2"],
+    "eleven_multilingual_v2": ["eleven_multilingual_v2", "elevenlabs-multilingual-v2"],
+    "elevenlabs-turbo-v2-5": ["elevenlabs-turbo-v2-5", "eleven_turbo_v2_5"],
+    "eleven_turbo_v2_5": ["eleven_turbo_v2_5", "elevenlabs-turbo-v2-5"],
+  };
+  return Array.from(new Set(aliases[model] ?? [model]));
+}
+
 async function firstCostByModelKeys(
   supabase: ReturnType<typeof createClient>,
   feature: string,
@@ -202,13 +214,17 @@ export async function lookupBaseCost(
   }
 
   /* ── Text to speech ── */
-  if (providerDef.provider === "google_tts" || providerDef.provider === "gemini_tts") {
-    const model = String(params.model_name ?? params.model ?? "google-tts-studio");
-    const { data } = await supabase
-      .from("credit_costs").select("cost, pricing_type")
-      .eq("feature", "text_to_speech")
-      .eq("model", model)
-      .limit(1).maybeSingle();
+  if (
+    providerDef.provider === "google_tts" ||
+    providerDef.provider === "gemini_tts" ||
+    providerDef.provider === "elevenlabs_tts"
+  ) {
+    const fallbackModel = providerDef.provider === "elevenlabs_tts"
+      ? "elevenlabs-multilingual-v2"
+      : "google-tts-studio";
+    const model = String(params.model_name ?? params.model ?? fallbackModel);
+    const keys = textToSpeechModelPriceKeys(model);
+    const data = await firstCostByModelKeys(supabase, "text_to_speech", keys);
 
     if (!data) {
       throw new PricingConfigError(
@@ -562,6 +578,7 @@ function getMultiplierForNode(nodeType: string, featureMultipliers?: FeatureMult
     case "hyper3d": return featureMultipliers.image;
     case "google_tts": return featureMultipliers.audio ?? 1.0;
     case "gemini_tts": return featureMultipliers.audio ?? 1.0;
+    case "elevenlabs_tts": return featureMultipliers.audio ?? 1.0;
     case "video_understanding": return featureMultipliers.chat;
     case "mp3_input": return featureMultipliers.audio ?? DEFAULT_WORKSPACE_MULTIPLIER;
     default: return DEFAULT_WORKSPACE_MULTIPLIER;

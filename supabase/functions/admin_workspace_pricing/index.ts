@@ -254,6 +254,55 @@ const SEEDANCE_ROWS: CreditCostWriteRow[] = [
   notes: row.notes,
 }));
 
+const ELEVENLABS_TTS_ROWS: CreditCostWriteRow[] = [
+  {
+    model: "elevenlabs-multilingual-v2",
+    apiModel: "eleven_multilingual_v2",
+    label: "ElevenLabs Multilingual v2 / 1K chars",
+    usdPer1k: 0.10,
+    quality: "multilingual-v2",
+    notes: "Estimated from ElevenLabs 1 credit per character for Multilingual v2; normalized through Workspace 50 credits/THB.",
+  },
+  {
+    model: "eleven_multilingual_v2",
+    apiModel: "eleven_multilingual_v2",
+    label: "ElevenLabs Multilingual v2 API alias / 1K chars",
+    usdPer1k: 0.10,
+    quality: "multilingual-v2",
+    notes: "Runtime alias for callers that pass the official ElevenLabs model_id.",
+  },
+  {
+    model: "elevenlabs-turbo-v2-5",
+    apiModel: "eleven_turbo_v2_5",
+    label: "ElevenLabs Turbo v2.5 / 1K chars",
+    usdPer1k: 0.05,
+    quality: "turbo-v2.5",
+    notes: "Estimated from ElevenLabs 0.5 credit per character for Turbo v2.5; normalized through Workspace 50 credits/THB.",
+  },
+  {
+    model: "eleven_turbo_v2_5",
+    apiModel: "eleven_turbo_v2_5",
+    label: "ElevenLabs Turbo v2.5 API alias / 1K chars",
+    usdPer1k: 0.05,
+    quality: "turbo-v2.5",
+    notes: "Runtime alias for callers that pass the official ElevenLabs model_id.",
+  },
+].map((row) => ({
+  feature: "text_to_speech",
+  model: row.model,
+  label: row.label,
+  cost: creditsFromUsd(row.usdPer1k),
+  pricing_type: "per_1k_chars",
+  provider: "elevenlabs",
+  price_key: row.apiModel,
+  resolution: "text",
+  quality: row.quality,
+  source: "official_docs_estimate",
+  source_url: "https://elevenlabs.io/docs/models",
+  provider_unit: "per 1K chars",
+  notes: `${row.notes} ${row.usdPer1k} USD/1K chars -> ${USD_TO_THB} THB/USD -> ${WORKSPACE_CREDITS_PER_THB} credits/THB.`,
+}));
+
 const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   ...GPT_IMAGE_2_ROWS,
   ...GPT_IMAGE_2_FALLBACK_ROWS,
@@ -270,6 +319,7 @@ const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   { feature: "chat_ai", model: "google/gemini-3-flash-preview", label: "Gemini 3 Flash Preview", cost: 20, pricing_type: "per_operation", provider: "google", price_key: "gemini-3-flash-preview", source: "master_pricing_sheet", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per operation", notes: "Master Pricing Sheet fixed-operation placeholder: 20 credits/op. Token-price reference: input about 0.50 USD / 1M tokens, output about 3 USD / 1M tokens." },
   { feature: "text_to_speech", model: "gemini-2.5-flash-preview-tts", label: "Gemini 2.5 Flash Preview TTS", cost: 1, pricing_type: "per_operation", provider: "google", price_key: "gemini-2.5-flash-preview-tts", source: "unverified_placeholder", provider_unit: "per operation", notes: "Workspace TTS proxy model. Placeholder set to 1 so the UI and strict pricing never fall back to an unrelated TTS row." },
   { feature: "text_to_speech", model: "gemini-2.5-pro-preview-tts", label: "Gemini 2.5 Pro Preview TTS", cost: 1, pricing_type: "per_operation", provider: "google", price_key: "gemini-2.5-pro-preview-tts", source: "unverified_placeholder", provider_unit: "per operation", notes: "Workspace TTS proxy model. Placeholder set to 1 so the UI and strict pricing never fall back to an unrelated TTS row." },
+  ...ELEVENLABS_TTS_ROWS,
   { feature: "text_to_speech", model: "google-tts-studio", label: "Google Cloud TTS Studio / 1K chars", cost: 280, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-studio", quality: "studio", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
   { feature: "text_to_speech", model: "google-tts-neural2", label: "Google Cloud TTS Neural2 / 1K chars", cost: 28, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-neural2", quality: "neural2", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
   { feature: "text_to_speech", model: "google-tts-wavenet", label: "Google Cloud TTS WaveNet / 1K chars", cost: 7, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-wavenet", quality: "wavenet", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },

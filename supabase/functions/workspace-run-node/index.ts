@@ -244,6 +244,11 @@ const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     image_input:   { internal_key: "image_url",      data_type: "image" },
     image:         { internal_key: "image_url",      data_type: "image" },
   },
+  seedream: {
+    ref_image:     { internal_key: "image_url",      data_type: "image" },
+    image_input:   { internal_key: "image_url",      data_type: "image" },
+    image:         { internal_key: "image_url",      data_type: "image" },
+  },
   chat_ai: {
     context_text:  { internal_key: "context_text",   data_type: "text" },
     image_input:   { internal_key: "image_url",      data_type: "image" },
@@ -1399,6 +1404,7 @@ async function executeSeedream(
   // workspace shell passes ref images via image_url / mention_image_urls.
   const refImage =
     (params.image_url as string | undefined) ??
+    (params.ref_image as string | undefined) ??
     (Array.isArray(params.mention_image_urls)
       ? (params.mention_image_urls as string[])[0]
       : undefined);
@@ -2502,6 +2508,9 @@ async function executeElevenLabsTts(
     }
     if (ttsRes.status === 401 || ttsRes.status === 403) {
       throw new Error(`ElevenLabs authentication failed — check ELEVENLABS_API_KEY (HTTP ${ttsRes.status}).`);
+    }
+    if (ttsRes.status === 402) {
+      throw new Error(`ElevenLabs account has insufficient provider credits/quota. Top up ElevenLabs billing or switch voice provider. (${errText.slice(0, 200)})`);
     }
     if (ttsRes.status === 422) {
       throw new Error(`Validation: ElevenLabs voice or model invalid — ${errText.slice(0, 200)}`);
@@ -5505,7 +5514,7 @@ serve(async (req) => {
           m.url,
       )
       .map((m) => m.url as string);
-    if (provider !== "kling" && mentionImageUrls.length > 0) {
+    if (provider !== "kling" && (mentionImageUrls.length > 0 || edgeImageUrls.length > 0)) {
       if (provider === "banana" || provider === "openai") {
         const merged = Array.from(new Set([
           ...((params.mention_image_urls as string[] | undefined) ?? []),
@@ -5544,13 +5553,6 @@ serve(async (req) => {
     }
 
     /* ─── Dispatch ────────────────────────────────────────── */
-    if (provider === "seedream") {
-      throw new Error(
-        `Provider "${provider}" not yet implemented in workspace-run-node. ` +
-          `Pick a Banana / Kling / GPT Image 2 / Seedance model for now.`,
-      );
-    }
-
     activeCreditCharge = await consumeWorkspaceCredits({
       supabase,
       userId: user.id,
