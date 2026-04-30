@@ -1406,21 +1406,51 @@ async function executeSeedream(
         ? parseInt(String(seedRaw), 10) || undefined
         : undefined;
 
-  // Image-to-image hint (some Seedream variants accept it). The
-  // workspace shell passes ref images via image_url / mention_image_urls.
-  const refImage =
-    (params.image_url as string | undefined) ??
-    (params.ref_image as string | undefined) ??
-    (Array.isArray(params.mention_image_urls)
-      ? (params.mention_image_urls as string[])[0]
-      : undefined);
+  // Image-to-image / image-edit references — BytePlus ModelArk
+  // Seedream 4.5 + 5.0 take an `image_urls` ARRAY (max 14). The
+  // canvas writes wired ref-image edges into `ref_image` (single
+  // URL when one connection, array when many). Standalone tool
+  // calls historically used `image_url` (singular). Mention path
+  // hands us `mention_image_urls`. Accept all three and normalise
+  // to an array, capped at the API's 14-image limit.
+  //
+  // Until 2026-04 this executor was sending `{ image: <url> }`
+  // (singular) — the 4.5 / 5.0 endpoint silently dropped that
+  // field, so wired refs had no effect. Switching to `image_urls`
+  // matches the published BytePlus spec.
+  const collectRefUrls = (): string[] => {
+    const acc: string[] = [];
+    const push = (v: unknown) => {
+      if (typeof v === "string" && v.length > 0) acc.push(v);
+    };
+    const refRaw = params.ref_image;
+    if (Array.isArray(refRaw)) refRaw.forEach(push);
+    else push(refRaw);
+    push(params.image_url);
+    push(params.image);
+    if (Array.isArray(params.mention_image_urls)) {
+      (params.mention_image_urls as unknown[]).forEach(push);
+    }
+    // Dedupe while preserving order — BytePlus indexes references
+    // semantically ("Image 1", "Image 2" in the prompt), so the
+    // order matters and we can't union into an unordered set.
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const u of acc) {
+      if (seen.has(u)) continue;
+      seen.add(u);
+      out.push(u);
+    }
+    return out.slice(0, 14);
+  };
+  const refUrls = collectRefUrls();
 
   const negativePrompt =
     typeof params.negative_prompt === "string" ? params.negative_prompt : undefined;
 
   console.log(
     `[seedream] generate model=${entry.model} size=${size} seed=${seed ?? "auto"} ` +
-      `i2i=${!!refImage}`,
+      `refs=${refUrls.length}`,
   );
 
   const items = await generateSeedreamImage(
@@ -1431,7 +1461,7 @@ async function executeSeedream(
       response_format: "url",
       n: 1,
       ...(seed !== undefined ? { seed } : {}),
-      ...(refImage ? { image: refImage } : {}),
+      ...(refUrls.length > 0 ? { image_urls: refUrls } : {}),
       ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
     },
     apiKey,
@@ -1454,7 +1484,7 @@ async function executeSeedream(
       tier: entry.tier,
       size,
       revised_prompt: items[0]?.revised_prompt,
-      has_reference_image: !!refImage,
+      reference_image_count: refUrls.length,
     },
   };
 }
@@ -1495,6 +1525,12 @@ async function executeHyper3D(
   }
 
   const prompt = typeof params.prompt === "string" ? params.prompt : undefined;
+  // Output format selection isn't documented as a flag on the BytePlus
+  // path — Hyper3D Gen2 returns a single GLB regardless. Keep the
+  // `format` knob in metadata only so the UI's selector is still
+  // honoured downstream (e.g. file extension hints) without us
+  // forwarding an undocumented `--format` flag that the model would
+  // either ignore or reject.
   const formatRaw = params.format ?? params.output_format;
   const format =
     formatRaw === "obj" || formatRaw === "fbx" || formatRaw === "glb"
@@ -1511,20 +1547,22 @@ async function executeHyper3D(
         ? parseInt(String(seedRaw), 10) || undefined
         : undefined;
 
-  const content = buildHyper3dContent({
+  // buildHyper3dContent returns { content, seed? } — spread both
+  // into the wire body so `seed` lands at the top level (per the
+  // BytePlus curl example), not inside the prompt as a flag.
+  const built = buildHyper3dContent({
     imageUrl,
     prompt,
-    format,
     texture,
     seed,
   });
 
   console.log(
-    `[hyper3d] submit model=${entry.model} format=${format} texture=${texture}`,
+    `[hyper3d] submit model=${entry.model} texture=${texture} seed=${seed ?? "auto"}`,
   );
 
   const taskId = await submitHyper3dTask(
-    { model: entry.model, content },
+    { model: entry.model, ...built },
     apiKey,
   );
 
@@ -2197,11 +2235,23 @@ async function executeGoogleTts(
 
   // Optional style hint → SSML <prosody>. Conservative mapping —
   // recognise a handful of keywords ("calm", "fast", "slow", "warm").
-  // Anything else gets passed as a plain raw <speak> wrapper without
-  // prosody so the Google TTS request stays valid.
+  //
+  // HOWEVER: Google's Studio voices REJECT every SSML tag (including
+  // <prosody>) with `400 INVALID_ARGUMENT: SSML markup is not
+  // supported for Studio voices`. The voice catalog the workspace
+  // ships is Studio-only, so wrapping the text in <prosody> on the
+  // back of a `style_prompt` was silently failing every Studio
+  // request the moment the user typed any style hint.
+  //
+  // Fix: gate the SSML wrap on the voice tier. Studio voices fall
+  // through to plain text input — the speakingRate / pitch knobs the
+  // API also accepts cover the same expressive range without SSML.
+  // Standard / Wavenet / Neural2 voices keep the SSML path so the
+  // style hint still has an effect there.
   const styleHint = String(params.style_prompt ?? "").trim().toLowerCase();
+  const isStudioVoice = /-Studio-/i.test(voiceId);
   let inputBody: { text?: string; ssml?: string };
-  if (styleHint) {
+  if (styleHint && !isStudioVoice) {
     const rate = /\bslow\b/.test(styleHint) ? "slow"
       : /\bfast\b/.test(styleHint) ? "fast"
       : "medium";
@@ -2219,6 +2269,10 @@ async function executeGoogleTts(
       ssml: `<speak><prosody rate="${rate}" pitch="${pitch}">${escaped}</prosody></speak>`,
     };
   } else {
+    // Studio voices OR no style hint → plain text. Studio voices
+    // also tend to ignore `pitch`, but accepting it as 0 doesn't
+    // 400 so we leave the request shape consistent. The speaking
+    // rate is honoured.
     inputBody = { text };
   }
 
@@ -4232,6 +4286,7 @@ interface WorkspaceRunBody {
     | "enqueue_workspace_job"
     | "get_workspace_job"
     | "poll_workspace_job"
+    | "run_workspace_job_worker"
     | "poll_kling"
     | "poll_seedance"
     | "poll_hyper3d"
@@ -4263,6 +4318,9 @@ interface WorkspaceRunBody {
 const WORKSPACE_JOB_MAX_MS = 30 * 60_000;
 const WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS = 260_000;
 const WORKSPACE_JOB_BACKOFF_MS = [3_000, 5_000, 10_000, 15_000, 30_000, 60_000];
+const WORKSPACE_JOB_WORKER_BATCH_SIZE = 2;
+const WORKSPACE_JOB_LOCK_SEC = 360;
+const WORKSPACE_JOB_EXPIRE_SWEEP_LIMIT = 25;
 
 type WorkspaceJobStatus =
   | "queued"
@@ -4288,6 +4346,16 @@ type WorkspaceJobRow = {
   result?: Record<string, unknown> | null;
   error?: string | null;
   last_error?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  run_after?: string | null;
+  deadline_at?: string | null;
+  locked_by?: string | null;
+  lock_expires_at?: string | null;
+  worker_heartbeat_at?: string | null;
+  notification_sent_at?: string | null;
   credits_charged?: number | null;
   credits_refunded?: number | null;
   credit_team_id?: string | null;
@@ -4339,6 +4407,7 @@ async function readJsonSafe(res: Response): Promise<Record<string, unknown>> {
 async function invokeWorkspaceRunOnce(args: {
   functionUrl: string;
   authHeader: string;
+  extraHeaders?: Record<string, string>;
   body: WorkspaceRunBody;
 }): Promise<Record<string, unknown>> {
   const controller = new AbortController();
@@ -4353,6 +4422,7 @@ async function invokeWorkspaceRunOnce(args: {
       headers: {
         authorization: args.authHeader,
         ...(gatewayApiKey ? { apikey: gatewayApiKey } : {}),
+        ...(args.extraHeaders ?? {}),
         "content-type": "application/json",
       },
       body: JSON.stringify(args.body),
@@ -4371,6 +4441,7 @@ async function invokeWorkspaceRunOnce(args: {
 async function pollWorkspaceAsyncResult(args: {
   functionUrl: string;
   authHeader: string;
+  extraHeaders?: Record<string, string>;
   response: Record<string, unknown>;
   budgetEndsAt: number;
 }): Promise<Record<string, unknown>> {
@@ -4416,6 +4487,7 @@ async function pollWorkspaceAsyncResult(args: {
     const pollResp = await invokeWorkspaceRunOnce({
       functionUrl: args.functionUrl,
       authHeader: args.authHeader,
+      extraHeaders: args.extraHeaders,
       body: {
         action: pollAction,
         task_id: taskId,
@@ -4462,6 +4534,7 @@ type WorkspaceAsyncPollOnceResult =
 async function pollWorkspaceAsyncResultOnce(args: {
   functionUrl: string;
   authHeader: string;
+  extraHeaders?: Record<string, string>;
   response: Record<string, unknown>;
 }): Promise<WorkspaceAsyncPollOnceResult> {
   const taskId = String(args.response.task_id ?? "").trim();
@@ -4487,6 +4560,7 @@ async function pollWorkspaceAsyncResultOnce(args: {
   const pollResp = await invokeWorkspaceRunOnce({
     functionUrl: args.functionUrl,
     authHeader: args.authHeader,
+    extraHeaders: args.extraHeaders,
     body: {
       action: pollAction,
       task_id: taskId,
@@ -4561,12 +4635,541 @@ async function pollWorkspaceAsyncResultOnce(args: {
   return { state: "pending", status: status || "submitted", message };
 }
 
+function workspaceJobDeadlineMs(job: WorkspaceJobRow): number {
+  const raw = job.deadline_at ?? job.started_at ?? job.created_at ?? "";
+  const parsed = raw ? Date.parse(raw) : Number.NaN;
+  if (Number.isFinite(parsed)) return parsed;
+  const base = job.created_at ? Date.parse(job.created_at) : Date.now();
+  return (Number.isFinite(base) ? base : Date.now()) + WORKSPACE_JOB_MAX_MS;
+}
+
+function workspaceJobLink(job: WorkspaceJobRow): string {
+  if (job.workspace_id) return `/app/workspace/${encodeURIComponent(job.workspace_id)}`;
+  const section =
+    job.node_type === "klingVideoNode" || job.node_type === "videoGenNode"
+      ? "video_gen"
+      : job.node_type === "googleTtsNode" || job.node_type === "geminiTtsNode"
+        ? "voice_gen"
+        : job.node_type === "tripo3dNode" || job.node_type === "hyper3dNode"
+          ? "model_3d"
+          : "image_gen";
+  return `/app/workspace?section=${section}`;
+}
+
+function workspaceJobProviderLabel(job: WorkspaceJobRow): string {
+  return String(job.model ?? job.provider ?? job.node_type ?? "generation");
+}
+
+function workspaceJobBackoffSeconds(attempt: number): number {
+  const ms = WORKSPACE_JOB_BACKOFF_MS[Math.min(Math.max(attempt - 1, 0), WORKSPACE_JOB_BACKOFF_MS.length - 1)];
+  return Math.max(5, Math.ceil(ms / 1000));
+}
+
+function workspaceJobPollDelaySeconds(result: Record<string, unknown>): number {
+  const providerMeta =
+    result.provider_meta && typeof result.provider_meta === "object"
+      ? (result.provider_meta as Record<string, unknown>)
+      : {};
+  const provider = String(providerMeta.provider ?? "").toLowerCase();
+  if (provider === "tripo3d") return 8;
+  if (provider === "hyper3d") return 10;
+  return 5;
+}
+
+function workspaceWorkerHeaders(secret: string, userId: string): Record<string, string> {
+  return {
+    "x-cron-secret": secret,
+    "x-workspace-worker-user-id": userId,
+  };
+}
+
+async function getWorkspaceWorkerSecret(
+  supabase: ReturnType<typeof createClient>,
+): Promise<string | null> {
+  const envSecret =
+    Deno.env.get("WORKSPACE_WORKER_SECRET") ??
+    Deno.env.get("CRON_SECRET") ??
+    "";
+  if (envSecret) return envSecret;
+
+  try {
+    const { data, error } = await supabase.rpc("get_retry_worker_cron_secret");
+    if (!error && data) return String(data);
+  } catch (err) {
+    console.warn(
+      "[workspace-job-worker] secret lookup failed:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+  return null;
+}
+
+async function verifyWorkspaceWorkerSecret(
+  supabase: ReturnType<typeof createClient>,
+  req: Request,
+): Promise<string | null> {
+  const provided =
+    req.headers.get("x-cron-secret") ??
+    req.headers.get("x-workspace-worker-secret") ??
+    "";
+  if (!provided) return null;
+
+  const expected = await getWorkspaceWorkerSecret(supabase);
+  return expected && provided === expected ? provided : null;
+}
+
+async function loadWorkspaceWorkerUser(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+): Promise<{ id: string; email?: string | null } | null> {
+  const { data, error } = await supabase.auth.admin.getUserById(userId);
+  if (error || !data?.user) {
+    console.error("[workspace-job-worker] user lookup failed", userId, error);
+    return null;
+  }
+  return { id: data.user.id, email: data.user.email ?? null };
+}
+
+async function releaseWorkspaceJobLock(args: {
+  supabase: ReturnType<typeof createClient>;
+  jobId: string;
+  workerId: string;
+  runAfterSeconds: number;
+}): Promise<void> {
+  const { error } = await args.supabase.rpc("release_workspace_generation_job", {
+    p_job_id: args.jobId,
+    p_worker_id: args.workerId,
+    p_run_after_seconds: args.runAfterSeconds,
+  });
+  if (error) {
+    console.warn("[workspace-job-worker] release lock failed", args.jobId, error.message);
+  }
+}
+
+async function notifyWorkspaceJobTerminal(args: {
+  supabase: ReturnType<typeof createClient>;
+  job: WorkspaceJobRow;
+  status: "completed" | "failed" | "permanent_failed";
+  message?: string;
+}): Promise<void> {
+  if (args.job.notification_sent_at) return;
+
+  const { data: claimed, error: claimErr } = await args.supabase
+    .from("workspace_generation_jobs")
+    .update({ notification_sent_at: new Date().toISOString() })
+    .eq("id", args.job.id)
+    .is("notification_sent_at", null)
+    .select("id")
+    .maybeSingle();
+
+  if (claimErr || !claimed) {
+    if (claimErr) console.warn("[workspace-job] notification claim failed", claimErr.message);
+    return;
+  }
+
+  const isSuccess = args.status === "completed";
+  const providerLabel = workspaceJobProviderLabel(args.job);
+  const title = isSuccess ? "Generation complete" : "Generation failed";
+  const message = isSuccess
+    ? `${providerLabel} is ready.`
+    : (args.message?.trim() || `${providerLabel} could not finish. Credits were refunded.`);
+
+  const { error } = await args.supabase.from("notifications").insert({
+    user_id: args.job.user_id,
+    type: isSuccess ? "workspace_generation_complete" : "workspace_generation_failed",
+    title,
+    message: message.substring(0, 300),
+    icon: isSuccess ? "sparkles" : "alert-circle",
+    link: workspaceJobLink(args.job),
+    metadata: {
+      job_id: args.job.id,
+      project_id: args.job.project_id ?? null,
+      workspace_id: args.job.workspace_id ?? null,
+      canvas_id: args.job.canvas_id ?? null,
+      node_id: args.job.node_id ?? null,
+      provider: args.job.provider ?? null,
+      model: args.job.model ?? null,
+      status: args.status,
+    },
+  });
+  if (error) {
+    console.warn("[workspace-job] notification insert failed", args.job.id, error.message);
+  }
+}
+
+async function completeWorkspaceJob(args: {
+  supabase: ReturnType<typeof createClient>;
+  job: WorkspaceJobRow;
+  result: Record<string, unknown>;
+}): Promise<WorkspaceJobRow | null> {
+  const charged = Number(args.job.credits_charged ?? 0);
+  const resultWithCredits = {
+    ...args.result,
+    credits_spent: Number.isFinite(charged) ? charged : 0,
+  };
+  const { data, error } = await args.supabase
+    .from("workspace_generation_jobs")
+    .update({
+      status: "completed",
+      result: resultWithCredits,
+      error: null,
+      last_error: null,
+      locked_by: null,
+      lock_expires_at: null,
+      run_after: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", args.job.id)
+    .select("*")
+    .maybeSingle();
+  if (error) throw error;
+  const updated = (data as WorkspaceJobRow | null) ?? { ...args.job, result: resultWithCredits, status: "completed" };
+  await notifyWorkspaceJobTerminal({ supabase: args.supabase, job: updated, status: "completed" });
+  return updated;
+}
+
+async function failWorkspaceJob(args: {
+  supabase: ReturnType<typeof createClient>;
+  job: WorkspaceJobRow;
+  status?: "failed" | "permanent_failed";
+  error: string;
+  refundReason: string;
+}): Promise<WorkspaceJobRow | null> {
+  const msg = args.error.substring(0, 1000);
+  await refundWorkspaceJobCharge({
+    supabase: args.supabase,
+    job: args.job,
+    reason: args.refundReason.substring(0, 300),
+  });
+  const { data, error } = await args.supabase
+    .from("workspace_generation_jobs")
+    .update({
+      status: args.status ?? "failed",
+      error: msg,
+      last_error: msg,
+      locked_by: null,
+      lock_expires_at: null,
+      run_after: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", args.job.id)
+    .select("*")
+    .maybeSingle();
+  if (error) throw error;
+  const updated = (data as WorkspaceJobRow | null) ?? {
+    ...args.job,
+    status: args.status ?? "failed",
+    error: msg,
+    last_error: msg,
+  };
+  await notifyWorkspaceJobTerminal({
+    supabase: args.supabase,
+    job: updated,
+    status: args.status ?? "failed",
+    message: msg,
+  });
+  return updated;
+}
+
+async function scheduleWorkspaceJobRetry(args: {
+  supabase: ReturnType<typeof createClient>;
+  job: WorkspaceJobRow;
+  workerId: string;
+  message: string;
+  delaySeconds: number;
+  result?: Record<string, unknown>;
+}): Promise<void> {
+  await args.supabase
+    .from("workspace_generation_jobs")
+    .update({
+      status: "running",
+      ...(args.result ? { result: args.result } : {}),
+      error: null,
+      last_error: args.message.substring(0, 1000),
+      worker_heartbeat_at: new Date().toISOString(),
+    })
+    .eq("id", args.job.id);
+  await releaseWorkspaceJobLock({
+    supabase: args.supabase,
+    jobId: args.job.id,
+    workerId: args.workerId,
+    runAfterSeconds: args.delaySeconds,
+  });
+}
+
+async function processWorkspaceGenerationJobTick(args: {
+  supabase: ReturnType<typeof createClient>;
+  job: WorkspaceJobRow;
+  workerId: string;
+  functionUrl: string;
+  serviceRoleKey: string;
+  workerSecret: string;
+}): Promise<{ job_id: string; status: string; detail?: string }> {
+  const job = args.job;
+  const now = Date.now();
+  const deadlineMs = workspaceJobDeadlineMs(job);
+  if (now >= deadlineMs) {
+    const msg = `Provider queue was busy for ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes. Generation timed out and credits were refunded.`;
+    await failWorkspaceJob({
+      supabase: args.supabase,
+      job,
+      status: "failed",
+      error: msg,
+      refundReason: `workspace job timed out after ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes`,
+    });
+    return { job_id: job.id, status: "failed", detail: "deadline" };
+  }
+
+  const authHeader = `Bearer ${args.serviceRoleKey}`;
+  const extraHeaders = workspaceWorkerHeaders(args.workerSecret, job.user_id);
+  const charged = Number(job.credits_charged ?? 0);
+  const currentResult =
+    job.result && typeof job.result === "object"
+      ? (job.result as Record<string, unknown>)
+      : null;
+
+  if (currentResult?.task_id && !currentResult.url) {
+    try {
+      const outcome = await pollWorkspaceAsyncResultOnce({
+        functionUrl: args.functionUrl,
+        authHeader,
+        extraHeaders,
+        response: currentResult,
+      });
+
+      if (outcome.state === "succeeded") {
+        await completeWorkspaceJob({ supabase: args.supabase, job, result: outcome.result });
+        return { job_id: job.id, status: "completed" };
+      }
+      if (outcome.state === "failed") {
+        const msg = outcome.message || `${job.provider ?? "provider"} task failed`;
+        await failWorkspaceJob({
+          supabase: args.supabase,
+          job,
+          status: "failed",
+          error: msg,
+          refundReason: `workspace async task failed: ${msg.substring(0, 160)}`,
+        });
+        return { job_id: job.id, status: "failed", detail: msg.substring(0, 120) };
+      }
+
+      const delaySeconds = workspaceJobPollDelaySeconds(currentResult);
+      await scheduleWorkspaceJobRetry({
+        supabase: args.supabase,
+        job,
+        workerId: args.workerId,
+        message: outcome.state === "pending"
+          ? (outcome.message || `Provider status: ${outcome.status}`)
+          : "Waiting for provider result",
+        delaySeconds,
+      });
+      return { job_id: job.id, status: "running", detail: "provider_pending" };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const permanent = isPermanentWorkspaceJobError(msg);
+      if (permanent) {
+        await failWorkspaceJob({
+          supabase: args.supabase,
+          job,
+          status: "permanent_failed",
+          error: msg,
+          refundReason: `workspace async polling failed: ${msg.substring(0, 160)}`,
+        });
+        return { job_id: job.id, status: "permanent_failed", detail: msg.substring(0, 120) };
+      }
+      await scheduleWorkspaceJobRetry({
+        supabase: args.supabase,
+        job,
+        workerId: args.workerId,
+        message: msg,
+        delaySeconds: 30,
+      });
+      return { job_id: job.id, status: "running", detail: "poll_retry" };
+    }
+  }
+
+  const attempt = Number(job.attempts ?? 0) + 1;
+  await args.supabase
+    .from("workspace_generation_jobs")
+    .update({
+      status: "running",
+      attempts: attempt,
+      started_at: job.started_at ?? new Date().toISOString(),
+      worker_heartbeat_at: new Date().toISOString(),
+      error: null,
+    })
+    .eq("id", job.id);
+
+  try {
+    const initial = await invokeWorkspaceRunOnce({
+      functionUrl: args.functionUrl,
+      authHeader,
+      extraHeaders,
+      body: job.request,
+    });
+    const initialWithCredits = {
+      ...initial,
+      credits_spent: Number.isFinite(charged) ? charged : 0,
+    };
+    const providerMeta =
+      initial.provider_meta && typeof initial.provider_meta === "object"
+        ? (initial.provider_meta as Record<string, unknown>)
+        : {};
+
+    if (initial.task_id && providerMeta.poll_endpoint && !initial.url) {
+      await scheduleWorkspaceJobRetry({
+        supabase: args.supabase,
+        job,
+        workerId: args.workerId,
+        message: "Provider accepted the job and is processing.",
+        delaySeconds: workspaceJobPollDelaySeconds(initialWithCredits),
+        result: initialWithCredits,
+      });
+      return { job_id: job.id, status: "running", detail: "async_submitted" };
+    }
+
+    await completeWorkspaceJob({ supabase: args.supabase, job, result: initialWithCredits });
+    return { job_id: job.id, status: "completed" };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const permanent = isPermanentWorkspaceJobError(msg);
+    if (permanent) {
+      await failWorkspaceJob({
+        supabase: args.supabase,
+        job: { ...job, attempts: attempt, last_error: msg },
+        status: "permanent_failed",
+        error: msg,
+        refundReason: `workspace job failed: ${msg.substring(0, 160)}`,
+      });
+      return { job_id: job.id, status: "permanent_failed", detail: msg.substring(0, 120) };
+    }
+
+    const delaySeconds = workspaceJobBackoffSeconds(attempt);
+    await args.supabase
+      .from("workspace_generation_jobs")
+      .update({
+        status: "running",
+        attempts: attempt,
+        last_error: msg.substring(0, 1000),
+        worker_heartbeat_at: new Date().toISOString(),
+      })
+      .eq("id", job.id);
+    await releaseWorkspaceJobLock({
+      supabase: args.supabase,
+      jobId: job.id,
+      workerId: args.workerId,
+      runAfterSeconds: delaySeconds,
+    });
+    return { job_id: job.id, status: "running", detail: `retry_in_${delaySeconds}s` };
+  }
+}
+
+async function expireWorkspaceGenerationJobs(args: {
+  supabase: ReturnType<typeof createClient>;
+}): Promise<number> {
+  const { data, error } = await args.supabase
+    .from("workspace_generation_jobs")
+    .select("*")
+    .in("status", ["queued", "running"])
+    .lte("deadline_at", new Date().toISOString())
+    .order("deadline_at", { ascending: true })
+    .limit(WORKSPACE_JOB_EXPIRE_SWEEP_LIMIT);
+
+  if (error) {
+    console.error("[workspace-job-worker] expire query failed", error.message);
+    return 0;
+  }
+
+  const jobs = (data ?? []) as WorkspaceJobRow[];
+  for (const job of jobs) {
+    const msg = `Provider queue was busy for ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes. Generation timed out and credits were refunded.`;
+    try {
+      await failWorkspaceJob({
+        supabase: args.supabase,
+        job,
+        status: "failed",
+        error: msg,
+        refundReason: `workspace job timed out after ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes`,
+      });
+    } catch (err) {
+      console.error(
+        "[workspace-job-worker] expire failed",
+        job.id,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+  return jobs.length;
+}
+
+async function runWorkspaceGenerationWorker(args: {
+  supabase: ReturnType<typeof createClient>;
+  functionUrl: string;
+  serviceRoleKey: string;
+  workerSecret: string;
+  requestedJobId?: string | null;
+}): Promise<Record<string, unknown>> {
+  const workerId = `workspace-worker-${crypto.randomUUID().slice(0, 8)}`;
+  const startedAt = Date.now();
+  const expired = await expireWorkspaceGenerationJobs({ supabase: args.supabase });
+
+  let jobs: WorkspaceJobRow[] = [];
+  if (args.requestedJobId) {
+    const { data, error } = await args.supabase.rpc("claim_workspace_generation_job", {
+      p_job_id: args.requestedJobId,
+      p_worker_id: workerId,
+      p_lock_duration_sec: WORKSPACE_JOB_LOCK_SEC,
+    });
+    if (error) throw error;
+    if (data) jobs = [data as WorkspaceJobRow];
+  } else {
+    const { data, error } = await args.supabase.rpc("claim_workspace_generation_jobs", {
+      p_worker_id: workerId,
+      p_batch_size: WORKSPACE_JOB_WORKER_BATCH_SIZE,
+      p_lock_duration_sec: WORKSPACE_JOB_LOCK_SEC,
+    });
+    if (error) throw error;
+    jobs = (data ?? []) as WorkspaceJobRow[];
+  }
+
+  const settled = await Promise.allSettled(
+    jobs.map((job) =>
+      processWorkspaceGenerationJobTick({
+        supabase: args.supabase,
+        job,
+        workerId,
+        functionUrl: args.functionUrl,
+        serviceRoleKey: args.serviceRoleKey,
+        workerSecret: args.workerSecret,
+      }),
+    ),
+  );
+
+  const results = settled.map((item, index) => {
+    if (item.status === "fulfilled") return item.value;
+    return {
+      job_id: jobs[index]?.id ?? null,
+      status: "worker_error",
+      detail: item.reason instanceof Error ? item.reason.message : String(item.reason),
+    };
+  });
+
+  return {
+    worker: workerId,
+    expired,
+    claimed: jobs.length,
+    results,
+    duration_ms: Date.now() - startedAt,
+  };
+}
+
 async function processWorkspaceGenerationJob(args: {
   supabase: any;
   jobId: string;
   userId: string;
   functionUrl: string;
   authHeader: string;
+  extraHeaders?: Record<string, string>;
 }): Promise<void> {
   const { data: jobRaw, error: jobErr } = await args.supabase
     .from("workspace_generation_jobs")
@@ -4607,6 +5210,7 @@ async function processWorkspaceGenerationJob(args: {
       const initial = await invokeWorkspaceRunOnce({
         functionUrl: args.functionUrl,
         authHeader: args.authHeader,
+        extraHeaders: args.extraHeaders,
         body: request,
       });
       const charged = Number(job.credits_charged ?? 0);
@@ -4632,6 +5236,7 @@ async function processWorkspaceGenerationJob(args: {
       const finalResult = await pollWorkspaceAsyncResult({
         functionUrl: args.functionUrl,
         authHeader: args.authHeader,
+        extraHeaders: args.extraHeaders,
         response: initialWithCredits,
         budgetEndsAt,
       });
@@ -4723,28 +5328,67 @@ serve(async (req) => {
 
   try {
     /* ─── Auth ─────────────────────────────────────────────── */
-    const authHeader = req.headers.get("authorization");
-    if (!authHeader) {
+    let authHeader = req.headers.get("authorization") ?? "";
+    if (
+      !authHeader &&
+      !req.headers.get("x-cron-secret") &&
+      !req.headers.get("x-workspace-worker-secret")
+    ) {
       return new Response(
         JSON.stringify({ error: "Authorization required" }),
         { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
     }
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-    const token = authHeader.replace("Bearer ", "");
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-    if (authError || !user) {
+    const body = (await req.json()) as WorkspaceRunBody;
+    activeBody = body;
+    const workerSecret = await verifyWorkspaceWorkerSecret(supabase, req);
+
+    if (body.action === "run_workspace_job_worker") {
+      if (!workerSecret) {
+        return new Response(
+          JSON.stringify({ error: "unauthorized" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const summary = await runWorkspaceGenerationWorker({
+        supabase,
+        functionUrl: `${SUPABASE_URL}/functions/v1/workspace-run-node`,
+        serviceRoleKey: SUPABASE_SERVICE_ROLE_KEY,
+        workerSecret,
+        requestedJobId: body.job_id ?? null,
+      });
       return new Response(
-        JSON.stringify({ error: "Invalid token" }),
+        JSON.stringify(summary),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    let user: { id: string; email?: string | null } | null = null;
+    const workerUserId = req.headers.get("x-workspace-worker-user-id") ?? "";
+    if (workerSecret && workerUserId) {
+      user = await loadWorkspaceWorkerUser(supabase, workerUserId);
+      authHeader = authHeader || `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`;
+    } else {
+      const token = String(authHeader ?? "").replace("Bearer ", "");
+      const { data: { user: authUser }, error: authError } = await supabase.auth.getUser(token);
+      if (authError || !authUser) {
+        return new Response(
+          JSON.stringify({ error: "Invalid token" }),
+          { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      user = { id: authUser.id, email: authUser.email ?? null };
+    }
+    if (!user) {
+      return new Response(
+        JSON.stringify({ error: "Invalid worker user" }),
         { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
     }
     activeUserId = user.id;
 
     /* ─── Parse body ───────────────────────────────────────── */
-    const body = (await req.json()) as WorkspaceRunBody;
-    activeBody = body;
-
     if (body.action === "get_workspace_job") {
       const jobId = String(body.job_id ?? "").trim();
       if (!jobId) {
@@ -4805,6 +5449,27 @@ serve(async (req) => {
         );
       }
 
+      if (
+        !["completed", "failed", "permanent_failed"].includes(job.status) &&
+        Date.now() >= workspaceJobDeadlineMs(job)
+      ) {
+        const msg = `Provider queue was busy for ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes. Generation timed out and credits were refunded.`;
+        await failWorkspaceJob({
+          supabase,
+          job,
+          status: "failed",
+          error: msg,
+          refundReason: `workspace job timed out after ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes`,
+        });
+        job = await loadJob();
+        if (!job) {
+          return new Response(
+            JSON.stringify({ error: "job not found" }),
+            { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+      }
+
       if (["completed", "failed", "permanent_failed"].includes(job.status)) {
         return new Response(
           JSON.stringify({ job }),
@@ -4832,34 +5497,22 @@ serve(async (req) => {
 
         if (outcome.state === "succeeded") {
           const charged = Number(job.credits_charged ?? 0);
-          await supabase
-            .from("workspace_generation_jobs")
-            .update({
-              status: "completed",
-              result: {
-                ...outcome.result,
-                credits_spent: Number.isFinite(charged) ? charged : 0,
-              },
-              error: null,
-              last_error: null,
-              completed_at: new Date().toISOString(),
-            })
-            .eq("id", job.id);
-        } else if (outcome.state === "failed") {
-          const msg = outcome.message.substring(0, 1000);
-          await supabase
-            .from("workspace_generation_jobs")
-            .update({
-              status: "failed",
-              error: msg,
-              last_error: msg,
-              completed_at: new Date().toISOString(),
-            })
-            .eq("id", job.id);
-          await refundWorkspaceJobCharge({
+          await completeWorkspaceJob({
             supabase,
             job,
-            reason: `workspace async task failed: ${msg.substring(0, 160)}`,
+            result: {
+              ...outcome.result,
+              credits_spent: Number.isFinite(charged) ? charged : 0,
+            },
+          });
+        } else if (outcome.state === "failed") {
+          const msg = outcome.message.substring(0, 1000);
+          await failWorkspaceJob({
+            supabase,
+            job,
+            status: "failed",
+            error: msg,
+            refundReason: `workspace async task failed: ${msg.substring(0, 160)}`,
           });
         } else if (outcome.state === "pending") {
           await supabase
@@ -4954,6 +5607,8 @@ serve(async (req) => {
             precharged_credits: jobCharge?.amount ?? 0,
           },
           status: "queued",
+          run_after: new Date().toISOString(),
+          deadline_at: new Date(Date.now() + WORKSPACE_JOB_MAX_MS).toISOString(),
           max_attempts: 18,
           credits_charged: jobCharge?.amount ?? 0,
           credit_team_id: jobCharge?.teamId ?? null,
@@ -4976,13 +5631,23 @@ serve(async (req) => {
       }
 
       const jobId = String(inserted.id);
-      const bgTask = processWorkspaceGenerationJob({
-        supabase,
-        jobId,
-        userId: user.id,
-        functionUrl: `${SUPABASE_URL}/functions/v1/workspace-run-node`,
-        authHeader,
-      }).catch(async (err) => {
+      const immediateWorkerSecret = await getWorkspaceWorkerSecret(supabase);
+      const bgTask = immediateWorkerSecret
+        ? runWorkspaceGenerationWorker({
+            supabase,
+            functionUrl: `${SUPABASE_URL}/functions/v1/workspace-run-node`,
+            serviceRoleKey: SUPABASE_SERVICE_ROLE_KEY,
+            workerSecret: immediateWorkerSecret,
+            requestedJobId: jobId,
+          })
+        : processWorkspaceGenerationJob({
+            supabase,
+            jobId,
+            userId: user.id,
+            functionUrl: `${SUPABASE_URL}/functions/v1/workspace-run-node`,
+            authHeader,
+          });
+      const guardedBgTask = bgTask.catch(async (err) => {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[workspace-job] bg crash job=${jobId}: ${msg}`);
         const { data: crashedJob } = await supabase
@@ -5002,7 +5667,10 @@ serve(async (req) => {
                 status: "running",
                 error: null,
                 last_error:
-                  "Background worker stopped before the provider finished; browser polling is continuing.",
+                  "Background worker stopped before the provider finished; durable worker will continue polling.",
+                locked_by: null,
+                lock_expires_at: null,
+                run_after: new Date(Date.now() + 15_000).toISOString(),
               })
               .eq("id", jobId);
             return;
@@ -5024,8 +5692,8 @@ serve(async (req) => {
           .eq("id", jobId);
       });
       const er = (globalThis as { EdgeRuntime?: { waitUntil: (p: Promise<unknown>) => void } }).EdgeRuntime;
-      if (er?.waitUntil) er.waitUntil(bgTask);
-      else bgTask.catch((e) => console.error("[workspace-job][bg-fallback]", e));
+      if (er?.waitUntil) er.waitUntil(guardedBgTask);
+      else guardedBgTask.catch((e) => console.error("[workspace-job][bg-fallback]", e));
 
       return new Response(
         JSON.stringify({

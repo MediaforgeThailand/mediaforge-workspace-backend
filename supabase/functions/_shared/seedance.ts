@@ -63,14 +63,24 @@ export interface SeedanceTaskCreate {
   /**
    * Ark "content" array — multimodal. Each item is one of:
    *   - { type: "text", text }                                     (prompt)
-   *   - { type: "image_url",  image_url:  { url }, role? }         (ref image)
+   *   - { type: "image_url",  image_url:  { url }, role? }         (ref image / keyframe)
    *   - { type: "video_url",  video_url:  { url }, role? }         (ref video, 2.0+)
    *   - { type: "audio_url",  audio_url:  { url }, role? }         (ref audio, 2.0+)
    *
-   * Roles per BytePlus 2.0 spec are `reference_image`,
-   * `reference_video`, `reference_audio`. Legacy 1.x omits the
-   * role entirely on image_url and still accepts trailing
-   * `--flag` tokens inline in the prompt text.
+   * BytePlus 2.0 spec defines TWO mutually-exclusive image modes
+   * (per official docs verified 2026-04 — see comment block in
+   * buildSeedanceContent for the verbatim role-string list):
+   *   - keyframe mode → roles `first_frame` / `last_frame`
+   *   - multimodal-ref mode → roles `reference_image` /
+   *     `reference_video` / `reference_audio`
+   * Mixing both modes in one request returns 400. Workspace UI
+   * surfaces only start_frame/end_frame for Seedance, so we only
+   * emit the keyframe roles from this builder; ref_video/ref_audio
+   * still use the multimodal-ref roles for 2.0 callers that wire
+   * those slots.
+   *
+   * Legacy 1.x omits the role entirely on image_url and still
+   * accepts trailing `--flag` tokens inline in the prompt text.
    */
   content: Array<Record<string, unknown>>;
   /* ── Top-level generation params (Seedance 2.0 spec). ──
@@ -151,11 +161,22 @@ export interface BuiltSeedanceBody {
  *   - 1.x → inline `--flag value` tokens trailing the prompt text
  *           (BytePlus parses them server-side); image_url has no role.
  *   - 2.0 → top-level fields (`ratio`, `duration`, `generate_audio`,
- *           `watermark`, `seed`) sit beside `content`; ref images
- *           carry `role: "reference_image"`, video carries
- *           `role: "reference_video"`, audio carries
- *           `role: "reference_audio"`. (Confirmed against the
- *           BytePlus official curl examples on 2026-04-30.)
+ *           `watermark`, `seed`) sit beside `content`; image roles
+ *           split into TWO mutually-exclusive modes:
+ *             • Keyframe mode → `first_frame` / `last_frame`
+ *               (used for start-frame and end-frame inputs)
+ *             • Multimodal-ref mode → `reference_image` /
+ *               `reference_video` / `reference_audio`
+ *               (used for character / style / clip references)
+ *           Mixing the two modes in a single request → 400. Verified
+ *           against the official BytePlus ModelArk API reference
+ *           docs (Apr 2026, page 1520757):
+ *             - "For first-and-last-frame generation, pass two image
+ *                items and set role to first_frame and last_frame."
+ *             - "Mode 1 is frame-guided generation … Mode 2 is
+ *                multimodal reference generation … the parameter
+ *                'content' specified is not valid with first/last
+ *                frame content mixed with reference media content."
  *
  * Pass `{ v2: true }` for the dreamina-seedance-* family; default
  * stays on 1.x flag-encoding for backwards compatibility.
@@ -169,18 +190,24 @@ export function buildSeedanceContent(
     const content: Array<Record<string, unknown>> = [
       { type: "text", text: p.prompt.trim() },
     ];
+    // start_frame / end_frame → keyframe-mode roles (first_frame /
+    // last_frame). NOT reference_image: the BytePlus API treats
+    // those as different modes and rejects the call when keyframe
+    // intent is sent under reference_image semantics — the model
+    // ends up animating around the image instead of using it as
+    // the literal first/last frame.
     if (p.startFrameUrl) {
       content.push({
         type: "image_url",
         image_url: { url: p.startFrameUrl },
-        role: "reference_image",
+        role: "first_frame",
       });
     }
     if (p.endFrameUrl) {
       content.push({
         type: "image_url",
         image_url: { url: p.endFrameUrl },
-        role: "reference_image",
+        role: "last_frame",
       });
     }
     if (p.referenceVideoUrl) {

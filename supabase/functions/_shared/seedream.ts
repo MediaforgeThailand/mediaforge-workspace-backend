@@ -65,10 +65,15 @@ export interface SeedreamGenerateRequest {
   response_format?: "url" | "b64_json";
   /** Optional seed for reproducibility. */
   seed?: number;
-  /** Optional reference image URL (image-to-image / variation). Some
-   *  Seedream variants ignore this — passed through anyway and
-   *  the model decides. */
-  image?: string;
+  /** Optional reference image URLs for image-to-image / image editing.
+   *  BytePlus ModelArk Seedream 4.5 + 5.0 both expect an ARRAY here
+   *  under the `image_urls` key (max 14 references, ≤10 MB each, jpg/
+   *  png/webp/bmp/tiff/gif). The legacy singular `image` key from
+   *  Seedream 4.0 is silently ignored on the 4.5 + 5.0 endpoints, so
+   *  the workspace builds the array form unconditionally — that's the
+   *  shape the user is expected to wire in via the canvas ref_image
+   *  port (or the standalone tool's reference image input). */
+  image_urls?: string[];
   /** Optional negative prompt — Seedream supports it on most variants. */
   negative_prompt?: string;
   /** Number of images to return. BytePlus tops out at ~4. */

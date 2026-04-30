@@ -37,33 +37,40 @@ export interface Hyper3dModelEntry {
 }
 
 export const HYPER3D_MODEL_MAP: Record<string, Hyper3dModelEntry> = {
-  // BytePlus ModelArk Hyper3D Gen2 — verified in ap-southeast-1 console
-  // on 2026-04-30. UI slug aliases let the frontend keep using the
-  // unversioned name; the dated ID is what BytePlus expects on the wire.
+  // BytePlus ModelArk Hyper3D Gen2 — confirmed against the official
+  // BytePlus API doc page 2279947 on 2026-04-30 (curl example uses
+  // this exact ID). UI slug aliases let the frontend keep using the
+  // unversioned name; the dated ID is what BytePlus expects on wire.
   "hyper3d-gen2":          { model: "hyper3d-gen2-260112", tier: "gen2", requiresImage: true },
   "hyper3d-gen2-260112":   { model: "hyper3d-gen2-260112", tier: "gen2", requiresImage: true },
   "hyper3d":               { model: "hyper3d-gen2-260112", tier: "gen2", requiresImage: true },
 };
 
 export interface Hyper3dParams {
-  /** HTTPS or data-URI of the reference image to lift to 3D. */
+  /** HTTPS URL (or data URI — but only public URLs are documented) of
+   *  the reference image to lift to 3D. */
   imageUrl: string;
   /** Optional text prompt — improves geometry hints when supplied. */
   prompt?: string;
-  /** Output format hint: "glb" | "obj" | "fbx". Default "glb". */
-  format?: "glb" | "obj" | "fbx";
-  /** Whether to bake textures (PBR). Default true. */
+  /** Whether to bake high-definition textures. Default true.
+   *  Maps to the documented `--hd_texture true|false` prompt flag. */
   texture?: boolean;
-  /** Optional seed for reproducibility. */
+  /** Optional seed for reproducibility. Sent as a TOP-LEVEL field
+   *  (per the BytePlus curl example), not a prompt flag. */
   seed?: number;
 }
 
 export interface Hyper3dTaskCreate {
   model: string;
-  /** Ark "content" array — same shape Seedance uses. Hyper3D reads:
-   *    [{ type: "image_url", image_url: { url } }, { type: "text", text }]
-   *  with optional --format / --texture flags inlined into the text. */
+  /** Ark "content" array — same multimodal shape Seedance uses. Per
+   *  the BytePlus doc page 2279947 the only documented elements are:
+   *    [{ type: "image_url", image_url: { url } }, { type: "text", text? }]
+   *  with knob tokens (--hd_texture, --material PBR, etc.) appended to
+   *  the prompt text. The doc does NOT show a `--format` / `--texture`
+   *  pair — output defaults to GLB. */
   content: Array<Record<string, unknown>>;
+  /** Optional reproducibility seed — top-level field per doc. */
+  seed?: number;
 }
 
 export interface Hyper3dTaskCreateResponse {
@@ -76,9 +83,15 @@ export interface Hyper3dTaskStatus {
   /** "queued" | "running" | "succeeded" | "failed" | "cancelled". */
   status: string;
   content?: {
-    /** Primary model URL (GLB by default). */
+    /** Primary URL — per the BytePlus list-tasks doc (page 2314182)
+     *  this is the ONE documented field for the rendered model file:
+     *      "content": { "file_url": "https://xxx" }
+     *  Earlier code read `model_url` / `glb_url` / `assets[]`; those
+     *  shapes never came back from this endpoint, so the legacy keys
+     *  are kept here only as defensive fallbacks for forward-compat.
+     */
+    file_url?: string;
     model_url?: string;
-    /** Some variants return additional rendered preview / mesh URLs. */
     rendered_image_url?: string;
     obj_url?: string;
     fbx_url?: string;
@@ -88,25 +101,50 @@ export interface Hyper3dTaskStatus {
   usage?: { total_seconds?: number };
 }
 
-/** Build the Ark "content" array from Hyper3D params. */
-export function buildHyper3dContent(p: Hyper3dParams): Array<Record<string, unknown>> {
+/** Result of `buildHyper3dContent` — the `content` array PLUS the
+ *  optional top-level `seed` value. Spread the result straight into
+ *  the body of `submitHyper3dTask`. */
+export interface BuiltHyper3dBody {
+  content: Array<Record<string, unknown>>;
+  seed?: number;
+}
+
+/** Build the Ark request body from Hyper3D params. The shape mirrors
+ *  the BytePlus curl example on page 2279947:
+ *
+ *    { model, content: [{type:"text",...}, {type:"image_url",...}], seed? }
+ *
+ *  Knobs that the doc shows live inside the prompt text as
+ *  `--flag value` tokens (Seedance 1.x style). The doc does NOT list
+ *  `--format` or `--texture` — only `--hd_texture`, `--material`,
+ *  `--mesh_mode`, `--addons`, `--quality_override`,
+ *  `--use_original_alpha`, `--bbox_condition`, `--TAPose`. We forward
+ *  the booleanised `texture` flag as `--hd_texture` and pair it with
+ *  `--material PBR` (the only material value the doc enumerates) so
+ *  the user's "texture on/off" toggle has a real effect. */
+export function buildHyper3dContent(p: Hyper3dParams): BuiltHyper3dBody {
   const flags: string[] = [];
-  if (p.format) flags.push(`--format ${p.format}`);
-  if (p.texture !== undefined) flags.push(`--texture ${p.texture ? "true" : "false"}`);
-  if (typeof p.seed === "number") flags.push(`--seed ${p.seed}`);
+  if (p.texture === true) {
+    flags.push("--hd_texture true", "--material PBR");
+  } else if (p.texture === false) {
+    flags.push("--hd_texture false");
+  }
 
   const promptWithFlags = [p.prompt?.trim() ?? "", ...flags].filter(Boolean).join(" ").trim();
 
-  const content: Array<Record<string, unknown>> = [
-    { type: "image_url", image_url: { url: p.imageUrl } },
-  ];
-  // Only include the text item when there's something to say — sending
-  // an empty text node confuses some BytePlus model loaders.
+  const content: Array<Record<string, unknown>> = [];
+  // Order in the doc example: text first, then image_url(s). Single-
+  // image generation works without a text element, but BytePlus's own
+  // curl example always includes one — keep that contract.
   if (promptWithFlags) {
     content.push({ type: "text", text: promptWithFlags });
   }
+  content.push({ type: "image_url", image_url: { url: p.imageUrl } });
 
-  return content;
+  return {
+    content,
+    ...(typeof p.seed === "number" ? { seed: p.seed } : {}),
+  };
 }
 
 /**
@@ -181,11 +219,14 @@ export async function pollHyper3dOnce(
   return (await res.json()) as Hyper3dTaskStatus;
 }
 
-/** Best-effort URL extraction across the response variants BytePlus
- *  uses for different output formats. */
+/** Best-effort URL extraction. Per the BytePlus list-tasks doc
+ *  (page 2314182) the canonical key is `content.file_url` — read
+ *  that first. Legacy keys remain as defensive fallbacks in case a
+ *  future variant changes the shape (older code expected
+ *  `model_url`/`glb_url`/`obj_url`/`fbx_url`). */
 export function pickHyper3dModelUrl(status: Hyper3dTaskStatus): string {
   const c = status.content ?? {};
-  return c.model_url ?? c.glb_url ?? c.obj_url ?? c.fbx_url ?? "";
+  return c.file_url ?? c.model_url ?? c.glb_url ?? c.obj_url ?? c.fbx_url ?? "";
 }
 
 /**
