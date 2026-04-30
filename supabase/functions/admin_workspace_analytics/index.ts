@@ -75,12 +75,21 @@ function resolveWindow(
   return { since: s, until: u };
 }
 
-interface EventRow {
-  feature: string;
-  model: string;
+interface RecentGenerationRow {
+  id: string;
+  user_id: string | null;
+  feature: string | null;
+  model: string | null;
+  provider: string | null;
   output_tier: string | null;
   output_count: number | null;
   credits_spent: number | null;
+  duration_seconds: number | null;
+  aspect_ratio: string | null;
+  canvas_id: string | null;
+  node_id: string | null;
+  task_id: string | null;
+  params: unknown;
   created_at: string;
 }
 
@@ -121,156 +130,40 @@ async function generationSummary(
   }>;
 }> {
   const { since, until } = resolveWindow(body.since, body.until);
-
-  // Pull the columns we need for every aggregation in a single read.
-  // workspace_generation_events is narrow (10-ish columns) so this is
-  // cheap. We intentionally do NOT pull user_id / canvas_id / task_id
-  // here — the summary is anonymous by design.
-  const { data, error } = await client
-    .from("workspace_generation_events")
-    .select("feature, model, output_tier, output_count, credits_spent, created_at")
-    .gte("created_at", since)
-    .lte("created_at", until)
-    .order("created_at", { ascending: false })
-    .limit(50_000); // safety cap; at 1k rows/day this is ~50 days of data
+  const { data, error } = await client.rpc("admin_workspace_generation_summary", {
+    p_since: since,
+    p_until: until,
+  });
   if (error) {
-    throw new Error(`workspace_generation_events read failed: ${error.message}`);
+    throw new Error(`workspace_generation_events summary failed: ${error.message}`);
   }
-
-  const rows = (data ?? []) as EventRow[];
-
-  const totals = {
-    images: 0,
-    videos: 0,
-    audio: 0,
-    other: 0,
-    grand_total: 0,
-    credits_spent: 0,
-  };
-
-  // Composite keys keep the aggregation in a single pass.
-  // We split by_model AND by_tier on `feature` too so the page can show
-  // "videos by model" vs "images by model" in separate columns if it
-  // wants to (the spec asks for a feature badge in each row).
-  const modelMap = new Map<
-    string,
-    { model: string; feature: string; count: number; credits: number }
-  >();
-  const tierMap = new Map<
-    string,
-    { tier: string; feature: string; count: number }
-  >();
-  const featureMap = new Map<string, number>();
-
-  // 30-day buckets keyed by YYYY-MM-DD (UTC). The admin-hub renders this
-  // as an area chart; missing days are filled with zeros below.
-  const dayMap = new Map<
-    string,
-    { images: number; videos: number; audio: number; other: number }
-  >();
-
-  for (const r of rows) {
-    const count = Math.max(1, Number(r.output_count ?? 1));
-    const credits = Number(r.credits_spent ?? 0);
-    const feature = String(r.feature ?? "other");
-    const model = String(r.model ?? "unknown");
-    const tier = r.output_tier ?? "unknown";
-
-    if (feature === "image") totals.images += count;
-    else if (feature === "video") totals.videos += count;
-    else if (feature === "audio") totals.audio += count;
-    else totals.other += count;
-    totals.grand_total += count;
-    totals.credits_spent += Number.isFinite(credits) ? credits : 0;
-
-    const mk = `${model}__${feature}`;
-    const existing = modelMap.get(mk);
-    if (existing) {
-      existing.count += count;
-      existing.credits += Number.isFinite(credits) ? credits : 0;
-    } else {
-      modelMap.set(mk, {
-        model,
-        feature,
-        count,
-        credits: Number.isFinite(credits) ? credits : 0,
-      });
-    }
-
-    const tk = `${tier}__${feature}`;
-    const tExisting = tierMap.get(tk);
-    if (tExisting) tExisting.count += count;
-    else tierMap.set(tk, { tier, feature, count });
-
-    featureMap.set(feature, (featureMap.get(feature) ?? 0) + count);
-
-    // Bucket the day (UTC).
-    const d = new Date(r.created_at);
-    if (!Number.isNaN(d.getTime())) {
-      const key = d.toISOString().slice(0, 10); // YYYY-MM-DD
-      const day = dayMap.get(key) ?? {
-        images: 0,
-        videos: 0,
-        audio: 0,
-        other: 0,
-      };
-      if (feature === "image") day.images += count;
-      else if (feature === "video") day.videos += count;
-      else if (feature === "audio") day.audio += count;
-      else day.other += count;
-      dayMap.set(key, day);
-    }
-  }
-
-  // Sort by count desc — that's how the page wants both tables.
-  const by_model = [...modelMap.values()].sort((a, b) => b.count - a.count);
-  const by_tier = [...tierMap.values()].sort((a, b) => b.count - a.count);
-  const by_feature = [...featureMap.entries()]
-    .map(([feature, count]) => ({ feature, count }))
-    .sort((a, b) => b.count - a.count);
-
-  // Fill missing days so the chart has a contiguous x-axis.
-  const timeseries: Array<{
-    date: string;
-    images: number;
-    videos: number;
-    audio: number;
-    other: number;
-  }> = [];
-  const sinceMs = new Date(since).getTime();
-  const untilMs = new Date(until).getTime();
-  const dayMs = 24 * 60 * 60 * 1000;
-  // Walk backwards from until → since, day-by-day. Cap at 60 entries to
-  // protect the JSON response size if the operator passes a wide window.
-  const days: string[] = [];
-  for (
-    let t = Math.floor(untilMs / dayMs) * dayMs;
-    t >= sinceMs && days.length < 60;
-    t -= dayMs
-  ) {
-    days.push(new Date(t).toISOString().slice(0, 10));
-  }
-  days.reverse(); // oldest → newest, chart-friendly
-  for (const date of days) {
-    const day = dayMap.get(date) ?? {
-      images: 0,
-      videos: 0,
-      audio: 0,
-      other: 0,
+  return data as {
+    range: { since: string; until: string };
+    totals: {
+      images: number;
+      videos: number;
+      audio: number;
+      other: number;
+      grand_total: number;
+      credits_spent: number;
     };
-    timeseries.push({ date, ...day });
-  }
-
-  return {
-    range: { since, until },
-    totals,
-    by_model,
-    by_tier,
-    by_feature,
-    timeseries,
+    by_model: Array<{
+      model: string;
+      feature: string;
+      count: number;
+      credits: number;
+    }>;
+    by_tier: Array<{ tier: string; feature: string; count: number }>;
+    by_feature: Array<{ feature: string; count: number }>;
+    timeseries: Array<{
+      date: string;
+      images: number;
+      videos: number;
+      audio: number;
+      other: number;
+    }>;
   };
 }
-
 /** recent_generations — paged window into workspace_generation_events.
  *  Honours the same `since`/`until` window as generation_summary so the
  *  admin page's date-range picker re-keys both queries together.
@@ -344,7 +237,7 @@ async function recentGenerations(
   }
 
   return {
-    rows: (data ?? []).map((r: any) => ({
+    rows: ((data ?? []) as RecentGenerationRow[]).map((r) => ({
       id: String(r.id),
       user_id: r.user_id ?? null,
       feature: String(r.feature ?? ""),

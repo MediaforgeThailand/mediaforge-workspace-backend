@@ -15,6 +15,18 @@ function json(body: unknown, status = 200) {
   });
 }
 
+function clampLimit(raw: unknown, fallback = 50, max = 100): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(Math.floor(n), max);
+}
+
+function clampPage(raw: unknown): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n);
+}
+
 async function verifyAdmin(req: Request) {
   const auth = req.headers.get("Authorization");
   if (!auth?.startsWith("Bearer ")) return null;
@@ -53,21 +65,13 @@ Deno.serve(async (req) => {
   try {
     switch (action) {
       case "get_dashboard_stats": {
-        const [flowsRes, reviewsRes, revenueRes] = await Promise.all([
-          supabase.from("flows").select("status", { count: "exact" }),
-          supabase.from("flow_reviews").select("*", { count: "exact" }).eq("decision", "pending"),
-          supabase.from("flow_metrics").select("total_revenue"),
-        ]);
-        const statusCounts: Record<string, number> = {};
-        (flowsRes.data || []).forEach((f: { status: string }) => {
-          statusCounts[f.status] = (statusCounts[f.status] || 0) + 1;
-        });
-        const totalRevenue = (revenueRes.data || []).reduce((s: number, m: { total_revenue: number }) => s + m.total_revenue, 0);
-        return json({
-          statusCounts,
-          pendingReviews: reviewsRes.count || 0,
-          totalRevenue,
-          totalFlows: flowsRes.count || 0,
+        const { data, error } = await supabase.rpc("admin_dashboard_stats");
+        if (error) return json({ error: error.message }, 500);
+        return json(data ?? {
+          statusCounts: {},
+          pendingReviews: 0,
+          totalRevenue: 0,
+          totalFlows: 0,
         });
       }
 
@@ -87,7 +91,7 @@ Deno.serve(async (req) => {
         if (error) return json({ error: error.message }, 500);
 
         const flowIds = (data || []).map((f: { id: string }) => f.id);
-        let reviewCounts: Record<string, number> = {};
+        const reviewCounts: Record<string, number> = {};
         if (flowIds.length > 0) {
           const { data: reviews } = await supabase
             .from("flow_reviews")
@@ -106,12 +110,19 @@ Deno.serve(async (req) => {
       }
 
       case "get_flow_detail": {
-        const { flow_id } = body;
+        const { flow_id, reviews_page = 0, reviews_limit = 50 } = body;
         if (!flow_id) return json({ error: "flow_id required" }, 400);
+        const reviewPage = clampPage(reviews_page);
+        const reviewLimit = clampLimit(reviews_limit, 50, 100);
         const [flowRes, nodesRes, reviewsRes, badgesRes] = await Promise.all([
           supabase.from("flows").select("*").eq("id", flow_id).single(),
           supabase.from("flow_nodes").select("*").eq("flow_id", flow_id).order("sort_order"),
-          supabase.from("flow_reviews").select("*").eq("flow_id", flow_id).order("created_at", { ascending: false }),
+          supabase
+            .from("flow_reviews")
+            .select("*", { count: "exact" })
+            .eq("flow_id", flow_id)
+            .order("created_at", { ascending: false })
+            .range(reviewPage * reviewLimit, (reviewPage + 1) * reviewLimit - 1),
           supabase.from("flow_badges").select("*").eq("flow_id", flow_id),
         ]);
         if (flowRes.error) return json({ error: flowRes.error.message }, 404);
@@ -119,6 +130,9 @@ Deno.serve(async (req) => {
           flow: flowRes.data,
           nodes: nodesRes.data || [],
           reviews: reviewsRes.data || [],
+          reviews_total: reviewsRes.count || 0,
+          reviews_page: reviewPage,
+          reviews_limit: reviewLimit,
           badges: badgesRes.data || [],
         });
       }
@@ -250,11 +264,15 @@ Deno.serve(async (req) => {
 
       case "list_admins": {
         if (admin.role !== "super_admin") return json({ error: "Super admin required" }, 403);
-        const { data } = await supabase
+        const { page = 0, limit = 100 } = body;
+        const safePage = clampPage(page);
+        const safeLimit = clampLimit(limit, 100, 100);
+        const { data, count } = await supabase
           .from("admin_accounts")
-          .select("id, email, display_name, admin_role, is_active, last_login_at, created_at")
-          .order("created_at");
-        return json({ admins: data || [] });
+          .select("id, email, display_name, admin_role, is_active, last_login_at, created_at", { count: "exact" })
+          .order("created_at")
+          .range(safePage * safeLimit, (safePage + 1) * safeLimit - 1);
+        return json({ admins: data || [], total: count || 0, page: safePage, limit: safeLimit });
       }
 
       case "create_admin": {
@@ -334,7 +352,8 @@ Deno.serve(async (req) => {
         const { data: sections, error } = await supabase
           .from("homepage_sections")
           .select("*")
-          .order("sort_order");
+          .order("sort_order")
+          .limit(100);
         if (error) return json({ error: error.message }, 500);
 
         const sectionIds = (sections || []).map((s: any) => s.id);
@@ -342,7 +361,8 @@ Deno.serve(async (req) => {
           .from("homepage_featured")
           .select("id, flow_id, section_id, sort_order, is_active, flows(id, name, thumbnail_url, status, category, selling_price)")
           .in("section_id", sectionIds.length ? sectionIds : ["00000000-0000-0000-0000-000000000000"])
-          .order("sort_order");
+          .order("sort_order")
+          .limit(500);
 
         const featuredBySection: Record<string, any[]> = {};
         (featured || []).forEach((f: any) => {
@@ -468,17 +488,24 @@ Deno.serve(async (req) => {
       }
 
       case "get_user_detail": {
-        const { user_id: targetUserId } = body;
+        const { user_id: targetUserId, flows_page = 0, flows_limit = 50 } = body;
         if (!targetUserId) return json({ error: "user_id required" }, 400);
+        const flowsPage = clampPage(flows_page);
+        const flowsLimit = clampLimit(flows_limit, 50, 100);
 
         const [profileRes, creditsRes, txRes, runsRes] = await Promise.all([
           supabase.from("profiles").select("*").eq("user_id", targetUserId).single(),
           supabase.from("user_credits").select("*").eq("user_id", targetUserId).single(),
           supabase.from("credit_transactions").select("*").eq("user_id", targetUserId).order("created_at", { ascending: false }).limit(50),
           supabase.from("flow_runs").select("id, flow_id, status, credits_used, started_at, completed_at, duration_ms").eq("user_id", targetUserId).order("started_at", { ascending: false }).limit(50),
-        ]);
+         ]);
 
-        const { data: flowsData } = await supabase.from("flows").select("id, name, status, is_official, created_at").eq("user_id", targetUserId).order("created_at", { ascending: false });
+        const { data: flowsData, count: flowsTotal } = await supabase
+          .from("flows")
+          .select("id, name, status, is_official, created_at", { count: "exact" })
+          .eq("user_id", targetUserId)
+          .order("created_at", { ascending: false })
+          .range(flowsPage * flowsLimit, (flowsPage + 1) * flowsLimit - 1);
 
         return json({
           profile: profileRes.data,
@@ -486,21 +513,26 @@ Deno.serve(async (req) => {
           transactions: txRes.data || [],
           flow_runs: runsRes.data || [],
           flows: flowsData || [],
+          flows_total: flowsTotal || 0,
+          flows_page: flowsPage,
+          flows_limit: flowsLimit,
         });
       }
 
       case "get_user_logs": {
         const { user_id: logUserId, log_type = "transactions", page = 0, limit = 50 } = body;
         if (!logUserId) return json({ error: "user_id required" }, 400);
+        const safePage = clampPage(page);
+        const safeLimit = clampLimit(limit, 50, 100);
 
         if (log_type === "transactions") {
-          const { data, error } = await supabase.from("credit_transactions").select("*").eq("user_id", logUserId).order("created_at", { ascending: false }).range(page * limit, (page + 1) * limit - 1);
+          const { data, error } = await supabase.from("credit_transactions").select("*").eq("user_id", logUserId).order("created_at", { ascending: false }).range(safePage * safeLimit, (safePage + 1) * safeLimit - 1);
           if (error) return json({ error: error.message }, 500);
-          return json({ logs: data || [] });
+          return json({ logs: data || [], page: safePage, limit: safeLimit });
         } else if (log_type === "flow_runs") {
-          const { data, error } = await supabase.from("flow_runs").select("id, flow_id, status, credits_used, started_at, completed_at, duration_ms, error_message").eq("user_id", logUserId).order("started_at", { ascending: false }).range(page * limit, (page + 1) * limit - 1);
+          const { data, error } = await supabase.from("flow_runs").select("id, flow_id, status, credits_used, started_at, completed_at, duration_ms, error_message").eq("user_id", logUserId).order("started_at", { ascending: false }).range(safePage * safeLimit, (safePage + 1) * safeLimit - 1);
           if (error) return json({ error: error.message }, 500);
-          return json({ logs: data || [] });
+          return json({ logs: data || [], page: safePage, limit: safeLimit });
         }
         return json({ error: "Invalid log_type" }, 400);
       }

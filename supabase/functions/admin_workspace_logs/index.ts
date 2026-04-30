@@ -266,7 +266,7 @@ async function listFlowRunsForGenLog(
 ): Promise<{ rows: unknown[]; total: number; limit: number; offset: number }> {
   const statuses = generationStatusToWorkspaceStatuses(status);
   if (statuses.length === 0) return { rows: [], total: 0, limit, offset };
-  let q = client
+  const q = client
     .from("workspace_generation_jobs")
     .select("*", { count: "exact" })
     .in("status", statuses)
@@ -297,20 +297,13 @@ async function getFlowRunsStats(
   client: SupabaseClient,
 ): Promise<{ since: string; counts: Record<string, number> }> {
   const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-  const { data, error } = await client
-    .from("workspace_generation_jobs")
-    .select("status, credits_refunded")
-    .gte("created_at", since);
+  const { data, error } = await client.rpc("workspace_generation_status_counts", {
+    p_since: since,
+  });
   if (error) {
     throw new Error(`workspace_generation_jobs stats read failed: ${error.message}`);
   }
-  const counts: Record<string, number> = { total: 0 };
-  for (const row of data ?? []) {
-    const s = workspaceStatusToGenerationStatus(row as Record<string, unknown>);
-    counts.total += 1;
-    counts[s] = (counts[s] ?? 0) + 1;
-  }
-  return { since, counts };
+  return data as { since: string; counts: Record<string, number> };
 }
 
 /**
