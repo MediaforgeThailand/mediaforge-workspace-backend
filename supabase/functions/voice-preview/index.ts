@@ -119,12 +119,23 @@ async function synthesiseGoogle(voiceId: string): Promise<Uint8Array> {
   return bytes;
 }
 
-async function synthesiseGemini(voiceId: string): Promise<Uint8Array> {
+async function synthesiseGemini(
+  voiceId: string,
+  modelId: string,
+): Promise<Uint8Array> {
   const apiKey =
     Deno.env.get("GOOGLE_AI_STUDIO_KEY") ?? Deno.env.get("GEMINI_API_KEY");
   if (!apiKey) throw new Error("GEMINI_API_KEY not configured");
   const text = sampleTextFor("gemini", voiceId);
-  const model = "gemini-2.5-flash-preview-tts";
+  // Use the user-selected Gemini model so Pro and Flash each preview
+  // with their actual voice (they share voice ids but render slightly
+  // differently). Hard-coding flash made every preview sound like
+  // flash even when the user picked Pro.
+  const allowed = new Set([
+    "gemini-2.5-pro-preview-tts",
+    "gemini-2.5-flash-preview-tts",
+  ]);
+  const model = allowed.has(modelId) ? modelId : "gemini-2.5-pro-preview-tts";
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const res = await fetch(url, {
@@ -187,14 +198,36 @@ function pcmToWav(
   return wav;
 }
 
-async function synthesiseElevenLabs(voiceId: string): Promise<Uint8Array> {
-  const apiKey = Deno.env.get("ELEVENLABS_API_KEY");
-  if (!apiKey) throw new Error("ELEVENLABS_API_KEY not configured");
+/** ElevenLabs API key — accepts either name. The Supabase secret was
+ *  set as `ELEVEN_API_KEY` (the form on Freepik / public docs uses
+ *  the short form), but our earlier draft used `ELEVENLABS_API_KEY`.
+ *  Reading both means we don't have to make admins rename the secret
+ *  to match our code; whichever they set wins. */
+function elevenApiKey(): string | undefined {
+  return (
+    Deno.env.get("ELEVEN_API_KEY") ?? Deno.env.get("ELEVENLABS_API_KEY")
+  );
+}
+
+async function synthesiseElevenLabs(
+  voiceId: string,
+  modelId: string,
+): Promise<Uint8Array> {
+  const apiKey = elevenApiKey();
+  if (!apiKey) {
+    throw new Error(
+      "ElevenLabs not configured — set ELEVEN_API_KEY in Supabase project secrets.",
+    );
+  }
   const text = sampleTextFor("elevenlabs", voiceId);
-  // `eleven_turbo_v2_5` is the cheapest tier and has multi-lingual
-  // coverage — perfect for short sample previews. The user-facing
-  // generation flow can use a higher-fidelity model; previews are
-  // strictly about giving the user a vibe of the voice.
+  // model_id is now driven by the caller so a preview reflects the
+  // exact model the user has selected (Multilingual v2 vs Turbo v2.5
+  // sound noticeably different — clipping the preview to one model
+  // mis-represents the others). Falls back to Turbo v2.5 if the
+  // caller didn't pass one.
+  const safeModel = modelId && /^eleven[_a-z0-9-]+$/i.test(modelId)
+    ? modelId
+    : "eleven_turbo_v2_5";
   const url =
     `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`;
   const res = await fetch(url, {
@@ -206,7 +239,7 @@ async function synthesiseElevenLabs(voiceId: string): Promise<Uint8Array> {
     },
     body: JSON.stringify({
       text,
-      model_id: "eleven_turbo_v2_5",
+      model_id: safeModel,
       voice_settings: { stability: 0.55, similarity_boost: 0.75 },
     }),
   });
@@ -266,9 +299,11 @@ serve(async (req) => {
     const body = (await req.json()) as {
       provider?: string;
       voice_id?: string;
+      model_id?: string;
     };
     const provider = String(body.provider ?? "").toLowerCase() as Provider;
     const voiceId = String(body.voice_id ?? "").trim();
+    const modelId = String(body.model_id ?? "").trim();
     if (!ALLOWED_PROVIDERS.has(provider)) {
       return new Response(
         JSON.stringify({ error: "Invalid provider" }),
@@ -291,12 +326,23 @@ serve(async (req) => {
     });
 
     const ext = provider === "gemini" ? "wav" : "mp3";
-    const cachePath = `${provider}/${voiceId}.${ext}`;
+    // Cache key includes the model so two different Gemini /
+    // ElevenLabs models for the same voice id don't share a cached
+    // sample (they sound noticeably different). Google TTS doesn't
+    // have a per-call model concept — the voice id IS the model — so
+    // its cache key stays voice-only.
+    const modelSlug = (modelId || "default").replace(/[^A-Za-z0-9._-]+/g, "-");
+    const cachePath =
+      provider === "google"
+        ? `${provider}/${voiceId}.${ext}`
+        : `${provider}/${modelSlug}/${voiceId}.${ext}`;
+    const probeDir =
+      provider === "google" ? provider : `${provider}/${modelSlug}`;
 
     // Quick existence probe — list with a search filter.
     const { data: listData } = await supabaseAdmin.storage
       .from("voice-previews")
-      .list(provider, { search: `${voiceId}.${ext}`, limit: 1 });
+      .list(probeDir, { search: `${voiceId}.${ext}`, limit: 1 });
     const cached = (listData ?? []).find((o) => o.name === `${voiceId}.${ext}`);
     if (cached) {
       const { data: pub } = supabaseAdmin.storage
@@ -308,6 +354,7 @@ serve(async (req) => {
           cached: true,
           provider,
           voice_id: voiceId,
+          model_id: modelId || null,
         }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
@@ -321,15 +368,15 @@ serve(async (req) => {
         bytes = await synthesiseGoogle(voiceId);
         contentType = "audio/mpeg";
       } else if (provider === "gemini") {
-        bytes = await synthesiseGemini(voiceId);
+        bytes = await synthesiseGemini(voiceId, modelId);
         contentType = "audio/wav";
       } else {
-        bytes = await synthesiseElevenLabs(voiceId);
+        bytes = await synthesiseElevenLabs(voiceId, modelId);
         contentType = "audio/mpeg";
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[voice-preview] synth failed provider=${provider} voice=${voiceId}: ${msg}`);
+      console.error(`[voice-preview] synth failed provider=${provider} voice=${voiceId} model=${modelId}: ${msg}`);
       return new Response(
         JSON.stringify({ error: msg }),
         { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } },

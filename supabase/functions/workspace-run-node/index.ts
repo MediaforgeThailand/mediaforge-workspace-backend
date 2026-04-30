@@ -2302,6 +2302,24 @@ async function executeGoogleTts(
   };
 }
 
+/** Coerce `params[key]` to a number clamped to [min,max]; falls back
+ *  to `def` for anything that isn't a finite number in range. Used by
+ *  the ElevenLabs executor to keep slider knobs within the API's
+ *  documented bounds (e.g. stability 0–1, speed 0.7–1.2). */
+function clampNum(
+  raw: unknown,
+  min: number,
+  max: number,
+  def: number,
+): number {
+  if (raw === undefined || raw === null || raw === "") return def;
+  const n = typeof raw === "number" ? raw : parseFloat(String(raw));
+  if (!Number.isFinite(n)) return def;
+  if (n < min) return min;
+  if (n > max) return max;
+  return n;
+}
+
 /**
  * executeElevenLabsTts — ElevenLabs Text-to-Speech.
  *
@@ -2332,10 +2350,15 @@ async function executeElevenLabsTts(
   supabaseClient: ReturnType<typeof createClient>,
   userId: string,
 ): Promise<ProviderResult> {
-  const apiKey = Deno.env.get("ELEVENLABS_API_KEY");
+  // Accept either env var name — admins set this as either
+  // `ELEVEN_API_KEY` (matches the public form on Freepik / docs)
+  // or `ELEVENLABS_API_KEY` (our earlier draft). Whichever is set
+  // wins.
+  const apiKey =
+    Deno.env.get("ELEVEN_API_KEY") ?? Deno.env.get("ELEVENLABS_API_KEY");
   if (!apiKey) {
     throw new Error(
-      "ElevenLabs not configured — set ELEVENLABS_API_KEY in Supabase project secrets (workspace dev).",
+      "ElevenLabs not configured — set ELEVEN_API_KEY in Supabase project secrets (workspace dev).",
     );
   }
 
@@ -2345,9 +2368,10 @@ async function executeElevenLabsTts(
     throw new Error("Script too long — max 5,000 characters per audio gen.");
   }
 
-  // ElevenLabs preset default voice ("Rachel"). Frontend voice picker
-  // populates `voice` with the actual id when the user picks one.
-  const voiceId = String(params.voice ?? "21m00Tcm4TlvDq8ikWAM");
+  const voiceId = String(params.voice ?? "").trim();
+  if (!voiceId || !/^[A-Za-z0-9_-]{8,}$/.test(voiceId)) {
+    throw new Error("Validation: ElevenLabs requires a valid `voice` id.");
+  }
 
   // Map our model slug to ElevenLabs model_id. Anything starting with
   // `elevenlabs-` is an in-house alias; we accept the API names too
@@ -2356,24 +2380,59 @@ async function executeElevenLabsTts(
   const ELEVEN_MODEL_MAP: Record<string, string> = {
     "elevenlabs-multilingual-v2": "eleven_multilingual_v2",
     "elevenlabs-turbo-v2-5":      "eleven_turbo_v2_5",
-    "elevenlabs-flash-v2-5":      "eleven_flash_v2_5",
   };
   const elevenModelId = ELEVEN_MODEL_MAP[requestedModel] ?? requestedModel;
 
-  // Light style hint mapping — keeps the UI parameter contract
-  // consistent across providers without exposing the full ElevenLabs
-  // numeric knob set.
-  const styleHint = String(params.style_prompt ?? "").trim().toLowerCase();
-  const stability =
-    /\b(steady|stable|formal|narrator)\b/.test(styleHint) ? 0.75
-    : /\b(emotional|expressive|playful)\b/.test(styleHint) ? 0.4
-    : 0.55;
-  const similarityBoost =
-    /\b(crisp|clear|defined)\b/.test(styleHint) ? 0.85 : 0.75;
+  // ── Per-call ElevenLabs voice_settings ─────────────────────────
+  // The frontend exposes 4 sliders that map 1:1 onto the ElevenLabs
+  // voice_settings keys. We accept either explicit numeric params
+  // (`stability`, `similarity_boost`, `style`, `use_speaker_boost`)
+  // OR a free-form `voice_style` enum from the picker — which we
+  // map onto the official three style presets ElevenLabs documents:
+  //   "expressive" → high style + low stability
+  //   "neutral"    → balanced (the API defaults)
+  //   "consistent" → low style + high stability
+  // Numeric knobs always win when both forms are present.
+  const stylePreset = String(params.voice_style ?? "neutral").toLowerCase();
+  const presetDefaults =
+    stylePreset === "expressive"
+      ? { stability: 0.30, similarity_boost: 0.75, style: 0.65, use_speaker_boost: true }
+      : stylePreset === "consistent"
+        ? { stability: 0.85, similarity_boost: 0.85, style: 0.10, use_speaker_boost: true }
+        : { stability: 0.55, similarity_boost: 0.75, style: 0.30, use_speaker_boost: true };
+
+  const stability = clampNum(params.stability, 0, 1, presetDefaults.stability);
+  const similarityBoost = clampNum(
+    params.similarity_boost ?? params.similarity,
+    0,
+    1,
+    presetDefaults.similarity_boost,
+  );
+  const style = clampNum(params.style, 0, 1, presetDefaults.style);
+  const useSpeakerBoost =
+    params.use_speaker_boost === undefined
+      ? presetDefaults.use_speaker_boost
+      : params.use_speaker_boost === true || params.use_speaker_boost === "true";
+
+  // `speed` is a top-level parameter (NOT inside voice_settings) per
+  // ElevenLabs API docs. Valid range: 0.7 – 1.2. Skip when default.
+  const speed = clampNum(params.speed, 0.7, 1.2, 1.0);
 
   console.log(
-    `[elevenlabs-tts] voice=${voiceId} model=${elevenModelId} stab=${stability} sim=${similarityBoost} chars=${text.length}`,
+    `[elevenlabs-tts] voice=${voiceId} model=${elevenModelId} stab=${stability} sim=${similarityBoost} style=${style} speed=${speed} chars=${text.length}`,
   );
+
+  const requestBody: Record<string, unknown> = {
+    text,
+    model_id: elevenModelId,
+    voice_settings: {
+      stability,
+      similarity_boost: similarityBoost,
+      style,
+      use_speaker_boost: useSpeakerBoost,
+      ...(speed !== 1.0 ? { speed } : {}),
+    },
+  };
 
   const ttsRes = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
@@ -2384,14 +2443,7 @@ async function executeElevenLabsTts(
         "Content-Type": "application/json",
         "Accept": "audio/mpeg",
       },
-      body: JSON.stringify({
-        text,
-        model_id: elevenModelId,
-        voice_settings: {
-          stability,
-          similarity_boost: similarityBoost,
-        },
-      }),
+      body: JSON.stringify(requestBody),
     },
   );
 
