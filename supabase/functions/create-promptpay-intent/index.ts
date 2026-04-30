@@ -33,27 +33,82 @@ serve(async (req) => {
     const user = data.user;
     if (!user?.email) throw new Error("User not authenticated");
 
-    const { packageId } = await req.json();
-    if (!packageId || typeof packageId !== "string")
-      throw new Error("Missing packageId");
+    /* Accept either:
+     *   { packageId }  — legacy preset path (looks up topup_packages)
+     *   { amountThb }  — custom-amount path (no DB lookup, fixed
+     *                    1 THB = 25 credits ratio, min 500 THB)
+     *
+     * Both paths converge on a single PaymentIntent with PromptPay
+     * as the only payment_method_type. Metadata.credits is always
+     * populated so the webhook (`intentType === "promptpay_topup"`)
+     * grants the correct amount regardless of which path was taken.
+     */
+    const { packageId, amountThb: rawAmountThb } = await req.json();
 
-    // Fetch top-up package
-    const { data: pkg, error: pkgError } = await supabaseAdmin
-      .from("topup_packages")
-      .select("id, name, credits, price_thb, is_active")
-      .eq("id", packageId)
-      .eq("is_active", true)
-      .single();
+    let pkgName: string;
+    let pkgCredits: number;
+    let pkgPriceThb: number;
+    let topupPackageId: string | null = null;
 
-    if (pkgError || !pkg) {
-      return new Response(
-        JSON.stringify({ error: "Package not found or inactive" }),
-        {
-          status: 404,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        }
-      );
+    if (packageId && typeof packageId === "string") {
+      const { data: pkg, error: pkgError } = await supabaseAdmin
+        .from("topup_packages")
+        .select("id, name, credits, price_thb, is_active")
+        .eq("id", packageId)
+        .eq("is_active", true)
+        .single();
+      if (pkgError || !pkg) {
+        return new Response(
+          JSON.stringify({ error: "Package not found or inactive" }),
+          {
+            status: 404,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+      pkgName = pkg.name;
+      pkgCredits = pkg.credits;
+      pkgPriceThb = pkg.price_thb;
+      topupPackageId = pkg.id;
+    } else {
+      // Custom-amount path. Strict server-side validation: integer
+      // THB, minimum 500, maximum 100,000. Conversion is fixed at
+      // 1 THB → 25 credits to match the published rate. Any client
+      // tampering (smaller amounts / different ratios) is rejected
+      // here before we touch Stripe.
+      const amountThb = Math.floor(Number(rawAmountThb));
+      const MIN_TOPUP_THB = 500;
+      const MAX_TOPUP_THB = 100_000;
+      const RATIO_THB_TO_CREDITS = 25;
+      if (
+        !Number.isFinite(amountThb) ||
+        amountThb < MIN_TOPUP_THB ||
+        amountThb > MAX_TOPUP_THB
+      ) {
+        return new Response(
+          JSON.stringify({
+            error: `amountThb must be an integer between ${MIN_TOPUP_THB} and ${MAX_TOPUP_THB}`,
+          }),
+          {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
+      pkgPriceThb = amountThb;
+      pkgCredits = amountThb * RATIO_THB_TO_CREDITS;
+      pkgName = `Top-up ฿${amountThb.toLocaleString()}`;
     }
+
+    // Synthesise a `pkg`-shaped object so the rest of the function
+    // doesn't have to branch — both paths reach the PaymentIntent
+    // creation with identical state.
+    const pkg = {
+      id: topupPackageId,
+      name: pkgName,
+      credits: pkgCredits,
+      price_thb: pkgPriceThb,
+    };
 
     const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") || "", {
       apiVersion: "2025-08-27.basil",
@@ -90,7 +145,9 @@ serve(async (req) => {
     // Amount in satang (THB smallest unit = 1 satang = 0.01 THB)
     const amountSatang = Math.round(pkg.price_thb * 100);
 
-    // Create PaymentIntent with PromptPay
+    // Create PaymentIntent with PromptPay. The webhook downstream
+    // keys off `metadata.type === "promptpay_topup"` — keep that
+    // contract regardless of preset vs custom path.
     const paymentIntent = await stripe.paymentIntents.create({
       amount: amountSatang,
       currency: "thb",
@@ -98,10 +155,11 @@ serve(async (req) => {
       payment_method_types: ["promptpay"],
       metadata: {
         user_id: user.id,
-        topup_package_id: pkg.id,
+        ...(pkg.id ? { topup_package_id: pkg.id } : {}),
         credits: pkg.credits.toString(),
         type: "promptpay_topup",
         package_name: pkg.name,
+        amount_thb: pkg.price_thb.toString(),
       },
     });
 
@@ -147,7 +205,11 @@ serve(async (req) => {
       error instanceof Error ? error.message : error
     );
     const msg = error instanceof Error ? error.message : "";
-    const safeMessages = ["User not authenticated", "Missing packageId"];
+    const safeMessages = [
+      "User not authenticated",
+      "Missing packageId",
+      "Missing amountThb",
+    ];
     const clientMsg = safeMessages.includes(msg)
       ? msg
       : "PromptPay checkout failed. Please try again.";
