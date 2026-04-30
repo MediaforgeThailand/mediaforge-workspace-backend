@@ -27,11 +27,11 @@
 //
 // Mutations
 // ---------
-// The workspace product runs nodes individually (no flow-level retries
-// today), so the retry queue is empty by design. All mutation actions
-// (cancel_retry_job, recover_stuck_retry_jobs) are stubbed to 501. When
-// node-level retries / cancellations land, the stubs become real reads
-// from `provider_retry_queue` + `retry_queue_dead_letter`.
+// The workspace product runs node jobs through `workspace_generation_jobs`.
+// The admin Retry Queue page still speaks the consumer retry shape, so this
+// function maps workspace job rows into that shape for read-only monitoring.
+// Mutation actions remain disabled until we ship the audited workspace write
+// path.
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -63,6 +63,99 @@ function clampOffset(raw: unknown): number {
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) return 0;
   return Math.floor(n);
+}
+
+function workspaceStatusToRetryStatus(status: string): string {
+  switch (status) {
+    case "queued":
+      return "pending";
+    case "running":
+      return "processing";
+    case "permanent_failed":
+      return "failed";
+    default:
+      return status || "unknown";
+  }
+}
+
+function retryStatusToWorkspaceStatuses(status: string | null): string[] {
+  switch (status) {
+    case "pending":
+      return ["queued"];
+    case "processing":
+      return ["running"];
+    case "failed":
+      return ["failed", "permanent_failed"];
+    case "completed":
+      return ["completed"];
+    case "cancelled":
+      return [];
+    default:
+      return ["queued", "running", "failed", "permanent_failed"];
+  }
+}
+
+function mapWorkspaceJobToRetryJob(row: Record<string, unknown>) {
+  const status = String(row.status ?? "unknown");
+  const retryStatus = workspaceStatusToRetryStatus(status);
+  const workspaceId = typeof row.workspace_id === "string" ? row.workspace_id : null;
+  const canvasId = typeof row.canvas_id === "string" ? row.canvas_id : null;
+  const lastError = String(row.last_error ?? row.error ?? "").trim() || null;
+  return {
+    id: String(row.id),
+    flow_run_id: workspaceId ?? canvasId,
+    step_index: null,
+    node_id: row.node_id ?? null,
+    provider: String(row.provider ?? row.model ?? "workspace"),
+    node_type: row.node_type ?? null,
+    status: retryStatus,
+    attempt: Number(row.attempts ?? 0),
+    max_attempts: Number(row.max_attempts ?? 18),
+    next_attempt_at:
+      retryStatus === "pending"
+        ? row.run_after ?? row.created_at ?? null
+        : retryStatus === "processing"
+          ? row.lock_expires_at ?? null
+          : null,
+    last_error: lastError,
+    last_classification: status,
+    locked_by: row.locked_by ?? null,
+    lock_expires_at: row.lock_expires_at ?? null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    completed_at: row.completed_at ?? null,
+    workspace_id: workspaceId,
+    canvas_id: canvasId,
+    project_id: row.project_id ?? null,
+    model: row.model ?? null,
+    credits_charged: row.credits_charged ?? null,
+    credits_refunded: row.credits_refunded ?? null,
+  };
+}
+
+function mapWorkspaceJobToDeadLetter(row: Record<string, unknown>) {
+  const lastError = String(row.last_error ?? row.error ?? "").trim() || null;
+  return {
+    id: String(row.id),
+    original_job_id: String(row.id),
+    flow_run_id:
+      typeof row.workspace_id === "string"
+        ? row.workspace_id
+        : typeof row.canvas_id === "string"
+          ? row.canvas_id
+          : null,
+    step_index: null,
+    task_type: row.node_type ?? null,
+    provider: String(row.provider ?? row.model ?? "workspace"),
+    final_error: lastError,
+    total_attempts: Number(row.attempts ?? 0),
+    moved_at: row.completed_at ?? row.updated_at ?? row.created_at,
+    moved_by: "workspace_generation_jobs",
+    workspace_id: row.workspace_id ?? null,
+    canvas_id: row.canvas_id ?? null,
+    project_id: row.project_id ?? null,
+    model: row.model ?? null,
+  };
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -188,18 +281,20 @@ async function listRetryJobs(
   provider: string | null,
   limit: number,
 ): Promise<{ jobs: unknown[] }> {
+  const statuses = retryStatusToWorkspaceStatuses(status);
+  if (statuses.length === 0) return { jobs: [] };
   let q = client
-    .from("provider_retry_queue")
+    .from("workspace_generation_jobs")
     .select("*")
-    .order("created_at", { ascending: false })
+    .in("status", statuses)
+    .order("updated_at", { ascending: false })
     .limit(limit);
-  if (status) q = q.eq("status", status);
   if (provider) q = q.eq("provider", provider);
   const { data, error } = await q;
   if (error) {
-    throw new Error(`provider_retry_queue read failed: ${error.message}`);
+    throw new Error(`workspace_generation_jobs read failed: ${error.message}`);
   }
-  return { jobs: data ?? [] };
+  return { jobs: (data ?? []).map((row) => mapWorkspaceJobToRetryJob(row as Record<string, unknown>)) };
 }
 
 /**
@@ -212,16 +307,17 @@ async function listRetryDeadLetters(
   limit: number,
 ): Promise<{ dead_letters: unknown[] }> {
   let q = client
-    .from("retry_queue_dead_letter")
+    .from("workspace_generation_jobs")
     .select("*")
-    .order("moved_at", { ascending: false })
+    .in("status", ["failed", "permanent_failed"])
+    .order("updated_at", { ascending: false })
     .limit(limit);
   if (provider) q = q.eq("provider", provider);
   const { data, error } = await q;
   if (error) {
-    throw new Error(`retry_queue_dead_letter read failed: ${error.message}`);
+    throw new Error(`workspace_generation_jobs dead-letter read failed: ${error.message}`);
   }
-  return { dead_letters: data ?? [] };
+  return { dead_letters: (data ?? []).map((row) => mapWorkspaceJobToDeadLetter(row as Record<string, unknown>)) };
 }
 
 /**
@@ -240,42 +336,47 @@ async function getRetryObservability(client: SupabaseClient): Promise<{
 }> {
   const nowIso = new Date().toISOString();
 
-  const [queueRes, dlqRes, stuckRes] = await Promise.all([
-    client.from("provider_retry_queue").select("status, provider"),
+  const [queueRes, dlqRes] = await Promise.all([
     client
-      .from("retry_queue_dead_letter")
-      .select("id", { count: "exact", head: true }),
+      .from("workspace_generation_jobs")
+      .select("*")
+      .in("status", ["queued", "running", "failed", "permanent_failed"]),
     client
-      .from("provider_retry_queue")
+      .from("workspace_generation_jobs")
       .select("id", { count: "exact", head: true })
-      .in("status", ["pending", "processing"])
-      .lt("lock_expires_at", nowIso),
+      .in("status", ["failed", "permanent_failed"]),
   ]);
 
   if (queueRes.error) {
-    throw new Error(`retry queue scan failed: ${queueRes.error.message}`);
+    throw new Error(`workspace retry queue scan failed: ${queueRes.error.message}`);
   }
   if (dlqRes.error) {
-    throw new Error(`dead-letter scan failed: ${dlqRes.error.message}`);
-  }
-  if (stuckRes.error) {
-    throw new Error(`stuck scan failed: ${stuckRes.error.message}`);
+    throw new Error(`workspace dead-letter scan failed: ${dlqRes.error.message}`);
   }
 
   const by_status: Record<string, number> = {};
   const by_provider: Record<string, number> = {};
   let total = 0;
+  let stuckCount = 0;
   for (const row of queueRes.data ?? []) {
-    const s = String((row as { status: string }).status ?? "unknown");
-    const p = String((row as { provider: string }).provider ?? "unknown");
+    const r = row as { status?: string; provider?: string; lock_expires_at?: string | null };
+    const s = workspaceStatusToRetryStatus(String(r.status ?? "unknown"));
+    const p = String(r.provider ?? "unknown");
     by_status[s] = (by_status[s] ?? 0) + 1;
     by_provider[p] = (by_provider[p] ?? 0) + 1;
+    if (
+      (r.status === "queued" || r.status === "running") &&
+      r.lock_expires_at &&
+      r.lock_expires_at < nowIso
+    ) {
+      stuckCount += 1;
+    }
     total += 1;
   }
   return {
     queue: { by_status, by_provider, total },
     dead_letter_total: dlqRes.count ?? 0,
-    stuck_count: stuckRes.count ?? 0,
+    stuck_count: stuckCount,
   };
 }
 
