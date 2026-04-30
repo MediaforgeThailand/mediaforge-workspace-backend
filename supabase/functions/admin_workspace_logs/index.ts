@@ -159,6 +159,81 @@ function mapWorkspaceJobToDeadLetter(row: Record<string, unknown>) {
 }
 
 // ───────────────────────────────────────────────────────────────────────
+function workspaceStatusToGenerationStatus(row: Record<string, unknown>): string {
+  const status = String(row.status ?? "unknown");
+  switch (status) {
+    case "queued":
+      return "processing";
+    case "running":
+      return "running";
+    case "failed":
+    case "permanent_failed":
+      return Number(row.credits_refunded ?? 0) > 0 ? "failed_refunded" : "failed";
+    default:
+      return status || "unknown";
+  }
+}
+
+function generationStatusToWorkspaceStatuses(status: string | null): string[] {
+  switch (status) {
+    case "processing":
+      return ["queued"];
+    case "running":
+      return ["running"];
+    case "completed":
+      return ["completed"];
+    case "failed":
+    case "failed_refunded":
+      return ["failed", "permanent_failed"];
+    case "cancelled":
+      return [];
+    default:
+      return ["queued", "running", "completed", "failed", "permanent_failed"];
+  }
+}
+
+function durationMs(
+  startedAt: unknown,
+  finishedAt: unknown,
+  fallbackEndAt: unknown,
+  status: string,
+): number | null {
+  const start = Date.parse(String(startedAt ?? ""));
+  if (!Number.isFinite(start)) return null;
+  const end = status === "running" || status === "processing"
+    ? Date.now()
+    : Date.parse(String(finishedAt ?? fallbackEndAt ?? ""));
+  if (!Number.isFinite(end)) return null;
+  return Math.max(0, end - start);
+}
+
+function mapWorkspaceJobToGenerationLogRow(row: Record<string, unknown>) {
+  const status = workspaceStatusToGenerationStatus(row);
+  const provider = String(row.provider ?? "workspace");
+  const model = String(row.model ?? "").trim();
+  const nodeType = String(row.node_type ?? "").trim();
+  const flowName = [provider, model || nodeType].filter(Boolean).join(" / ");
+  const creditsCharged = Number(row.credits_charged ?? 0);
+  const creditsRefunded = Number(row.credits_refunded ?? 0);
+  const errorMessage = String(row.error ?? row.last_error ?? "").trim() || null;
+  return {
+    id: String(row.id),
+    user_id: String(row.user_id ?? ""),
+    flow_id: row.workspace_id ?? row.canvas_id ?? row.project_id ?? null,
+    status,
+    credits_used: Math.max(0, creditsCharged - creditsRefunded),
+    started_at: row.started_at ?? row.created_at ?? null,
+    completed_at: status === "completed" || status === "failed" || status === "failed_refunded"
+      ? row.completed_at ?? row.updated_at ?? null
+      : null,
+    duration_ms: durationMs(row.started_at ?? row.created_at, row.completed_at, row.updated_at, status),
+    error_message: errorMessage,
+    error_classification: errorMessage ? String(row.status ?? "") : null,
+    display_name: null,
+    flow_name: flowName || "Workspace generation",
+  };
+}
+
 // Reads
 // ───────────────────────────────────────────────────────────────────────
 
@@ -188,35 +263,24 @@ async function listFlowRunsForGenLog(
   limit: number,
   offset: number,
 ): Promise<{ rows: unknown[]; total: number; limit: number; offset: number }> {
+  const statuses = generationStatusToWorkspaceStatuses(status);
+  if (statuses.length === 0) return { rows: [], total: 0, limit, offset };
   let q = client
-    .from("pipeline_executions")
-    .select(
-      "id, user_id, flow_id, flow_run_id, status, credits_deducted, created_at, updated_at, error_message",
-      { count: "exact" },
-    )
-    .order("created_at", { ascending: false })
+    .from("workspace_generation_jobs")
+    .select("*", { count: "exact" })
+    .in("status", statuses)
+    .order("updated_at", { ascending: false })
     .range(offset, offset + limit - 1);
-  if (status) q = q.eq("status", status);
 
   const { data, error, count } = await q;
   if (error) {
-    throw new Error(`pipeline_executions read failed: ${error.message}`);
+    throw new Error(`workspace_generation_jobs generation log read failed: ${error.message}`);
   }
 
-  const rows = (data ?? []).map((r: any) => ({
-    id: r.id,
-    user_id: r.user_id,
-    flow_id: r.flow_id,
-    status: r.status,
-    credits_used: r.credits_deducted ?? null,
-    started_at: r.created_at, // workspace doesn't track started_at separately
-    completed_at: r.status === "completed" ? r.updated_at : null,
-    duration_ms: null,
-    error_message: r.error_message ?? null,
-    error_classification: null,
-    display_name: null,
-    flow_name: null,
-  }));
+  const rows = (data ?? [])
+    .map((r) => mapWorkspaceJobToGenerationLogRow(r as Record<string, unknown>))
+    .filter((r) => status !== "failed_refunded" || r.status === "failed_refunded")
+    .filter((r) => status !== "failed" || r.status === "failed");
 
   return { rows, total: count ?? rows.length, limit, offset };
 }
@@ -233,15 +297,15 @@ async function getFlowRunsStats(
 ): Promise<{ since: string; counts: Record<string, number> }> {
   const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const { data, error } = await client
-    .from("pipeline_executions")
-    .select("status")
+    .from("workspace_generation_jobs")
+    .select("status, credits_refunded")
     .gte("created_at", since);
   if (error) {
-    throw new Error(`pipeline_executions stats read failed: ${error.message}`);
+    throw new Error(`workspace_generation_jobs stats read failed: ${error.message}`);
   }
   const counts: Record<string, number> = { total: 0 };
   for (const row of data ?? []) {
-    const s = String((row as { status: string }).status ?? "unknown");
+    const s = workspaceStatusToGenerationStatus(row as Record<string, unknown>);
     counts.total += 1;
     counts[s] = (counts[s] ?? 0) + 1;
   }
