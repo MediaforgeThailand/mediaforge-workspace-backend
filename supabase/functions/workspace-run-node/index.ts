@@ -1680,7 +1680,9 @@ async function executeBanana(
    * upload + JSON-parse work below to finish before the platform
    * pulls the plug. The caller gets a friendly error instead of a
    * generic platform 500. */
-  const ABORT_MS = 120_000;
+  // Keep in sync with WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS; Banana 2
+  // standard-tier calls may complete after the old 120s cutoff.
+  const ABORT_MS = 240_000;
   const aborter = new AbortController();
   const abortTimer = setTimeout(() => aborter.abort(), ABORT_MS);
   const modelLabel = modelId === "nano-banana-pro" ? "Nano Banana Pro" : "Nano Banana 2";
@@ -4259,7 +4261,7 @@ interface WorkspaceRunBody {
 }
 
 const WORKSPACE_JOB_MAX_MS = 30 * 60_000;
-const WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS = 140_000;
+const WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS = 260_000;
 const WORKSPACE_JOB_BACKOFF_MS = [3_000, 5_000, 10_000, 15_000, 30_000, 60_000];
 
 type WorkspaceJobStatus =
@@ -4292,6 +4294,22 @@ type WorkspaceJobRow = {
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function hasRecoverableAsyncResult(job: WorkspaceJobRow): boolean {
+  const result =
+    job.result && typeof job.result === "object"
+      ? (job.result as Record<string, unknown>)
+      : null;
+  const providerMeta =
+    result?.provider_meta && typeof result.provider_meta === "object"
+      ? (result.provider_meta as Record<string, unknown>)
+      : null;
+  return Boolean(
+    result?.task_id &&
+      !result.url &&
+      providerMeta?.poll_endpoint,
+  );
+}
 
 function isPermanentWorkspaceJobError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -4973,9 +4991,25 @@ serve(async (req) => {
           .eq("id", jobId)
           .maybeSingle();
         if (crashedJob) {
+          const typedJob = crashedJob as WorkspaceJobRow;
+          if (["completed", "failed", "permanent_failed"].includes(String(typedJob.status))) {
+            return;
+          }
+          if (hasRecoverableAsyncResult(typedJob)) {
+            await supabase
+              .from("workspace_generation_jobs")
+              .update({
+                status: "running",
+                error: null,
+                last_error:
+                  "Background worker stopped before the provider finished; browser polling is continuing.",
+              })
+              .eq("id", jobId);
+            return;
+          }
           await refundWorkspaceJobCharge({
             supabase,
-            job: crashedJob as WorkspaceJobRow,
+            job: typedJob,
             reason: `workspace job crashed: ${msg.substring(0, 160)}`,
           });
         }
