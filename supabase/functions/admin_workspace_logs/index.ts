@@ -35,6 +35,7 @@
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { verifyAdminJwt, unauthorizedResponse } from "../_shared/adminAuth.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -452,6 +453,13 @@ Deno.serve(async (req: Request) => {
   if (req.method !== "POST") {
     return json({ error: "Method not allowed — use POST" }, 405);
   }
+
+  // Admin-JWT gate. The audit found this function had `verify_jwt:false`
+  // and ZERO internal auth — anyone with the URL could read user data.
+  // The admin hub now signs JWTs via this project's `admin-login` using
+  // JWT_SECRET; we verify them here via the shared helper.
+  const adminPayload = await verifyAdminJwt(req);
+  if (!adminPayload) return unauthorizedResponse(CORS_HEADERS);
 
   let body: { action?: string; [k: string]: unknown };
   try {

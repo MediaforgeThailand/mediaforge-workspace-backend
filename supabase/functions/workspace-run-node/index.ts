@@ -3645,26 +3645,82 @@ function workspaceMultiplierForProvider(
 
 type WorkspaceCreditCharge = {
   amount: number;
+  scope: "user" | "organization" | "team";
   teamId: string | null;
-  creditUserId: string;
+  organizationId: string | null;
+  classId: string | null;
+  creditUserId: string | null;
   referenceId: string;
   feature: string;
 };
 
-const CMO_SHARED_CREDIT_DOMAIN = "cmo-group.com";
-const CMO_SHARED_CREDIT_POOL_USER_ID = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0";
+type WorkspaceCreditOwner =
+  | {
+      scope: "organization";
+      organizationId: string;
+      organizationName: string | null;
+      poolDomain: string | null;
+      email: string | null;
+      organizationType?: string | null;
+      classId?: string | null;
+    }
+  | {
+      scope: "user";
+      creditUserId: string;
+      email: string | null;
+      organizationId?: string | null;
+      organizationName?: string | null;
+      organizationType?: string | null;
+      classId?: string | null;
+      className?: string | null;
+      classRole?: string | null;
+    };
 
-function sharedCreditPoolUserIdForEmail(email?: string | null): string | null {
-  const normalized = String(email ?? "").trim().toLowerCase();
-  if (!normalized.endsWith(`@${CMO_SHARED_CREDIT_DOMAIN}`)) return null;
-  return CMO_SHARED_CREDIT_POOL_USER_ID;
+async function resolveWorkspaceEducationCreditScope(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+): Promise<{
+  organizationId: string;
+  organizationName: string | null;
+  organizationType: string | null;
+  classId: string | null;
+  className: string | null;
+  classRole: string | null;
+} | null> {
+  try {
+    const { data, error } = await supabase.rpc("workspace_education_credit_scope", {
+      p_user_id: userId,
+    });
+    if (error) {
+      if (!/function .*workspace_education_credit_scope/i.test(error.message)) {
+        console.warn("[workspace-credits] education credit scope skipped:", error.message);
+      }
+      return null;
+    }
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row?.organization_id) return null;
+    return {
+      organizationId: String(row.organization_id),
+      organizationName: row.organization_name ? String(row.organization_name) : null,
+      organizationType: row.organization_type ? String(row.organization_type) : null,
+      classId: row.class_id ? String(row.class_id) : null,
+      className: row.class_name ? String(row.class_name) : null,
+      classRole: row.class_role ? String(row.class_role) : null,
+    };
+  } catch (err) {
+    console.warn(
+      "[workspace-credits] education credit scope unavailable:",
+      err instanceof Error ? err.message : String(err),
+    );
+    return null;
+  }
 }
 
-async function resolveWorkspaceCreditUserId(
+async function resolveWorkspaceCreditOwner(
   supabase: ReturnType<typeof createClient>,
   userId: string,
   email?: string | null,
-): Promise<{ creditUserId: string; isSharedPool: boolean; email: string | null }> {
+): Promise<WorkspaceCreditOwner> {
   let resolvedEmail = email ?? null;
   if (!resolvedEmail) {
     try {
@@ -3677,10 +3733,136 @@ async function resolveWorkspaceCreditUserId(
       );
     }
   }
-  const sharedPoolId = sharedCreditPoolUserIdForEmail(resolvedEmail);
+
+  try {
+    const { data, error } = await supabase.rpc("workspace_org_credit_scope", {
+      p_user_id: userId,
+    });
+    if (error && !/function .*workspace_org_credit_scope/i.test(error.message)) {
+      console.warn("[workspace-credits] org credit scope lookup skipped:", error.message);
+    }
+    const row = Array.isArray(data) ? data[0] : data;
+    if (row?.organization_id) {
+      const orgType = row.organization_type ? String(row.organization_type) : null;
+      if (orgType === "school" || orgType === "university") {
+        const edu = await resolveWorkspaceEducationCreditScope(supabase, userId);
+        if (edu?.classRole === "student" && edu.classId) {
+          return {
+            scope: "user",
+            creditUserId: userId,
+            email: resolvedEmail,
+            organizationId: edu.organizationId,
+            organizationName: edu.organizationName,
+            organizationType: edu.organizationType,
+            classId: edu.classId,
+            className: edu.className,
+            classRole: edu.classRole,
+          };
+        }
+        if (!edu?.classId) {
+          return {
+            scope: "user",
+            creditUserId: userId,
+            email: resolvedEmail,
+            organizationId: String(row.organization_id),
+            organizationName: row.organization_name ? String(row.organization_name) : null,
+            organizationType: orgType,
+            classId: null,
+            className: null,
+            classRole: null,
+          };
+        }
+      }
+      return {
+        scope: "organization",
+        organizationId: String(row.organization_id),
+        organizationName: row.organization_name ? String(row.organization_name) : null,
+        poolDomain: row.primary_domain ? String(row.primary_domain) : null,
+        email: resolvedEmail,
+        organizationType: orgType,
+      };
+    }
+  } catch (err) {
+    console.warn(
+      "[workspace-credits] org credit scope unavailable:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+
+  // Repair older profiles that signed in before the post-auth org trigger
+  // existed. If their email domain is now verified, pin membership so future
+  // calls resolve through workspace_org_credit_scope.
+  const domain = String(resolvedEmail ?? "").toLowerCase().split("@")[1] ?? "";
+  if (domain) {
+    try {
+      const { data: domainRow } = await supabase
+        .from("organization_domains")
+        .select("organization_id, domain")
+        .eq("domain", domain)
+        .not("verified_at", "is", null)
+        .maybeSingle();
+      if (domainRow?.organization_id) {
+        const { data: org } = await supabase
+          .from("organizations")
+          .select("id, name, display_name, status, type")
+          .eq("id", domainRow.organization_id)
+          .eq("status", "active")
+          .is("deleted_at", null)
+          .maybeSingle();
+        if (org?.id) {
+          await supabase
+            .from("profiles")
+            .update({
+              organization_id: org.id,
+              account_type: "org_user",
+              updated_at: new Date().toISOString(),
+            })
+            .eq("user_id", userId)
+            .is("organization_id", null);
+          await supabase.from("organization_memberships").upsert(
+            {
+              organization_id: org.id,
+              user_id: userId,
+              role: "member",
+              status: "active",
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: "organization_id,user_id" },
+          );
+          if (String((org as { type?: unknown }).type ?? "") === "school" || String((org as { type?: unknown }).type ?? "") === "university") {
+            return {
+              scope: "user",
+              creditUserId: userId,
+              organizationId: String(org.id),
+              organizationName: String(org.display_name ?? org.name ?? ""),
+              organizationType: String((org as { type?: unknown }).type ?? ""),
+              classId: null,
+              className: null,
+              classRole: null,
+              email: resolvedEmail,
+            };
+          }
+          return {
+            scope: "organization",
+            organizationId: String(org.id),
+            organizationName: String(org.display_name ?? org.name ?? ""),
+            poolDomain: String(domainRow.domain ?? domain),
+            email: resolvedEmail,
+            organizationType: String((org as { type?: unknown }).type ?? ""),
+          };
+        }
+      }
+    } catch (err) {
+      console.warn(
+        "[workspace-credits] org membership repair skipped:",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
   return {
-    creditUserId: sharedPoolId ?? userId,
-    isSharedPool: Boolean(sharedPoolId),
+    scope: "user",
+    creditUserId: userId,
     email: resolvedEmail,
   };
 }
@@ -3815,18 +3997,54 @@ async function consumeWorkspaceCredits(args: {
       args.body.node_id ??
       crypto.randomUUID(),
   );
-  const creditOwner = await resolveWorkspaceCreditUserId(args.supabase, args.userId, args.userEmail);
+  const creditOwner = await resolveWorkspaceCreditOwner(args.supabase, args.userId, args.userEmail);
   const descriptionBase = `${args.nodeType} ${String(args.params.model_name ?? args.params.model ?? args.provider)}`;
-  const description = creditOwner.isSharedPool
-    ? `${descriptionBase} (CMO shared pool; actual user ${creditOwner.email ?? args.userId})`
-    : descriptionBase;
+  const description =
+    creditOwner.scope === "organization"
+      ? `${descriptionBase} (${creditOwner.organizationName ?? "org"} shared pool; actual user ${creditOwner.email ?? args.userId})`
+      : descriptionBase;
+
+  if (!teamId && creditOwner.scope === "organization") {
+    const { data, error } = await args.supabase.rpc("consume_workspace_org_credits", {
+      p_user_id: args.userId,
+      p_organization_id: creditOwner.organizationId,
+      p_amount: amount,
+      p_feature: def.feature,
+      p_description: description,
+      p_reference_id: referenceId,
+      p_workspace_id: args.body.workspace_id ?? null,
+      p_canvas_id: args.body.canvas_id ?? null,
+    });
+    if (error) {
+      throw new Error(`Org credit deduction failed: ${error.message}`);
+    }
+    if (data !== true) {
+      throw new Error("INSUFFICIENT_CREDITS");
+    }
+
+    console.log(
+      `[workspace-credits] charged ${amount} credits user=${args.userId} org=${creditOwner.organizationId} ref=${referenceId}`,
+    );
+    return {
+      amount,
+      scope: "organization",
+      teamId: null,
+      organizationId: creditOwner.organizationId,
+      classId: creditOwner.classId ?? null,
+      creditUserId: null,
+      referenceId,
+      feature: def.feature,
+    };
+  }
+
+  const creditUserId = creditOwner.scope === "user" ? creditOwner.creditUserId : args.userId;
 
   if (!teamId) {
-    await ensureSpendableUserCreditBatch(args.supabase, creditOwner.creditUserId, amount);
+    await ensureSpendableUserCreditBatch(args.supabase, creditUserId, amount);
   }
 
   const { data, error } = await args.supabase.rpc("consume_credits_for", {
-    p_user_id: creditOwner.creditUserId,
+    p_user_id: creditUserId,
     p_team_id: teamId,
     p_amount: amount,
     p_feature: def.feature,
@@ -3838,7 +4056,7 @@ async function consumeWorkspaceCredits(args: {
   if (error) {
     if (/function .*consume_credits_for/i.test(error.message)) {
       const fallback = await args.supabase.rpc("consume_credits", {
-        p_user_id: creditOwner.creditUserId,
+        p_user_id: creditUserId,
         p_amount: amount,
         p_feature: def.feature,
         p_description: description,
@@ -3858,9 +4076,18 @@ async function consumeWorkspaceCredits(args: {
   }
 
   console.log(
-    `[workspace-credits] charged ${amount} credits user=${args.userId} credit_user=${creditOwner.creditUserId} team=${teamId ?? "personal"} ref=${referenceId}`,
+    `[workspace-credits] charged ${amount} credits user=${args.userId} credit_user=${creditUserId} team=${teamId ?? "personal"} ref=${referenceId}`,
   );
-  return { amount, teamId, creditUserId: creditOwner.creditUserId, referenceId, feature: def.feature };
+  return {
+    amount,
+    scope: teamId ? "team" : "user",
+    teamId,
+    organizationId: creditOwner.scope === "user" ? creditOwner.organizationId ?? null : null,
+    classId: creditOwner.scope === "user" ? creditOwner.classId ?? null : null,
+    creditUserId,
+    referenceId,
+    feature: def.feature,
+  };
 }
 
 async function refundWorkspaceCredits(args: {
@@ -3872,9 +4099,26 @@ async function refundWorkspaceCredits(args: {
   canvasId?: string | null;
 }): Promise<void> {
   if (!args.charge || args.charge.amount <= 0) return;
-  const creditUserId = args.charge.creditUserId ??
-    (await resolveWorkspaceCreditUserId(args.supabase, args.userId)).creditUserId;
   try {
+    if (args.charge.scope === "organization" && args.charge.organizationId) {
+      const { error } = await args.supabase.rpc("refund_workspace_org_credits", {
+        p_user_id: args.userId,
+        p_organization_id: args.charge.organizationId,
+        p_amount: args.charge.amount,
+        p_reason: args.reason,
+        p_reference_id: args.charge.referenceId,
+        p_workspace_id: args.workspaceId ?? null,
+        p_canvas_id: args.canvasId ?? null,
+      });
+      if (error) throw error;
+      return;
+    }
+
+    const owner = args.charge.creditUserId
+      ? null
+      : await resolveWorkspaceCreditOwner(args.supabase, args.userId);
+    const creditUserId = args.charge.creditUserId ??
+      (owner?.scope === "user" ? owner.creditUserId : args.userId);
     const { error } = await args.supabase.rpc("refund_credits_for", {
       p_user_id: creditUserId,
       p_team_id: args.charge.teamId,
@@ -3917,8 +4161,12 @@ async function refundWorkspaceJobCharge(args: {
     userId: args.job.user_id,
     charge: {
       amount: remaining,
+      scope: (args.job.credit_scope as WorkspaceCreditCharge["scope"] | null) ??
+        (args.job.credit_organization_id ? "organization" : args.job.credit_team_id ? "team" : "user"),
       teamId: args.job.credit_team_id ?? null,
-      creditUserId: (await resolveWorkspaceCreditUserId(args.supabase, args.job.user_id)).creditUserId,
+      organizationId: args.job.credit_organization_id ?? null,
+      classId: args.job.credit_class_id ?? null,
+      creditUserId: null,
       referenceId: args.job.id,
       feature: String(args.job.provider ?? args.job.node_type),
     },
@@ -4312,6 +4560,9 @@ interface WorkspaceRunBody {
    *  the worker replays the request with charging disabled. */
   skip_credit_charge?: boolean;
   precharged_credits?: number;
+  credit_scope?: "user" | "organization" | "team";
+  credit_organization_id?: string | null;
+  credit_class_id?: string | null;
 }
 
 const WORKSPACE_JOB_MAX_MS = 30 * 60_000;
@@ -4358,6 +4609,9 @@ type WorkspaceJobRow = {
   credits_charged?: number | null;
   credits_refunded?: number | null;
   credit_team_id?: string | null;
+  credit_organization_id?: string | null;
+  credit_class_id?: string | null;
+  credit_scope?: string | null;
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -5552,6 +5806,46 @@ serve(async (req) => {
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       }
+
+      /* Per-user rate limit. Prevents a single user (or compromised
+       * account) from spamming generations and burning provider
+       * billing in seconds. The audit found this dispatcher had no
+       * server-side rate limit at all — only client-side.
+       *
+       * Window: 60 gens per minute per user. That's still ~3,600/hr
+       * which covers any realistic creator burst (multi-gen waves,
+       * batch experiments) without leaving the door open to abuse.
+       * Workers + cron callers are exempt because their rate is
+       * already governed by the cron schedule. */
+      if (!req.headers.get("x-workspace-worker-secret") && !req.headers.get("x-cron-secret")) {
+        try {
+          const { data: rateOk, error: rateErr } = await supabase.rpc(
+            "check_rate_limit",
+            {
+              p_user_id: user.id,
+              p_endpoint: "workspace_run_node_enqueue",
+              p_max_requests: 60,
+              p_window_seconds: 60,
+            },
+          );
+          if (rateErr) {
+            // Don't fail closed on RPC errors — log and continue,
+            // since blocking legit users on a transient DB blip is
+            // worse than letting one extra gen through.
+            console.warn("[workspace-run-node] rate limit RPC error:", rateErr.message);
+          } else if (rateOk === false) {
+            return new Response(
+              JSON.stringify({
+                error: "ใช้งานถี่เกินไป รอสักครู่แล้วลองใหม่ / Too many requests, please slow down.",
+              }),
+              { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+            );
+          }
+        } catch (e) {
+          console.warn("[workspace-run-node] rate limit check failed:", e);
+        }
+      }
+
       const { action: _action, job_id: _jobId, ...runRequest } = body;
       const provider = getProviderForNodeType(
         nodeType,
@@ -5601,6 +5895,9 @@ serve(async (req) => {
             ...runRequest,
             skip_credit_charge: true,
             precharged_credits: jobCharge?.amount ?? 0,
+            credit_scope: jobCharge?.scope ?? "user",
+            credit_organization_id: jobCharge?.organizationId ?? null,
+            credit_class_id: jobCharge?.classId ?? null,
           },
           status: "queued",
           run_after: new Date().toISOString(),
@@ -5608,6 +5905,9 @@ serve(async (req) => {
           max_attempts: 18,
           credits_charged: jobCharge?.amount ?? 0,
           credit_team_id: jobCharge?.teamId ?? null,
+          credit_organization_id: jobCharge?.organizationId ?? null,
+          credit_class_id: jobCharge?.classId ?? null,
+          credit_scope: jobCharge?.scope ?? "user",
         })
         .select("id")
         .single();
@@ -6602,6 +6902,8 @@ serve(async (req) => {
     await recordGenerationEvent({
       supabase,
       userId: user.id,
+      organizationId: activeCreditCharge?.organizationId ?? body.credit_organization_id ?? null,
+      classId: activeCreditCharge?.classId ?? body.credit_class_id ?? null,
       provider,
       nodeType,
       params,

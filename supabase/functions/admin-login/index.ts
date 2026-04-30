@@ -45,12 +45,52 @@ async function signJWT(payload: Record<string, unknown>): Promise<string> {
   return `${h}.${p}.${s}`;
 }
 
+/**
+ * Bootstrap-only actions ("seed" / "reseed" / "force_reset") are
+ * gated behind a server-only secret. The audit found that anyone on
+ * the internet could POST `{ email, password, action: "reseed" }`
+ * and reset the super-admin password — full takeover via curl.
+ *
+ * After this fix the bootstrap actions require an `X-Bootstrap-Token`
+ * header that matches the `ADMIN_BOOTSTRAP_TOKEN` env var. The token
+ * is set ONCE in Supabase project secrets and only known to the
+ * deploy operator. Normal login continues to work without the token.
+ *
+ * Set the secret via the Supabase Dashboard → Functions → Secrets
+ * (`ADMIN_BOOTSTRAP_TOKEN=<random-32-char-string>`).
+ */
+function checkBootstrapToken(req: Request): boolean {
+  const expected = Deno.env.get("ADMIN_BOOTSTRAP_TOKEN");
+  if (!expected || expected.length < 16) {
+    // Fail closed: if no token is set, NO bootstrap action is allowed.
+    return false;
+  }
+  const provided = req.headers.get("x-bootstrap-token") ?? "";
+  // Constant-time-ish comparison to discourage timing oracles. Deno
+  // doesn't ship a crypto.timingSafeEqual; a length-then-XOR check
+  // is good enough for a 32-char shared secret over HTTPS.
+  if (provided.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) {
+    diff |= expected.charCodeAt(i) ^ provided.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
   try {
     const { email, password, action } = await req.json();
     if (!email || !password) return json({ error: "Email and password required" }, 400);
+
+    // Bootstrap-action gate: seed / reseed / force_reset all rewrite
+    // an admin's password. Without the env-set token, refuse.
+    const isBootstrapAction =
+      action === "seed" || action === "reseed" || action === "force_reset";
+    if (isBootstrapAction && !checkBootstrapToken(req)) {
+      return json({ error: "Forbidden" }, 403);
+    }
 
     const supabase = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 

@@ -40,6 +40,7 @@
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { verifyAdminJwt, unauthorizedResponse } from "../_shared/adminAuth.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -63,9 +64,6 @@ const USD_TO_THB = 35;
 const FLOW_CREDITS_PER_THB = 125;
 const WORKSPACE_CREDITS_PER_THB = 50;
 const FLOW_TO_WORKSPACE_RATIO = WORKSPACE_CREDITS_PER_THB / FLOW_CREDITS_PER_THB;
-const CMO_SHARED_CREDIT_DOMAIN = "cmo-group.com";
-const CMO_SHARED_CREDIT_POOL_USER_ID = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0";
-
 type CreditCostWriteRow = {
   feature: string;
   model: string | null;
@@ -455,12 +453,6 @@ async function setPricingBuffer(
 // the insert when no resolvable uuid is supplied. The frontend doesn't
 // pass one yet — leaving the hook in place so it lights up the day we
 // federate admin auth.
-function sharedCreditPoolUserIdForEmail(email?: string | null): string | null {
-  const normalized = String(email ?? "").trim().toLowerCase();
-  if (!normalized.endsWith(`@${CMO_SHARED_CREDIT_DOMAIN}`)) return null;
-  return CMO_SHARED_CREDIT_POOL_USER_ID;
-}
-
 async function getWorkspaceCreditBalance(
   client: SupabaseClient,
   authHeader: string | null,
@@ -472,6 +464,9 @@ async function getWorkspaceCreditBalance(
     is_shared_pool: boolean;
     pool_domain: string | null;
     pool_user_id: string | null;
+    organization_id?: string | null;
+    organization_name?: string | null;
+    organization_type?: string | null;
   };
 }> {
   const token = String(authHeader ?? "").replace(/^Bearer\s+/i, "").trim();
@@ -480,8 +475,57 @@ async function getWorkspaceCreditBalance(
   const { data: authData, error: authError } = await client.auth.getUser(token);
   if (authError || !authData.user) throw new Error("Invalid token");
 
-  const sharedPoolUserId = sharedCreditPoolUserIdForEmail(authData.user.email);
-  const creditUserId = sharedPoolUserId ?? authData.user.id;
+  let educationScope: Record<string, unknown> | null = null;
+  try {
+    const { data: eduScope, error: eduError } = await client.rpc("workspace_education_credit_scope", {
+      p_user_id: authData.user.id,
+    });
+    if (eduError && !/function .*workspace_education_credit_scope/i.test(eduError.message)) {
+      throw eduError;
+    }
+    const eduRow = Array.isArray(eduScope) ? eduScope[0] : eduScope;
+    if (eduRow?.organization_id && eduRow?.class_role === "student") {
+      educationScope = eduRow as Record<string, unknown>;
+    }
+  } catch (err) {
+    console.warn(
+      "admin_workspace_pricing: education credit balance lookup skipped:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+
+  try {
+    const { data: orgScope, error: orgError } = await client.rpc("workspace_org_credit_scope", {
+      p_user_id: authData.user.id,
+    });
+    if (orgError && !/function .*workspace_org_credit_scope/i.test(orgError.message)) {
+      throw orgError;
+    }
+    const orgRow = Array.isArray(orgScope) ? orgScope[0] : orgScope;
+    if (orgRow?.organization_id && !educationScope) {
+      const balance = Number(orgRow.credit_balance ?? 0);
+      return {
+        data: {
+          balance,
+          total_purchased: balance,
+          total_used: 0,
+          is_shared_pool: true,
+          pool_domain: orgRow.primary_domain ?? null,
+          pool_user_id: null,
+          organization_id: String(orgRow.organization_id),
+          organization_name: orgRow.organization_name ?? null,
+          organization_type: orgRow.organization_type ?? null,
+        },
+      };
+    }
+  } catch (err) {
+    console.warn(
+      "admin_workspace_pricing: org credit balance lookup skipped:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+
+  const creditUserId = authData.user.id;
   const { data, error } = await client
     .from("user_credits")
     .select("balance,total_purchased,total_used")
@@ -494,9 +538,12 @@ async function getWorkspaceCreditBalance(
       balance: Number((data as { balance?: number } | null)?.balance ?? 0),
       total_purchased: Number((data as { total_purchased?: number } | null)?.total_purchased ?? 0),
       total_used: Number((data as { total_used?: number } | null)?.total_used ?? 0),
-      is_shared_pool: Boolean(sharedPoolUserId),
-      pool_domain: sharedPoolUserId ? CMO_SHARED_CREDIT_DOMAIN : null,
-      pool_user_id: sharedPoolUserId,
+      is_shared_pool: false,
+      pool_domain: educationScope?.class_code ? String(educationScope.class_code) : null,
+      pool_user_id: null,
+      organization_id: educationScope?.organization_id ? String(educationScope.organization_id) : null,
+      organization_name: educationScope?.organization_name ? String(educationScope.organization_name) : null,
+      organization_type: educationScope?.organization_type ? String(educationScope.organization_type) : null,
     },
   };
 }
@@ -945,6 +992,11 @@ Deno.serve(async (req: Request) => {
   if (req.method !== "POST") {
     return json({ error: "Method not allowed — use POST" }, 405);
   }
+
+  // Admin-JWT gate. The audit found this function had no auth and
+  // anyone could rewrite `credit_costs` rows / set markup multipliers.
+  const adminPayload = await verifyAdminJwt(req);
+  if (!adminPayload) return unauthorizedResponse(CORS_HEADERS);
 
   let body: { action?: string; [k: string]: unknown };
   try {

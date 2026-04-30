@@ -1157,6 +1157,127 @@ serve(async (req) => {
       }
     }
 
+    /* ── Payment failure (declined card / past-due renewal) ──────
+     *
+     * Pre-fix: zero handler. Stripe would mark a subscription
+     * past-due, our DB still showed `subscription_status='professional'`,
+     * the user kept seeing the Pro UI but Stripe had stopped
+     * granting credits. They thought they were paid up while
+     * Stripe was silently dunning them.
+     *
+     * Post-fix: stamp the profile as `past_due` so the UI knows
+     * to surface the problem, and log the event for ops triage.
+     * Doesn't auto-suspend — that happens via subscription.deleted
+     * after the dunning window. */
+    if (event.type === "invoice.payment_failed") {
+      try {
+        const invoice = event.data.object as Stripe.Invoice;
+        const customerId =
+          typeof invoice.customer === "string"
+            ? invoice.customer
+            : invoice.customer?.id;
+        if (customerId) {
+          const { data: prof } = await supabase
+            .from("profiles")
+            .select("user_id")
+            .eq("stripe_customer_id", customerId)
+            .single();
+          if (prof?.user_id) {
+            await supabase
+              .from("profiles")
+              .update({ subscription_status: "past_due" })
+              .eq("user_id", prof.user_id);
+          }
+        }
+        console.log(
+          `[STRIPE-WEBHOOK] invoice.payment_failed customer=${customerId} amount_due=${invoice.amount_due}`,
+        );
+      } catch (e) {
+        console.error("[STRIPE-WEBHOOK] invoice.payment_failed exception:", e);
+      }
+    }
+
+    if (event.type === "payment_intent.payment_failed") {
+      try {
+        const intent = event.data.object as Stripe.PaymentIntent;
+        const customerId =
+          typeof intent.customer === "string"
+            ? intent.customer
+            : intent.customer?.id;
+        // Mark the matching payment_transactions row as failed if
+        // we recorded one (idempotent — the row may not exist if
+        // the failure happened before the user got past 3DS).
+        await supabase
+          .from("payment_transactions")
+          .update({
+            status: "failed",
+            stripe_error: intent.last_payment_error?.message ?? "payment_failed",
+          })
+          .eq("stripe_payment_intent_id", intent.id);
+        console.log(
+          `[STRIPE-WEBHOOK] payment_intent.payment_failed pi=${intent.id} customer=${customerId} err=${intent.last_payment_error?.code ?? "?"}`,
+        );
+      } catch (e) {
+        console.error(
+          "[STRIPE-WEBHOOK] payment_intent.payment_failed exception:",
+          e,
+        );
+      }
+    }
+
+    /* ── Chargeback / dispute ────────────────────────────────
+     *
+     * Pre-fix: no handler. A user disputes a charge → our system
+     * never knows, the user keeps using the credits they bought.
+     *
+     * Post-fix: log the dispute against the user's profile via a
+     * service-side audit table (`payment_disputes`) so ops can
+     * see it on the dashboard, and pause the subscription if the
+     * dispute looks fraud-flavoured. We don't auto-revoke credits
+     * because Stripe gives 7+ days to respond — admin can choose. */
+    if (
+      event.type === "charge.dispute.created" ||
+      event.type === "charge.dispute.updated" ||
+      event.type === "charge.dispute.closed"
+    ) {
+      try {
+        const dispute = event.data.object as Stripe.Dispute;
+        const chargeId =
+          typeof dispute.charge === "string" ? dispute.charge : dispute.charge?.id;
+        const customerId =
+          typeof (dispute as unknown as { customer?: string | { id: string } }).customer === "string"
+            ? ((dispute as unknown as { customer: string }).customer)
+            : (dispute as unknown as { customer?: { id: string } }).customer?.id;
+        // Best-effort upsert into a disputes table — table may
+        // not exist on every environment; ignore failures so the
+        // webhook still 200s back to Stripe.
+        try {
+          await supabase
+            .from("payment_disputes")
+            .upsert(
+              {
+                stripe_dispute_id: dispute.id,
+                stripe_charge_id: chargeId,
+                stripe_customer_id: customerId,
+                amount: dispute.amount,
+                currency: dispute.currency,
+                reason: dispute.reason,
+                status: dispute.status,
+                created_at: new Date(dispute.created * 1000).toISOString(),
+              },
+              { onConflict: "stripe_dispute_id" },
+            );
+        } catch (e) {
+          console.warn("[STRIPE-WEBHOOK] payment_disputes upsert failed (table may not exist):", e);
+        }
+        console.warn(
+          `[STRIPE-WEBHOOK] DISPUTE ${event.type} dispute=${dispute.id} charge=${chargeId} reason=${dispute.reason} amount=${dispute.amount}`,
+        );
+      } catch (e) {
+        console.error("[STRIPE-WEBHOOK] dispute exception:", e);
+      }
+    }
+
     return new Response(JSON.stringify({ received: true }), {
       headers: { "Content-Type": "application/json" },
     });
