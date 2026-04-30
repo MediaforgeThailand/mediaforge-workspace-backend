@@ -642,6 +642,9 @@ async function executeKlingStandard(
   }
 
   const rawTailUrl = params.image_tail_url as string | undefined;
+  if (rawTailUrl && !rawImageUrl) {
+    throw new Error("Validation: End frame requires a start frame.");
+  }
   let tailImageBase64: string | undefined;
   if (rawTailUrl) {
     try {
@@ -792,6 +795,9 @@ async function executeKlingOmni(
   }
 
   const rawTailUrl = params.image_tail_url as string | undefined;
+  if (rawTailUrl && !rawImageUrl) {
+    throw new Error("Validation: End frame requires a start frame.");
+  }
   if (rawTailUrl) {
     let tailPayload = rawTailUrl;
     try {
@@ -4223,6 +4229,7 @@ interface WorkspaceRunBody {
   action?:
     | "enqueue_workspace_job"
     | "get_workspace_job"
+    | "poll_workspace_job"
     | "poll_kling"
     | "poll_seedance"
     | "poll_hyper3d"
@@ -4428,6 +4435,114 @@ async function pollWorkspaceAsyncResult(args: {
   throw new Error(`${provider} polling timed out (last status: ${lastStatus || "empty"})`);
 }
 
+type WorkspaceAsyncPollOnceResult =
+  | { state: "not_async"; result: Record<string, unknown> }
+  | { state: "pending"; status: string; message: string }
+  | { state: "succeeded"; result: Record<string, unknown> }
+  | { state: "failed"; message: string };
+
+async function pollWorkspaceAsyncResultOnce(args: {
+  functionUrl: string;
+  authHeader: string;
+  response: Record<string, unknown>;
+}): Promise<WorkspaceAsyncPollOnceResult> {
+  const taskId = String(args.response.task_id ?? "").trim();
+  const providerMeta =
+    args.response.provider_meta && typeof args.response.provider_meta === "object"
+      ? (args.response.provider_meta as Record<string, unknown>)
+      : {};
+  const pollEndpoint = String(providerMeta.poll_endpoint ?? "").trim();
+  if (!taskId || args.response.url || !pollEndpoint) {
+    return { state: "not_async", result: args.response };
+  }
+
+  const provider = String(providerMeta.provider ?? "kling").toLowerCase();
+  const pollAction =
+    provider === "tripo3d"
+      ? "poll_tripo3d"
+      : provider === "hyper3d"
+        ? "poll_hyper3d"
+      : provider === "seedance"
+        ? "poll_seedance"
+        : "poll_kling";
+
+  const pollResp = await invokeWorkspaceRunOnce({
+    functionUrl: args.functionUrl,
+    authHeader: args.authHeader,
+    body: {
+      action: pollAction,
+      task_id: taskId,
+      poll_endpoint: pollEndpoint,
+      model: String(providerMeta.model ?? providerMeta.provider_model_id ?? ""),
+      provider_model_id: String(providerMeta.provider_model_id ?? ""),
+    } as WorkspaceRunBody,
+  });
+
+  const status = String(pollResp.status ?? "").toLowerCase();
+  const message = String(pollResp.message ?? "");
+  if (status === "polling_error") {
+    return { state: "pending", status, message };
+  }
+
+  const successStatuses = new Set([
+    "succeed",
+    "success",
+    "succeeded",
+    "completed",
+    "complete",
+    "done",
+  ]);
+  const failedStatuses = new Set([
+    "failed",
+    "fail",
+    "error",
+    "errored",
+    "cancelled",
+    "canceled",
+  ]);
+
+  if (successStatuses.has(status)) {
+    const url = String(pollResp.url ?? "");
+    if (!url) {
+      return { state: "failed", message: `${provider} task succeeded but returned no URL` };
+    }
+    const nextProviderMeta = {
+      ...providerMeta,
+      ...(pollResp.model_url ? { model_url: pollResp.model_url } : {}),
+      ...(pollResp.preview_image ? { rendered_image: pollResp.preview_image } : {}),
+    };
+    const currentOutputs =
+      args.response.outputs && typeof args.response.outputs === "object"
+        ? (args.response.outputs as Record<string, string>)
+        : {};
+    const responseType = String(args.response.type ?? "");
+    const outputKey =
+      responseType === "video"
+        ? "output_video"
+        : responseType === "audio"
+          ? "output_audio"
+          : "output_image";
+    return {
+      state: "succeeded",
+      result: {
+        ...args.response,
+        url,
+        outputs: {
+          ...currentOutputs,
+          [outputKey]: url,
+        },
+        provider_meta: nextProviderMeta,
+      },
+    };
+  }
+
+  if (failedStatuses.has(status)) {
+    return { state: "failed", message: message || `${provider} task failed` };
+  }
+
+  return { state: "pending", status: status || "submitted", message };
+}
+
 async function processWorkspaceGenerationJob(args: {
   supabase: any;
   jobId: string;
@@ -4476,13 +4591,32 @@ async function processWorkspaceGenerationJob(args: {
         authHeader: args.authHeader,
         body: request,
       });
+      const charged = Number(job.credits_charged ?? 0);
+      const initialWithCredits = {
+        ...initial,
+        credits_spent: Number.isFinite(charged) ? charged : 0,
+      };
+      const providerMeta =
+        initial.provider_meta && typeof initial.provider_meta === "object"
+          ? (initial.provider_meta as Record<string, unknown>)
+          : {};
+      if (initial.task_id && providerMeta.poll_endpoint && !initial.url) {
+        await args.supabase
+          .from("workspace_generation_jobs")
+          .update({
+            status: "running",
+            result: initialWithCredits,
+            error: null,
+            last_error: null,
+          })
+          .eq("id", job.id);
+      }
       const finalResult = await pollWorkspaceAsyncResult({
         functionUrl: args.functionUrl,
         authHeader: args.authHeader,
-        response: initial,
+        response: initialWithCredits,
         budgetEndsAt,
       });
-      const charged = Number(job.credits_charged ?? 0);
       const finalResultWithCredits = {
         ...finalResult,
         credits_spent: Number.isFinite(charged) ? charged : 0,
@@ -4623,6 +4757,124 @@ serve(async (req) => {
         JSON.stringify({ job }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
+    }
+
+    if (body.action === "poll_workspace_job") {
+      const jobId = String(body.job_id ?? "").trim();
+      if (!jobId) {
+        return new Response(
+          JSON.stringify({ error: "job_id required" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const loadJob = async () => {
+        const { data: job, error } = await supabase
+          .from("workspace_generation_jobs")
+          .select("*")
+          .eq("id", jobId)
+          .eq("user_id", user.id)
+          .maybeSingle();
+        if (error) throw error;
+        return job as WorkspaceJobRow | null;
+      };
+
+      let job = await loadJob();
+      if (!job) {
+        return new Response(
+          JSON.stringify({ error: "job not found" }),
+          { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      if (["completed", "failed", "permanent_failed"].includes(job.status)) {
+        return new Response(
+          JSON.stringify({ job }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const currentResult =
+        job.result && typeof job.result === "object"
+          ? (job.result as Record<string, unknown>)
+          : null;
+      if (!currentResult?.task_id) {
+        return new Response(
+          JSON.stringify({ job }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      try {
+        const outcome = await pollWorkspaceAsyncResultOnce({
+          functionUrl: `${SUPABASE_URL}/functions/v1/workspace-run-node`,
+          authHeader,
+          response: currentResult,
+        });
+
+        if (outcome.state === "succeeded") {
+          const charged = Number(job.credits_charged ?? 0);
+          await supabase
+            .from("workspace_generation_jobs")
+            .update({
+              status: "completed",
+              result: {
+                ...outcome.result,
+                credits_spent: Number.isFinite(charged) ? charged : 0,
+              },
+              error: null,
+              last_error: null,
+              completed_at: new Date().toISOString(),
+            })
+            .eq("id", job.id);
+        } else if (outcome.state === "failed") {
+          const msg = outcome.message.substring(0, 1000);
+          await supabase
+            .from("workspace_generation_jobs")
+            .update({
+              status: "failed",
+              error: msg,
+              last_error: msg,
+              completed_at: new Date().toISOString(),
+            })
+            .eq("id", job.id);
+          await refundWorkspaceJobCharge({
+            supabase,
+            job,
+            reason: `workspace async task failed: ${msg.substring(0, 160)}`,
+          });
+        } else if (outcome.state === "pending") {
+          await supabase
+            .from("workspace_generation_jobs")
+            .update({
+              status: "running",
+              last_error: outcome.message
+                ? outcome.message.substring(0, 1000)
+                : `Provider status: ${outcome.status}`,
+            })
+            .eq("id", job.id);
+        }
+
+        job = await loadJob();
+        return new Response(
+          JSON.stringify({ job }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await supabase
+          .from("workspace_generation_jobs")
+          .update({
+            status: "running",
+            last_error: msg.substring(0, 1000),
+          })
+          .eq("id", job.id);
+        job = await loadJob();
+        return new Response(
+          JSON.stringify({ job, warning: msg.substring(0, 300) }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
     }
 
     if (body.action === "enqueue_workspace_job") {
