@@ -2177,6 +2177,10 @@ async function executeGoogleTts(
   const langMatch = voiceId.match(/^([a-z]{2}-[A-Z]{2})-/);
   const languageCode = langMatch?.[1] ?? "en-US";
 
+  const speakingRate = clampNum(params.speaking_rate ?? params.speakingRate, 0.25, 2.0, 1.0);
+  const pitch = clampNum(params.pitch, -20.0, 20.0, 0);
+  const volumeGainDb = clampNum(params.volume_gain_db ?? params.volumeGainDb, -96.0, 16.0, 0);
+
   // Optional style hint → SSML <prosody>. Conservative mapping —
   // recognise a handful of keywords ("calm", "fast", "slow", "warm").
   // Anything else gets passed as a plain raw <speak> wrapper without
@@ -2218,10 +2222,9 @@ async function executeGoogleTts(
         voice: { languageCode, name: voiceId },
         audioConfig: {
           audioEncoding: "MP3",
-          // Google's defaults are tuned for broadcast read; keep
-          // them unless the style hint already adjusted prosody.
-          speakingRate: 1.0,
-          pitch: 0,
+          speakingRate,
+          pitch,
+          ...(volumeGainDb !== 0 ? { volumeGainDb } : {}),
         },
       }),
     },
@@ -2286,6 +2289,9 @@ async function executeGoogleTts(
       provider: "google_tts",
       text_length: text.length,
       style_prompt: styleHint || null,
+      speaking_rate: speakingRate,
+      pitch,
+      volume_gain_db: volumeGainDb,
     },
   });
 
@@ -2298,6 +2304,9 @@ async function executeGoogleTts(
       voice: voiceId,
       language: languageCode,
       model: String(params.model_name ?? "google-tts-studio"),
+      speaking_rate: speakingRate,
+      pitch,
+      volume_gain_db: volumeGainDb,
     },
   };
 }
@@ -2414,9 +2423,10 @@ async function executeElevenLabsTts(
       ? presetDefaults.use_speaker_boost
       : params.use_speaker_boost === true || params.use_speaker_boost === "true";
 
-  // `speed` is a top-level parameter (NOT inside voice_settings) per
-  // ElevenLabs API docs. Valid range: 0.7 – 1.2. Skip when default.
+  // `speed` lives with the rest of the request-level `voice_settings`
+  // in ElevenLabs' TTS API. Valid range in our UI: 0.7–1.2.
   const speed = clampNum(params.speed, 0.7, 1.2, 1.0);
+  const styleHint = String(params.style_prompt ?? "").trim();
 
   console.log(
     `[elevenlabs-tts] voice=${voiceId} model=${elevenModelId} stab=${stability} sim=${similarityBoost} style=${style} speed=${speed} chars=${text.length}`,
@@ -2502,6 +2512,13 @@ async function executeElevenLabsTts(
       model: elevenModelId,
       text_length: text.length,
       style_prompt: styleHint || null,
+      voice_settings: {
+        stability,
+        similarity_boost: similarityBoost,
+        style,
+        speed,
+        use_speaker_boost: useSpeakerBoost,
+      },
     },
   });
 
@@ -2513,6 +2530,13 @@ async function executeElevenLabsTts(
       provider: "elevenlabs_tts",
       voice: voiceId,
       model: elevenModelId,
+      voice_settings: {
+        stability,
+        similarity_boost: similarityBoost,
+        style,
+        speed,
+        use_speaker_boost: useSpeakerBoost,
+      },
     },
   };
 }
