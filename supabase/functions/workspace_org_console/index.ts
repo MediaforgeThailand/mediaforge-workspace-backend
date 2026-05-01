@@ -77,6 +77,31 @@ function emailDomain(email: string): string {
   return email.toLowerCase().split("@")[1] ?? "";
 }
 
+function allowedConsoleRedirect(input: unknown): string {
+  const fallback = Deno.env.get("ADMIN_CONSOLE_URL") || "https://mediaforge-admin-hub.vercel.app/org/console";
+  const allowed = [
+    fallback,
+    "https://mediaforge-admin-hub.vercel.app/org/console",
+    "http://127.0.0.1:8090/org/console",
+    "http://localhost:8090/org/console",
+  ];
+  const raw = asString(input) || fallback;
+  try {
+    const url = new URL(raw);
+    const isAllowed = allowed.some((candidate) => {
+      try {
+        const allowedUrl = new URL(candidate);
+        return url.origin === allowedUrl.origin && url.pathname === allowedUrl.pathname;
+      } catch {
+        return false;
+      }
+    });
+    return isAllowed ? url.toString() : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 async function currentUser(req: Request): Promise<User | null> {
   const authHeader = req.headers.get("Authorization") ?? req.headers.get("authorization") ?? "";
   if (!authHeader.startsWith("Bearer ")) return null;
@@ -192,6 +217,37 @@ async function getTeamStatus(client: SupabaseClient, user: User) {
         organization: orgById.get(row.organization_id) ?? null,
       })),
       can_open_admin_console: (memberships ?? []).some((row: any) => row.role === "org_admin" && row.status === "active"),
+    },
+  };
+}
+
+async function createConsoleLoginLink(client: SupabaseClient, user: User, body: Record<string, unknown>) {
+  if (!user.email) throw new Error("user email is required");
+  const ctx = await orgAdminContext(client, user);
+  if (!ctx) throw new Error("org_admin_required");
+
+  const redirectTo = allowedConsoleRedirect(body.redirect_to);
+  const { data, error } = await client.auth.admin.generateLink({
+    type: "magiclink",
+    email: user.email,
+    options: { redirectTo },
+  });
+  if (error) throw new Error(`console handoff failed: ${error.message}`);
+
+  const url = (data as any)?.properties?.action_link;
+  if (!url) throw new Error("console handoff failed: missing action link");
+
+  await client.from("workspace_activity").insert({
+    user_id: user.id,
+    organization_id: ctx.organization_id,
+    activity_type: "login",
+    metadata: { redirect_to: redirectTo },
+  });
+
+  return {
+    data: {
+      url,
+      redirect_to: redirectTo,
     },
   };
 }
@@ -516,6 +572,7 @@ async function getOrgPaymentStatus(client: SupabaseClient, user: User, body: Rec
 
 const ACTIONS: Record<string, (client: SupabaseClient, user: User, body: Record<string, unknown>) => Promise<unknown>> = {
   get_team_status: getTeamStatus,
+  create_console_login_link: createConsoleLoginLink,
   get_console_overview: getOverview,
   invite_member: inviteMember,
   approve_member: (client, user, body) => updateMemberStatus(client, user, body, "active"),
