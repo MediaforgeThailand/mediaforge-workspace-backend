@@ -1048,13 +1048,22 @@ Deno.serve(async (req: Request) => {
       // Pricing Manager calls this `fetch_credit_costs` against the consumer
       // bridge — accept both names so the frontend can stay agnostic.
       case "list_credit_costs":
-      case "fetch_credit_costs":
-        return json(
-          await listRows(admin, "credit_costs", [
+      case "fetch_credit_costs": {
+        const rows = await listRows(admin, "credit_costs", [
             { column: "feature", ascending: true },
             { column: "model", ascending: true },
-          ]),
-        );
+        ]);
+        if (rows.data.length === 0) {
+          await seedWorkspacePricingCatalog(admin, auditCtx);
+          return json(
+            await listRows(admin, "credit_costs", [
+              { column: "feature", ascending: true },
+              { column: "model", ascending: true },
+            ]),
+          );
+        }
+        return json(rows);
+      }
 
       case "get_markup_multipliers":
         return json(await getMarkupMultipliers(admin));
