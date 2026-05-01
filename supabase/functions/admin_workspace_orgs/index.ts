@@ -7,6 +7,9 @@
 // Action-style admin API for Workspace SSO organizations, domains,
 // providers, org credit pools, and team/class credit pools. This is used by
 // the ERP admin hub when the operator selects the Workspace target.
+//
+// ERP scope: support/debug. Customer org admins manage members, teams,
+// requests, top-ups, and team credit pools through workspace_org_console.
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -25,7 +28,7 @@ const CORS_HEADERS = {
 const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,58}[a-z0-9])?$/;
 const PROVIDERS = new Set(["google_workspace", "microsoft_entra", "email_otp", "saml"]);
-const ORG_TYPES = new Set(["school", "university", "enterprise", "agency"]);
+const ORG_TYPES = new Set(["school", "university", "enterprise"]);
 const ORG_STATUSES = new Set(["pending", "active", "suspended", "expired"]);
 
 function json(body: unknown, status = 200) {

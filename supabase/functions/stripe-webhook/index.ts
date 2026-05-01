@@ -1025,6 +1025,77 @@ serve(async (req) => {
       }
 
       // ─── PROMPTPAY TOP-UP (existing flow) ───
+      if (intentType === "org_promptpay_topup") {
+        const userId = intent.metadata.user_id;
+        const organizationId = intent.metadata.organization_id;
+        const creditsToAdd = parseInt(intent.metadata.credits || "0", 10);
+        const packageName = intent.metadata.package_name || "Organization credit top-up";
+
+        if (!userId || !organizationId || creditsToAdd <= 0) {
+          console.error("[STRIPE-WEBHOOK] Org PromptPay: missing user_id, organization_id, or credits");
+          return new Response(JSON.stringify({ error: "Invalid org top-up metadata" }), { status: 400 });
+        }
+
+        const { data: existingTx } = await supabase
+          .from("payment_transactions")
+          .select("id")
+          .eq("stripe_payment_intent_id", intent.id)
+          .eq("status", "completed")
+          .maybeSingle();
+
+        if (existingTx) {
+          console.log(`[STRIPE-WEBHOOK] Org PromptPay: already processed ${intent.id}`);
+          return new Response(JSON.stringify({ received: true }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+
+        const amountThb = (intent.amount || 0) / 100;
+        const { data: newPool, error: poolError } = await supabase.rpc("admin_adjust_org_credit_pool", {
+          p_org_id: organizationId,
+          p_delta: creditsToAdd,
+          p_actor_id: userId,
+          p_description: `${packageName}: +${creditsToAdd} credits (PromptPay, THB ${amountThb})`,
+        });
+
+        if (poolError || newPool === -1) {
+          console.error("[STRIPE-WEBHOOK] Org PromptPay credit pool error:", poolError);
+          return new Response(JSON.stringify({ error: "Organization credit grant failed" }), { status: 500 });
+        }
+
+        await supabase.from("payment_transactions").insert({
+          user_id: userId,
+          organization_id: organizationId,
+          payment_scope: "organization",
+          package_id: null,
+          stripe_session_id: null,
+          stripe_payment_intent_id: intent.id,
+          amount_thb: amountThb,
+          credits_added: creditsToAdd,
+          status: "completed",
+          payment_method: "promptpay",
+        });
+
+        console.log(`[STRIPE-WEBHOOK] Org PromptPay success: +${creditsToAdd} for org ${organizationId}`);
+
+        try {
+          const { email, first_name } = await getUserEmailAndName(supabase, userId);
+          if (email) {
+            await sendTransactionalEmail("payment_receipt", email, {
+              first_name,
+              invoice_number: intent.id,
+              payment_date: fmtDateTH(new Date()),
+              package_name: packageName,
+              credits_added: fmtNum(creditsToAdd),
+              amount_thb: fmtNum(amountThb),
+              transactions_url: "https://mediaforge-admin-hub.vercel.app/org/console",
+            });
+          }
+        } catch (e) {
+          console.warn("[STRIPE-WEBHOOK] Org PromptPay receipt email failed:", e);
+        }
+      }
+
       if (intentType === "promptpay_topup") {
         const userId = intent.metadata.user_id;
         const creditsToAdd = parseInt(intent.metadata.credits || "0", 10);
