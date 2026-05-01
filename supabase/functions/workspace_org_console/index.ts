@@ -466,6 +466,17 @@ async function normalizeTeamId(client: SupabaseClient, orgId: string, value: unk
   return teamId;
 }
 
+async function activeOrgAdminCount(client: SupabaseClient, orgId: string): Promise<number> {
+  const { count, error } = await client
+    .from("organization_memberships")
+    .select("id", { count: "exact", head: true })
+    .eq("organization_id", orgId)
+    .eq("role", "org_admin")
+    .eq("status", "active");
+  if (error) throw new Error(`admin count failed: ${error.message}`);
+  return count ?? 0;
+}
+
 async function inviteMember(client: SupabaseClient, user: User, body: Record<string, unknown>) {
   const ctx = await orgAdminContext(client, user);
   if (!ctx) throw new Error("org_admin_required");
@@ -519,6 +530,49 @@ async function inviteMember(client: SupabaseClient, user: User, body: Record<str
   return { data: { mode: "invited", invite: data } };
 }
 
+async function updateMember(client: SupabaseClient, user: User, body: Record<string, unknown>) {
+  const ctx = await orgAdminContext(client, user);
+  if (!ctx) throw new Error("org_admin_required");
+  const membershipId = asString(body.membership_id);
+  if (!membershipId) throw new Error("membership_id is required");
+
+  const { data: member, error: memberError } = await client
+    .from("organization_memberships")
+    .select("id,user_id,organization_id,role,status,team_id")
+    .eq("id", membershipId)
+    .eq("organization_id", ctx.organization_id)
+    .maybeSingle();
+  if (memberError) throw new Error(`member lookup failed: ${memberError.message}`);
+  if (!member) throw new Error("member not found");
+
+  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  const nextRole = asString(body.role);
+  if (nextRole) {
+    if (nextRole !== "org_admin" && nextRole !== "member") throw new Error("invalid role");
+    if ((member as any).role === "org_admin" && nextRole !== "org_admin") {
+      const adminCount = await activeOrgAdminCount(client, ctx.organization_id);
+      if (adminCount <= 1) throw new Error("organization must keep at least one active admin");
+    }
+    updates.role = nextRole;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, "team_id")) {
+    updates.team_id = await normalizeTeamId(client, ctx.organization_id, body.team_id);
+  }
+
+  if (Object.keys(updates).length === 1) throw new Error("no member updates provided");
+
+  const { data, error } = await client
+    .from("organization_memberships")
+    .update(updates)
+    .eq("id", membershipId)
+    .eq("organization_id", ctx.organization_id)
+    .select("id,user_id,organization_id,role,status,source,team_id,requested_at,approved_at,joined_at,created_at,updated_at")
+    .single();
+  if (error) throw new Error(`member update failed: ${error.message}`);
+  return { data: { member: data } };
+}
+
 async function updateMemberStatus(client: SupabaseClient, user: User, body: Record<string, unknown>, status: "active" | "rejected" | "suspended") {
   const ctx = await orgAdminContext(client, user);
   if (!ctx) throw new Error("org_admin_required");
@@ -526,6 +580,22 @@ async function updateMemberStatus(client: SupabaseClient, user: User, body: Reco
   if (!membershipId) throw new Error("membership_id is required");
   const role = asString(body.role);
   const teamId = await normalizeTeamId(client, ctx.organization_id, body.team_id);
+
+  const { data: existing, error: existingError } = await client
+    .from("organization_memberships")
+    .select("id,user_id,role,status")
+    .eq("id", membershipId)
+    .eq("organization_id", ctx.organization_id)
+    .maybeSingle();
+  if (existingError) throw new Error(`member lookup failed: ${existingError.message}`);
+  if (!existing) throw new Error("member not found");
+  if (status === "suspended" && (existing as any).user_id === user.id) {
+    throw new Error("you cannot suspend your own admin account");
+  }
+  if (status === "suspended" && (existing as any).role === "org_admin") {
+    const adminCount = await activeOrgAdminCount(client, ctx.organization_id);
+    if (adminCount <= 1) throw new Error("organization must keep at least one active admin");
+  }
 
   const updates: Record<string, unknown> = {
     status,
@@ -608,6 +678,63 @@ async function allocateTeamCredits(client: SupabaseClient, user: User, body: Rec
   if (data === -1) throw new Error("organization pool does not have enough available credits");
   if (data === -2) throw new Error("team has already consumed too many credits to revoke that amount");
   return { data: { credit_pool: data } };
+}
+
+async function deleteTeam(client: SupabaseClient, user: User, body: Record<string, unknown>) {
+  const ctx = await orgAdminContext(client, user);
+  if (!ctx) throw new Error("org_admin_required");
+  const teamId = await normalizeTeamId(client, ctx.organization_id, body.team_id);
+  if (!teamId) throw new Error("team_id is required");
+
+  const { data: team, error: teamError } = await client
+    .from("classes")
+    .select("id,organization_id,name,code,credit_pool,credit_pool_consumed")
+    .eq("id", teamId)
+    .eq("organization_id", ctx.organization_id)
+    .is("deleted_at", null)
+    .maybeSingle();
+  if (teamError) throw new Error(`team lookup failed: ${teamError.message}`);
+  if (!team) throw new Error("team not found");
+
+  const available = Math.max(0, Number((team as any).credit_pool ?? 0) - Number((team as any).credit_pool_consumed ?? 0));
+  if (available > 0) {
+    const { data, error } = await client.rpc("admin_allocate_class_pool", {
+      p_class_id: teamId,
+      p_delta: -available,
+      p_actor_id: user.id,
+      p_description: `Delete team ${String((team as any).name ?? teamId)}: return unused credits`,
+    });
+    if (error) throw new Error(`team credit return failed: ${error.message}`);
+    if (data === -2) throw new Error("team has consumed more credits than expected");
+  }
+
+  await client
+    .from("organization_memberships")
+    .update({ team_id: null, updated_at: new Date().toISOString() })
+    .eq("organization_id", ctx.organization_id)
+    .eq("team_id", teamId);
+  await client
+    .from("organization_member_invites")
+    .update({ team_id: null, updated_at: new Date().toISOString() })
+    .eq("organization_id", ctx.organization_id)
+    .eq("team_id", teamId)
+    .eq("status", "pending");
+
+  const deletedCode = `${String((team as any).code ?? "team")}-deleted-${Date.now()}`;
+  const { data: deleted, error: deleteError } = await client
+    .from("classes")
+    .update({
+      status: "archived",
+      code: deletedCode,
+      deleted_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", teamId)
+    .eq("organization_id", ctx.organization_id)
+    .select("id,name,code,status,deleted_at")
+    .single();
+  if (deleteError) throw new Error(`team delete failed: ${deleteError.message}`);
+  return { data: { team: deleted, credits_returned: available } };
 }
 
 async function createOrgPromptPayIntent(client: SupabaseClient, user: User, body: Record<string, unknown>, req: Request) {
@@ -747,11 +874,13 @@ const ACTIONS: Record<string, (client: SupabaseClient, user: User, body: Record<
   create_console_login_link: createConsoleLoginLink,
   get_console_overview: getOverview,
   invite_member: inviteMember,
+  update_member: updateMember,
   approve_member: (client, user, body) => updateMemberStatus(client, user, body, "active"),
   reject_member: (client, user, body) => updateMemberStatus(client, user, body, "rejected"),
   suspend_member: (client, user, body) => updateMemberStatus(client, user, body, "suspended"),
   create_team: createTeam,
   allocate_team_credits: allocateTeamCredits,
+  delete_team: deleteTeam,
   get_org_payment_status: getOrgPaymentStatus,
   get_org_receipt: getOrgReceipt,
 };
