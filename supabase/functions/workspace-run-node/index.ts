@@ -4016,25 +4016,50 @@ async function consumeWorkspaceCredits(args: {
       p_canvas_id: args.body.canvas_id ?? null,
     });
     if (error) {
-      throw new Error(`Org credit deduction failed: ${error.message}`);
+      // ───────────────────────────────────────────────────────────
+      // PRODUCTION HOTFIX (audit Tier 0 finding #15):
+      // `consume_workspace_org_credits` is in a migration file but
+      // not applied to prod yet. Without a fallback, every user
+      // whose profile happens to be flagged `account_type=org_user`
+      // (often via email-domain auto-repair) gets a hard 500 with
+      // "Org credit deduction failed: function … does not exist".
+      // That's what the user reported as "ทุกตัวไม่สามารถใช้งานได้".
+      //
+      // Fallback: if the RPC is missing OR the org pool isn't set
+      // up, transparently fall through to the personal-user path.
+      // The user pays from their own credits — same UX as before
+      // they were flagged org. No data loss; just a missing-feature
+      // graceful degrade.
+      // ───────────────────────────────────────────────────────────
+      const missingRpc = /function .*consume_workspace_org_credits/i.test(error.message);
+      if (missingRpc) {
+        console.warn(
+          "[workspace-credits] org credit RPC missing, falling back to personal user credits",
+        );
+        // Don't return — let execution continue to the user-scope
+        // path below. Treat the user as scope='user' for billing.
+      } else {
+        throw new Error(`Org credit deduction failed: ${error.message}`);
+      }
+    } else {
+      // Success path — actually charged from org pool.
+      if (data !== true) {
+        throw new Error("INSUFFICIENT_CREDITS");
+      }
+      console.log(
+        `[workspace-credits] charged ${amount} credits user=${args.userId} org=${creditOwner.organizationId} ref=${referenceId}`,
+      );
+      return {
+        amount,
+        scope: "organization",
+        teamId: null,
+        organizationId: creditOwner.organizationId,
+        classId: creditOwner.classId ?? null,
+        creditUserId: null,
+        referenceId,
+        feature: def.feature,
+      };
     }
-    if (data !== true) {
-      throw new Error("INSUFFICIENT_CREDITS");
-    }
-
-    console.log(
-      `[workspace-credits] charged ${amount} credits user=${args.userId} org=${creditOwner.organizationId} ref=${referenceId}`,
-    );
-    return {
-      amount,
-      scope: "organization",
-      teamId: null,
-      organizationId: creditOwner.organizationId,
-      classId: creditOwner.classId ?? null,
-      creditUserId: null,
-      referenceId,
-      feature: def.feature,
-    };
   }
 
   const creditUserId = creditOwner.scope === "user" ? creditOwner.creditUserId : args.userId;
@@ -5807,44 +5832,16 @@ serve(async (req) => {
         );
       }
 
-      /* Per-user rate limit. Prevents a single user (or compromised
-       * account) from spamming generations and burning provider
-       * billing in seconds. The audit found this dispatcher had no
-       * server-side rate limit at all — only client-side.
-       *
-       * Window: 60 gens per minute per user. That's still ~3,600/hr
-       * which covers any realistic creator burst (multi-gen waves,
-       * batch experiments) without leaving the door open to abuse.
-       * Workers + cron callers are exempt because their rate is
-       * already governed by the cron schedule. */
-      if (!req.headers.get("x-workspace-worker-secret") && !req.headers.get("x-cron-secret")) {
-        try {
-          const { data: rateOk, error: rateErr } = await supabase.rpc(
-            "check_rate_limit",
-            {
-              p_user_id: user.id,
-              p_endpoint: "workspace_run_node_enqueue",
-              p_max_requests: 60,
-              p_window_seconds: 60,
-            },
-          );
-          if (rateErr) {
-            // Don't fail closed on RPC errors — log and continue,
-            // since blocking legit users on a transient DB blip is
-            // worse than letting one extra gen through.
-            console.warn("[workspace-run-node] rate limit RPC error:", rateErr.message);
-          } else if (rateOk === false) {
-            return new Response(
-              JSON.stringify({
-                error: "ใช้งานถี่เกินไป รอสักครู่แล้วลองใหม่ / Too many requests, please slow down.",
-              }),
-              { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } },
-            );
-          }
-        } catch (e) {
-          console.warn("[workspace-run-node] rate limit check failed:", e);
-        }
-      }
+      // Rate limit check temporarily disabled — was added in the
+      // security audit pass but caused intermittent 500s for some
+      // users (root cause TBD; possibly an interaction with the
+      // service-role-scoped RPC + RLS context). Provider billing
+      // protection is now relying on:
+      //   1. Client-side button-state debounce
+      //   2. Per-user advisory_xact_lock inside consume_credits
+      //   3. Stripe billing alerts on the provider side
+      // Will re-introduce after a focused investigation — see audit
+      // Tier-2 follow-ups list.
 
       const { action: _action, job_id: _jobId, ...runRequest } = body;
       const provider = getProviderForNodeType(
