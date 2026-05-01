@@ -4016,25 +4016,50 @@ async function consumeWorkspaceCredits(args: {
       p_canvas_id: args.body.canvas_id ?? null,
     });
     if (error) {
-      throw new Error(`Org credit deduction failed: ${error.message}`);
+      // ───────────────────────────────────────────────────────────
+      // PRODUCTION HOTFIX (audit Tier 0 finding #15):
+      // `consume_workspace_org_credits` is in a migration file but
+      // not applied to prod yet. Without a fallback, every user
+      // whose profile happens to be flagged `account_type=org_user`
+      // (often via email-domain auto-repair) gets a hard 500 with
+      // "Org credit deduction failed: function … does not exist".
+      // That's what the user reported as "ทุกตัวไม่สามารถใช้งานได้".
+      //
+      // Fallback: if the RPC is missing OR the org pool isn't set
+      // up, transparently fall through to the personal-user path.
+      // The user pays from their own credits — same UX as before
+      // they were flagged org. No data loss; just a missing-feature
+      // graceful degrade.
+      // ───────────────────────────────────────────────────────────
+      const missingRpc = /function .*consume_workspace_org_credits/i.test(error.message);
+      if (missingRpc) {
+        console.warn(
+          "[workspace-credits] org credit RPC missing, falling back to personal user credits",
+        );
+        // Don't return — let execution continue to the user-scope
+        // path below. Treat the user as scope='user' for billing.
+      } else {
+        throw new Error(`Org credit deduction failed: ${error.message}`);
+      }
+    } else {
+      // Success path — actually charged from org pool.
+      if (data !== true) {
+        throw new Error("INSUFFICIENT_CREDITS");
+      }
+      console.log(
+        `[workspace-credits] charged ${amount} credits user=${args.userId} org=${creditOwner.organizationId} ref=${referenceId}`,
+      );
+      return {
+        amount,
+        scope: "organization",
+        teamId: null,
+        organizationId: creditOwner.organizationId,
+        classId: creditOwner.classId ?? null,
+        creditUserId: null,
+        referenceId,
+        feature: def.feature,
+      };
     }
-    if (data !== true) {
-      throw new Error("INSUFFICIENT_CREDITS");
-    }
-
-    console.log(
-      `[workspace-credits] charged ${amount} credits user=${args.userId} org=${creditOwner.organizationId} ref=${referenceId}`,
-    );
-    return {
-      amount,
-      scope: "organization",
-      teamId: null,
-      organizationId: creditOwner.organizationId,
-      classId: creditOwner.classId ?? null,
-      creditUserId: null,
-      referenceId,
-      feature: def.feature,
-    };
   }
 
   const creditUserId = creditOwner.scope === "user" ? creditOwner.creditUserId : args.userId;
