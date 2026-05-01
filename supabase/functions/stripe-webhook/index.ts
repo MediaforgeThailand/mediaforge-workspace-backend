@@ -1055,16 +1055,35 @@ serve(async (req) => {
 
         const { data: existingTx } = await supabase
           .from("payment_transactions")
-          .select("id")
+          .select("id,status")
           .eq("stripe_payment_intent_id", intent.id)
-          .eq("status", "completed")
           .maybeSingle();
 
-        if (existingTx) {
+        if (existingTx?.status === "completed") {
           console.log(`[STRIPE-WEBHOOK] Org PromptPay: already processed ${intent.id}`);
           return new Response(JSON.stringify({ received: true }), {
             headers: { "Content-Type": "application/json" },
           });
+        }
+
+        if (existingTx?.id) {
+          const { data: claimedTx, error: claimError } = await supabase
+            .from("payment_transactions")
+            .update({ status: "processing" })
+            .eq("id", existingTx.id)
+            .in("status", ["pending", "failed"])
+            .select("id")
+            .maybeSingle();
+          if (claimError) {
+            console.error("[STRIPE-WEBHOOK] Org PromptPay claim error:", claimError);
+            return new Response(JSON.stringify({ error: "Payment claim failed" }), { status: 500 });
+          }
+          if (!claimedTx) {
+            console.log(`[STRIPE-WEBHOOK] Org PromptPay: already being processed ${intent.id}`);
+            return new Response(JSON.stringify({ received: true }), {
+              headers: { "Content-Type": "application/json" },
+            });
+          }
         }
 
         const amountThb = (intent.amount || 0) / 100;
@@ -1077,10 +1096,13 @@ serve(async (req) => {
 
         if (poolError || newPool === -1) {
           console.error("[STRIPE-WEBHOOK] Org PromptPay credit pool error:", poolError);
+          if (existingTx?.id) {
+            await supabase.from("payment_transactions").update({ status: "failed" }).eq("id", existingTx.id);
+          }
           return new Response(JSON.stringify({ error: "Organization credit grant failed" }), { status: 500 });
         }
 
-        await supabase.from("payment_transactions").insert({
+        const paymentRow = {
           user_id: userId,
           organization_id: organizationId,
           payment_scope: "organization",
@@ -1092,7 +1114,11 @@ serve(async (req) => {
           credits_added: creditsToAdd,
           status: "completed",
           payment_method: "promptpay",
-        });
+        };
+        const { error: paymentRowError } = existingTx?.id
+          ? await supabase.from("payment_transactions").update(paymentRow).eq("id", existingTx.id)
+          : await supabase.from("payment_transactions").insert(paymentRow);
+        if (paymentRowError) console.error("[STRIPE-WEBHOOK] Org PromptPay payment row error:", paymentRowError);
 
         console.log(`[STRIPE-WEBHOOK] Org PromptPay success: +${creditsToAdd} for org ${organizationId}`);
 

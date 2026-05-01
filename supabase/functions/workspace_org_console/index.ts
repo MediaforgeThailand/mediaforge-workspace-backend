@@ -673,6 +673,20 @@ async function createOrgPromptPayIntent(client: SupabaseClient, user: User, body
     return_url: returnUrl,
   });
 
+  const { error: txError } = await client.from("payment_transactions").insert({
+    user_id: user.id,
+    organization_id: ctx.organization_id,
+    payment_scope: "organization",
+    package_id: null,
+    stripe_session_id: null,
+    stripe_payment_intent_id: confirmed.id,
+    amount_thb: amountThb,
+    credits_added: credits,
+    status: "pending",
+    payment_method: "promptpay",
+  });
+  if (txError) throw new Error(`payment audit row failed: ${txError.message}`);
+
   const expiresAt = confirmed.next_action?.promptpay_display_qr_code?.expires_at ?? null;
   return {
     data: {
