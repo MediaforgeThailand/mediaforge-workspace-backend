@@ -157,12 +157,34 @@ grant execute on function public.refund_credits_for(
 -- SELECT instead of joining the workspaces row inline.
 create or replace function public.workspace_team_id(p_workspace_id text)
 returns uuid
-language sql
+language plpgsql
 stable
 security definer
 set search_path = public
 as $$
-  select team_id from public.workspaces where id = p_workspace_id
+declare
+  v_team_id uuid;
+begin
+  if p_workspace_id is null then
+    return null;
+  end if;
+
+  if not exists (
+    select 1
+    from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'workspaces'
+      and column_name = 'team_id'
+  ) then
+    return null;
+  end if;
+
+  execute 'select team_id from public.workspaces where id = $1'
+    into v_team_id
+    using p_workspace_id;
+
+  return v_team_id;
+end;
 $$;
 
 grant execute on function public.workspace_team_id(text)
