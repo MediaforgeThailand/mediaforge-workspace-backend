@@ -73,6 +73,7 @@ alter table public.workspace_generation_events enable row level security;
 -- policy here. Keeping the user policy narrow (read-only, own rows)
 -- means a future workspace-frontend "your usage" widget works without
 -- any further RLS work.
+drop policy if exists "wge_select_own" on public.workspace_generation_events;
 create policy "wge_select_own"
   on public.workspace_generation_events
   for select
