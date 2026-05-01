@@ -471,6 +471,12 @@ async function getWorkspaceCreditBalance(
     credit_scope?: "user" | "organization" | "team";
     team_id?: string | null;
     team_name?: string | null;
+    personal_balance?: number;
+    personal_total_purchased?: number;
+    personal_total_used?: number;
+    shared_balance?: number | null;
+    shared_total?: number | null;
+    shared_used?: number | null;
   };
 }> {
   const token = String(authHeader ?? "").replace(/^Bearer\s+/i, "").trim();
@@ -489,6 +495,18 @@ async function getWorkspaceCreditBalance(
   }
 
   let educationScope: Record<string, unknown> | null = null;
+  const creditUserId = authData.user.id;
+  const { data: personalCredits, error: personalCreditError } = await client
+    .from("user_credits")
+    .select("balance,total_purchased,total_used")
+    .eq("user_id", creditUserId)
+    .maybeSingle();
+  if (personalCreditError) throw new Error(`user_credits read failed: ${personalCreditError.message}`);
+
+  const personalBalance = Number((personalCredits as { balance?: number } | null)?.balance ?? 0);
+  const personalTotalPurchased = Number((personalCredits as { total_purchased?: number } | null)?.total_purchased ?? 0);
+  const personalTotalUsed = Number((personalCredits as { total_used?: number } | null)?.total_used ?? 0);
+
   try {
     const { data: eduScope, error: eduError } = await client.rpc("workspace_education_credit_scope", {
       p_user_id: authData.user.id,
@@ -517,6 +535,27 @@ async function getWorkspaceCreditBalance(
     const orgRow = Array.isArray(orgScope) ? orgScope[0] : orgScope;
     if (orgRow?.organization_id && !educationScope) {
       const balance = Number(orgRow.credit_balance ?? 0);
+      let orgUsed = 0;
+      try {
+        const { data: txRows, error: txError } = await client
+          .from("pool_transactions")
+          .select("amount,reason")
+          .eq("organization_id", orgRow.organization_id)
+          .in("reason", ["org_node_run", "org_node_run_refund"])
+          .limit(10000);
+        if (txError) throw txError;
+        orgUsed = (txRows ?? []).reduce((sum: number, tx: any) => {
+          const amount = Number(tx.amount ?? 0);
+          if (tx.reason === "org_node_run") return sum + Math.abs(Math.min(amount, 0));
+          if (tx.reason === "org_node_run_refund") return Math.max(0, sum - Math.max(amount, 0));
+          return sum;
+        }, 0);
+      } catch (err) {
+        console.warn(
+          "admin_workspace_pricing: org usage lookup skipped:",
+          err instanceof Error ? err.message : String(err),
+        );
+      }
       let team: Record<string, unknown> | null = null;
       try {
         const { data: membership } = await client
@@ -557,7 +596,7 @@ async function getWorkspaceCreditBalance(
         data: {
           balance: team ? Number((team as any).credit_available ?? 0) : balance,
           total_purchased: team ? Number((team as any).credit_pool ?? 0) : balance,
-          total_used: 0,
+          total_used: team ? Number((team as any).credit_pool_consumed ?? 0) : orgUsed,
           is_shared_pool: true,
           pool_domain: orgRow.primary_domain ?? null,
           pool_user_id: null,
@@ -567,6 +606,12 @@ async function getWorkspaceCreditBalance(
           credit_scope: team ? "team" : "organization",
           team_id: team?.id ? String(team.id) : null,
           team_name: team?.name ? String(team.name) : null,
+          personal_balance: personalBalance,
+          personal_total_purchased: personalTotalPurchased,
+          personal_total_used: personalTotalUsed,
+          shared_balance: team ? Number((team as any).credit_available ?? 0) : balance,
+          shared_total: team ? Number((team as any).credit_pool ?? 0) : balance + orgUsed,
+          shared_used: team ? Number((team as any).credit_pool_consumed ?? 0) : orgUsed,
         },
       };
     }
@@ -577,19 +622,11 @@ async function getWorkspaceCreditBalance(
     );
   }
 
-  const creditUserId = authData.user.id;
-  const { data, error } = await client
-    .from("user_credits")
-    .select("balance,total_purchased,total_used")
-    .eq("user_id", creditUserId)
-    .maybeSingle();
-  if (error) throw new Error(`user_credits read failed: ${error.message}`);
-
   return {
     data: {
-      balance: Number((data as { balance?: number } | null)?.balance ?? 0),
-      total_purchased: Number((data as { total_purchased?: number } | null)?.total_purchased ?? 0),
-      total_used: Number((data as { total_used?: number } | null)?.total_used ?? 0),
+      balance: personalBalance,
+      total_purchased: personalTotalPurchased,
+      total_used: personalTotalUsed,
       is_shared_pool: false,
       pool_domain: educationScope?.class_code ? String(educationScope.class_code) : null,
       pool_user_id: null,
@@ -599,6 +636,12 @@ async function getWorkspaceCreditBalance(
       credit_scope: "user",
       team_id: null,
       team_name: null,
+      personal_balance: personalBalance,
+      personal_total_purchased: personalTotalPurchased,
+      personal_total_used: personalTotalUsed,
+      shared_balance: null,
+      shared_total: null,
+      shared_used: null,
     },
   };
 }
