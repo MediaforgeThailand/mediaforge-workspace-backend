@@ -20,6 +20,7 @@ import {
   TOTAL_MAX_RETRIES,
 } from "../_shared/providerRetry.ts";
 import { recordGenerationEvent } from "../_shared/analytics.ts";
+import { acceptPendingOrgInviteForUser } from "../_shared/orgInvite.ts";
 import {
   SEEDANCE_BASE,
   SEEDANCE_TASKS_PATH,
@@ -3729,6 +3730,21 @@ async function resolveWorkspaceCreditOwner(
     } catch (err) {
       console.warn(
         "[workspace-credits] shared pool email lookup skipped:",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
+  if (resolvedEmail) {
+    try {
+      await acceptPendingOrgInviteForUser(
+        supabase,
+        { id: userId, email: resolvedEmail },
+        "workspace_run_node",
+      );
+    } catch (err) {
+      console.warn(
+        "[workspace-credits] pending org invite accept skipped:",
         err instanceof Error ? err.message : String(err),
       );
     }

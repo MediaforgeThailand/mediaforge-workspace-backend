@@ -41,6 +41,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { verifyAdminJwt, unauthorizedResponse } from "../_shared/adminAuth.ts";
+import { acceptPendingOrgInviteForUser } from "../_shared/orgInvite.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -467,6 +468,9 @@ async function getWorkspaceCreditBalance(
     organization_id?: string | null;
     organization_name?: string | null;
     organization_type?: string | null;
+    credit_scope?: "user" | "organization" | "team";
+    team_id?: string | null;
+    team_name?: string | null;
   };
 }> {
   const token = String(authHeader ?? "").replace(/^Bearer\s+/i, "").trim();
@@ -474,6 +478,15 @@ async function getWorkspaceCreditBalance(
 
   const { data: authData, error: authError } = await client.auth.getUser(token);
   if (authError || !authData.user) throw new Error("Invalid token");
+
+  try {
+    await acceptPendingOrgInviteForUser(client, authData.user, "credit_balance");
+  } catch (err) {
+    console.warn(
+      "admin_workspace_pricing: pending org invite accept skipped:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
 
   let educationScope: Record<string, unknown> | null = null;
   try {
@@ -504,10 +517,46 @@ async function getWorkspaceCreditBalance(
     const orgRow = Array.isArray(orgScope) ? orgScope[0] : orgScope;
     if (orgRow?.organization_id && !educationScope) {
       const balance = Number(orgRow.credit_balance ?? 0);
+      let team: Record<string, unknown> | null = null;
+      try {
+        const { data: membership } = await client
+          .from("organization_memberships")
+          .select("team_id")
+          .eq("user_id", authData.user.id)
+          .eq("organization_id", orgRow.organization_id)
+          .eq("status", "active")
+          .not("team_id", "is", null)
+          .order("joined_at", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+        if (membership?.team_id) {
+          const { data: teamRow } = await client
+            .from("classes")
+            .select("id,name,code,credit_pool,credit_pool_consumed")
+            .eq("id", membership.team_id)
+            .eq("organization_id", orgRow.organization_id)
+            .is("deleted_at", null)
+            .maybeSingle();
+          if (teamRow?.id) {
+            team = {
+              ...teamRow,
+              credit_available: Math.max(
+                0,
+                Number((teamRow as any).credit_pool ?? 0) - Number((teamRow as any).credit_pool_consumed ?? 0),
+              ),
+            };
+          }
+        }
+      } catch (err) {
+        console.warn(
+          "admin_workspace_pricing: team credit balance lookup skipped:",
+          err instanceof Error ? err.message : String(err),
+        );
+      }
       return {
         data: {
-          balance,
-          total_purchased: balance,
+          balance: team ? Number((team as any).credit_available ?? 0) : balance,
+          total_purchased: team ? Number((team as any).credit_pool ?? 0) : balance,
           total_used: 0,
           is_shared_pool: true,
           pool_domain: orgRow.primary_domain ?? null,
@@ -515,6 +564,9 @@ async function getWorkspaceCreditBalance(
           organization_id: String(orgRow.organization_id),
           organization_name: orgRow.organization_name ?? null,
           organization_type: orgRow.organization_type ?? null,
+          credit_scope: team ? "team" : "organization",
+          team_id: team?.id ? String(team.id) : null,
+          team_name: team?.name ? String(team.name) : null,
         },
       };
     }
@@ -544,6 +596,9 @@ async function getWorkspaceCreditBalance(
       organization_id: educationScope?.organization_id ? String(educationScope.organization_id) : null,
       organization_name: educationScope?.organization_name ? String(educationScope.organization_name) : null,
       organization_type: educationScope?.organization_type ? String(educationScope.organization_type) : null,
+      credit_scope: "user",
+      team_id: null,
+      team_name: null,
     },
   };
 }

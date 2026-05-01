@@ -5,6 +5,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, type SupabaseClient, type User } from "https://esm.sh/@supabase/supabase-js@2";
 import Stripe from "https://esm.sh/stripe@18.5.0";
+import { acceptPendingOrgInviteForUser } from "../_shared/orgInvite.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
@@ -258,6 +259,9 @@ async function orgAdminContext(client: SupabaseClient, user: User) {
 
 async function ensureDomainJoinRequest(client: SupabaseClient, user: User) {
   if (!user.email) return;
+  const acceptedInvite = await acceptPendingOrgInviteForUser(client, user, "team_status");
+  if (acceptedInvite.accepted) return;
+
   const { data: existing, error: existingError } = await client
     .from("organization_memberships")
     .select("id,status")
@@ -310,13 +314,36 @@ async function getTeamStatus(client: SupabaseClient, user: User) {
       .select("id,name,display_name,slug,type,status,credit_pool,credit_pool_allocated")
       .in("id", orgIds)
     : { data: [] as any[] };
-  const orgById = new Map((orgs ?? []).map((org: any) => [org.id, org]));
+  const orgById = new Map((orgs ?? []).map((org: any) => [
+    org.id,
+    {
+      ...org,
+      credit_available: Math.max(0, Number(org.credit_pool ?? 0) - Number(org.credit_pool_allocated ?? 0)),
+    },
+  ]));
+
+  const teamIds = [...new Set((memberships ?? []).map((row: any) => row.team_id).filter(Boolean))];
+  const { data: teams } = teamIds.length
+    ? await client
+      .from("classes")
+      .select("id,organization_id,name,code,status,credit_pool,credit_pool_consumed,credit_policy,credit_amount")
+      .in("id", teamIds)
+      .is("deleted_at", null)
+    : { data: [] as any[] };
+  const teamById = new Map((teams ?? []).map((team: any) => [
+    team.id,
+    {
+      ...team,
+      credit_available: Math.max(0, Number(team.credit_pool ?? 0) - Number(team.credit_pool_consumed ?? 0)),
+    },
+  ]));
 
   return {
     data: {
       memberships: (memberships ?? []).map((row: any) => ({
         ...row,
         organization: orgById.get(row.organization_id) ?? null,
+        team: row.team_id ? teamById.get(row.team_id) ?? null : null,
       })),
       can_open_admin_console: (memberships ?? []).some((row: any) => row.role === "org_admin" && row.status === "active"),
     },
