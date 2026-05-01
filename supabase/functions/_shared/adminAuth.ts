@@ -117,7 +117,10 @@ export async function verifyAdminJwt(req: Request): Promise<AdminJwtPayload | nu
       .select("role")
       .eq("user_id", user.id);
     if (roleError) return null;
-    const role = (roles ?? []).map((row: { role: string }) => row.role).find((value) => value === "admin");
+    const allowedAdminRoles = new Set(["admin", "super_admin"]);
+    const role = (roles ?? [])
+      .map((row: { role: string }) => row.role)
+      .find((value) => allowedAdminRoles.has(value));
     if (!role) return null;
 
     const now = Math.floor(Date.now() / 1000);
