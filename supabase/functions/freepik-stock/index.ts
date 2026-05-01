@@ -1,5 +1,4 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { rejectIfOrgUser } from "../_shared/orgUserGuard.ts";
 import { getAuthUser } from "../_shared/auth.ts";
 
 const corsHeaders = {
@@ -9,189 +8,121 @@ const corsHeaders = {
 };
 
 const FREEPIK_BASE = "https://api.freepik.com/v1";
+const JSON_HEADERS = { ...corsHeaders, "Content-Type": "application/json" };
+
+function json(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), { status, headers: JSON_HEADERS });
+}
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function setIfPresent(params: URLSearchParams, key: string, value: unknown): void {
+  const s = typeof value === "string" ? value.trim() : "";
+  if (s) params.set(key, s);
+}
+
+async function readFreepik(res: Response): Promise<unknown> {
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
+  }
+}
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
 
-  const orgBlock = await rejectIfOrgUser(req);
-  if (orgBlock) return orgBlock;
-
   try {
     const apiKey = Deno.env.get("FREEPIK_API_KEY");
-    if (!apiKey) {
-      return new Response(
-        JSON.stringify({ error: "FREEPIK_API_KEY not configured" }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
+    if (!apiKey) return json({ error: "FREEPIK_API_KEY not configured" }, 500);
 
     const authUser = await getAuthUser(req);
-    if (!authUser) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    if (!authUser) return json({ error: "Unauthorized" }, 401);
 
-    const userId = authUser.id;
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const supabaseService = supabaseUrl && serviceKey
+      ? createClient(supabaseUrl, serviceKey)
+      : null;
 
-    // Create service role client for DB operations
-    const supabaseService = createClient(supabaseUrl, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
-
-    const body = await req.json();
-    const { action } = body;
+    const body = await req.json().catch(() => ({}));
+    const action = String(body?.action ?? "");
 
     const freepikHeaders = {
+      Accept: "application/json",
+      "Accept-Language": String(body?.language ?? "en-US"),
+      // Freepik's public docs reference x-freepik-api-key. The docs
+      // currently redirect to Magnific pages that use x-magnific-api-key,
+      // so send both to keep this proxy compatible during the transition.
       "x-freepik-api-key": apiKey,
-      "Accept-Language": "en",
+      "x-magnific-api-key": apiKey,
     };
 
-    // ── Search Resources (photos, vectors, PSDs) ──
     if (action === "search-resources") {
-      const { query, page = 1, limit = 20, orientation, contentType, order } = body;
       const params = new URLSearchParams();
-      if (query) params.set("term", query);
-      params.set("page", String(page));
-      params.set("limit", String(Math.min(limit, 50)));
-      if (orientation) params.set("orientation", orientation);
-      if (contentType) params.set("filters[content_type][photo]", contentType === "photo" ? "1" : "0");
-      if (order) params.set("order", order);
+      params.set("page", String(clampInt(body?.page, 1, 1, 100)));
+      params.set("limit", String(clampInt(body?.limit, 30, 1, 50)));
+      setIfPresent(params, "term", body?.query);
+      setIfPresent(params, "order", body?.order);
+      setIfPresent(params, "filters[orientation]", body?.orientation);
+      setIfPresent(params, "filters[content_type]", body?.contentType);
+      setIfPresent(params, "filters[license]", body?.license);
 
-      const res = await fetch(`${FREEPIK_BASE}/resources?${params}`, {
+      const res = await fetch(`${FREEPIK_BASE}/resources?${params.toString()}`, {
         headers: freepikHeaders,
       });
-
+      const payload = await readFreepik(res);
       if (!res.ok) {
-        const errText = await res.text();
-        console.error("Freepik resources error:", errText);
-        return new Response(
-          JSON.stringify({ error: `Freepik API error: ${res.status}` }),
-          { status: res.status, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
+        console.error("Freepik resources error:", res.status, payload);
+        return json({ error: "Freepik API error", status: res.status, details: payload }, res.status);
       }
-
-      const data = await res.json();
-      return new Response(JSON.stringify(data), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      return json(payload);
     }
 
-    // ── Search Videos ──
-    if (action === "search-videos") {
-      const { query, page = 1, limit = 20, order } = body;
-      const params = new URLSearchParams();
-      if (query) params.set("term", query);
-      params.set("page", String(page));
-      params.set("limit", String(Math.min(limit, 50)));
-      if (order) params.set("order", order);
-
-      const res = await fetch(`${FREEPIK_BASE}/videos?${params}`, {
-        headers: freepikHeaders,
-      });
-
-      if (!res.ok) {
-        const errText = await res.text();
-        console.error("Freepik videos error:", errText);
-        return new Response(
-          JSON.stringify({ error: `Freepik API error: ${res.status}` }),
-          { status: res.status, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      const data = await res.json();
-      return new Response(JSON.stringify(data), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    // ── Download Resource ──
     if (action === "download-resource") {
-      const { resourceId } = body;
-      if (!resourceId) {
-        return new Response(JSON.stringify({ error: "resourceId required" }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
+      const resourceId = String(body?.resourceId ?? "").trim();
+      if (!resourceId) return json({ error: "resourceId required" }, 400);
 
-      const res = await fetch(`${FREEPIK_BASE}/resources/${resourceId}/download`, {
+      const params = new URLSearchParams();
+      setIfPresent(params, "image_size", body?.imageSize);
+      const suffix = params.toString() ? `?${params.toString()}` : "";
+      const res = await fetch(`${FREEPIK_BASE}/resources/${resourceId}/download${suffix}`, {
         headers: freepikHeaders,
       });
-
+      const payload = await readFreepik(res);
       if (!res.ok) {
-        const errText = await res.text();
-        console.error("Freepik download error:", errText);
-        return new Response(
-          JSON.stringify({ error: `Download failed: ${res.status}` }),
-          { status: res.status, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
+        console.error("Freepik download error:", res.status, payload);
+        return json({ error: "Freepik download failed", status: res.status, details: payload }, res.status);
       }
 
-      const data = await res.json();
-
-      // Log the download
-      await supabaseService.from("stock_downloads").insert({
-        user_id: userId,
-        resource_id: String(resourceId),
-        resource_title: body.title || null,
-        source: "freepik",
-        download_url: data?.data?.url || null,
-      });
-
-      return new Response(JSON.stringify(data), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    // ── Download Video ──
-    if (action === "download-video") {
-      const { videoId } = body;
-      if (!videoId) {
-        return new Response(JSON.stringify({ error: "videoId required" }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+      if (supabaseService) {
+        const downloadUrl = (payload as { data?: { url?: string; signed_url?: string } } | null)?.data?.url ??
+          (payload as { data?: { url?: string; signed_url?: string } } | null)?.data?.signed_url ??
+          null;
+        const { error } = await supabaseService.from("stock_downloads").insert({
+          user_id: authUser.id,
+          resource_id: resourceId,
+          resource_title: typeof body?.title === "string" ? body.title : null,
+          source: "freepik",
+          download_url: downloadUrl,
         });
+        if (error) console.warn("stock_downloads insert skipped:", error.message);
       }
 
-      const res = await fetch(`${FREEPIK_BASE}/videos/${videoId}/download`, {
-        headers: freepikHeaders,
-      });
-
-      if (!res.ok) {
-        const errText = await res.text();
-        console.error("Freepik video download error:", errText);
-        return new Response(
-          JSON.stringify({ error: `Download failed: ${res.status}` }),
-          { status: res.status, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-
-      const data = await res.json();
-
-      await supabaseService.from("stock_downloads").insert({
-        user_id: userId,
-        resource_id: String(videoId),
-        resource_title: body.title || null,
-        source: "freepik-video",
-        download_url: data?.data?.url || null,
-      });
-
-      return new Response(JSON.stringify(data), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      return json(payload);
     }
 
-    return new Response(JSON.stringify({ error: "Unknown action" }), {
-      status: 400,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return json({ error: "Unknown action" }, 400);
   } catch (err) {
     console.error("freepik-stock error:", err);
-    return new Response(
-      JSON.stringify({ error: "Internal server error" }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
+    return json({ error: "Internal server error" }, 500);
   }
 });
