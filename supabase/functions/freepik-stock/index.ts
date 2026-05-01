@@ -7,7 +7,7 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-const FREEPIK_BASE = "https://api.freepik.com/v1";
+const FREEPIK_BASE = Deno.env.get("FREEPIK_API_BASE")?.trim() || "https://api.freepik.com/v1";
 const JSON_HEADERS = { ...corsHeaders, "Content-Type": "application/json" };
 
 function json(payload: unknown, status = 200): Response {
@@ -73,7 +73,6 @@ Deno.serve(async (req) => {
       setIfPresent(params, "term", body?.query);
       setIfPresent(params, "order", body?.order);
       setIfPresent(params, "filters[orientation]", body?.orientation);
-      setIfPresent(params, "filters[content_type]", body?.contentType);
       setIfPresent(params, "filters[license]", body?.license);
 
       const res = await fetch(`${FREEPIK_BASE}/resources?${params.toString()}`, {
@@ -82,7 +81,11 @@ Deno.serve(async (req) => {
       const payload = await readFreepik(res);
       if (!res.ok) {
         console.error("Freepik resources error:", res.status, payload);
-        return json({ error: "Freepik API error", status: res.status, details: payload }, res.status);
+        return json({
+          error: "Freepik search failed",
+          status: res.status,
+          details: payload,
+        });
       }
       return json(payload);
     }
@@ -100,7 +103,11 @@ Deno.serve(async (req) => {
       const payload = await readFreepik(res);
       if (!res.ok) {
         console.error("Freepik download error:", res.status, payload);
-        return json({ error: "Freepik download failed", status: res.status, details: payload }, res.status);
+        return json({
+          error: "Freepik download failed",
+          status: res.status,
+          details: payload,
+        });
       }
 
       if (supabaseService) {
