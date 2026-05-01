@@ -30,3 +30,6 @@ SUPABASE_CREDENTIALS.md
 
 # Supabase local env (Google OAuth secrets etc.)
 supabase/.env
+
+
+.tmp
