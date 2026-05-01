@@ -4016,31 +4016,8 @@ async function consumeWorkspaceCredits(args: {
       p_canvas_id: args.body.canvas_id ?? null,
     });
     if (error) {
-      // ───────────────────────────────────────────────────────────
-      // PRODUCTION HOTFIX (audit Tier 0 finding #15):
-      // `consume_workspace_org_credits` is in a migration file but
-      // not applied to prod yet. Without a fallback, every user
-      // whose profile happens to be flagged `account_type=org_user`
-      // (often via email-domain auto-repair) gets a hard 500 with
-      // "Org credit deduction failed: function … does not exist".
-      // That's what the user reported as "ทุกตัวไม่สามารถใช้งานได้".
-      //
-      // Fallback: if the RPC is missing OR the org pool isn't set
-      // up, transparently fall through to the personal-user path.
-      // The user pays from their own credits — same UX as before
-      // they were flagged org. No data loss; just a missing-feature
-      // graceful degrade.
-      // ───────────────────────────────────────────────────────────
-      const missingRpc = /function .*consume_workspace_org_credits/i.test(error.message);
-      if (missingRpc) {
-        console.warn(
-          "[workspace-credits] org credit RPC missing, falling back to personal user credits",
-        );
-        // Don't return — let execution continue to the user-scope
-        // path below. Treat the user as scope='user' for billing.
-      } else {
-        throw new Error(`Org credit deduction failed: ${error.message}`);
-      }
+      // Shared-credit users must not silently fall back to personal billing.
+      throw new Error(`Org credit deduction failed: ${error.message}`);
     } else {
       // Success path — actually charged from org pool.
       if (data !== true) {
@@ -4080,6 +4057,9 @@ async function consumeWorkspaceCredits(args: {
   });
   if (error) {
     if (/function .*consume_credits_for/i.test(error.message)) {
+      if (teamId) {
+        throw new Error(`Team credit deduction unavailable: ${error.message}`);
+      }
       const fallback = await args.supabase.rpc("consume_credits", {
         p_user_id: creditUserId,
         p_amount: amount,

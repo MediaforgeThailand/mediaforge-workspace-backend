@@ -197,6 +197,8 @@ export function pickCostParams(
 export async function recordGenerationEvent(args: {
   supabase: SupabaseClient<any, any, any>;
   userId: string;
+  organizationId?: string | null;
+  classId?: string | null;
   provider: string;
   nodeType: string;
   params: Record<string, unknown>;
@@ -242,6 +244,8 @@ export async function recordGenerationEvent(args: {
       .from("workspace_generation_events")
       .insert({
         user_id: args.userId,
+        organization_id: args.organizationId ?? null,
+        class_id: args.classId ?? null,
         project_id: args.projectId ?? null,
         workspace_id: args.workspaceId ?? null,
         canvas_id: args.canvasId ?? null,

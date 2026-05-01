@@ -161,6 +161,359 @@ async function requireOrgMember(
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
 const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
 
+type SchoolOverviewAuth = {
+  userId: string;
+  email: string | null;
+  isSuperAdmin: boolean;
+};
+
+function asArray<T>(value: T[] | null | undefined): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function uniqueStrings(values: Array<string | null | undefined>): string[] {
+  return Array.from(new Set(values.filter(Boolean) as string[]));
+}
+
+function sumNumbers(rows: any[], key: string): number {
+  return rows.reduce((total, row) => total + Number(row?.[key] ?? 0), 0);
+}
+
+function isFreshSeen(value: string | null | undefined, minutes = 5): boolean {
+  if (!value) return false;
+  const seen = Date.parse(value);
+  if (!Number.isFinite(seen)) return false;
+  return Date.now() - seen <= minutes * 60 * 1000;
+}
+
+async function safeData<T>(
+  label: string,
+  fn: () => Promise<{ data: T | null; error?: any }>,
+  fallback: T,
+): Promise<T> {
+  try {
+    const res = await fn();
+    if (res.error) {
+      console.warn(`[mf-um-org-admin-api] optional query failed: ${label}`, res.error.message);
+      return fallback;
+    }
+    return (res.data ?? fallback) as T;
+  } catch (err: any) {
+    console.warn(`[mf-um-org-admin-api] optional query threw: ${label}`, err?.message ?? err);
+    return fallback;
+  }
+}
+
+async function getSchoolAuth(req: Request): Promise<SchoolOverviewAuth | Response> {
+  const caller = await resolveCaller(req);
+  if (caller instanceof Response) return caller;
+  const a = admin();
+  const [userRes, roleRes] = await Promise.all([
+    a.auth.admin.getUserById(caller.userId),
+    a.from("user_roles").select("role").eq("user_id", caller.userId).eq("role", "admin").maybeSingle(),
+  ]);
+  return {
+    userId: caller.userId,
+    email: userRes.data?.user?.email ?? null,
+    isSuperAdmin: !!roleRes.data,
+  };
+}
+
+async function userEmailMap(ids: string[]): Promise<Map<string, any>> {
+  const wanted = new Set(ids);
+  const byId = new Map<string, any>();
+  if (wanted.size === 0) return byId;
+
+  const a = admin();
+  for (let page = 1; page <= 10 && byId.size < wanted.size; page += 1) {
+    const { data } = await a.auth.admin.listUsers({ page, perPage: 1000 });
+    for (const user of data?.users ?? []) {
+      if (wanted.has(user.id)) byId.set(user.id, user);
+    }
+    if (!data?.users || data.users.length < 1000) break;
+  }
+  return byId;
+}
+
+async function buildSchoolOverview(req: Request, requestedOrgId?: string | null): Promise<Response> {
+  const auth = await getSchoolAuth(req);
+  if (auth instanceof Response) return auth;
+
+  const a = admin();
+  const [profileRes, orgMembershipsRes, teacherMembershipsRes] = await Promise.all([
+    a.from("profiles").select("user_id, display_name, avatar_url, organization_id, account_type")
+      .eq("user_id", auth.userId).maybeSingle(),
+    a.from("organization_memberships")
+      .select("organization_id, role, status, joined_at")
+      .eq("user_id", auth.userId)
+      .eq("status", "active"),
+    a.from("class_members")
+      .select("class_id, role, status, classes(id, organization_id, name, code, status)")
+      .eq("user_id", auth.userId)
+      .eq("role", "teacher")
+      .eq("status", "active"),
+  ]);
+
+  const orgIds = uniqueStrings([
+    profileRes.data?.organization_id,
+    ...asArray(orgMembershipsRes.data).map((row: any) => row.organization_id),
+    ...asArray(teacherMembershipsRes.data).map((row: any) => row.classes?.organization_id),
+  ]);
+
+  const orgs = orgIds.length > 0
+    ? await safeData<any[]>("school_overview.organizations", () =>
+        a.from("organizations")
+          .select("id, name, display_name, slug, type, status, logo_url, brand_color, credit_pool, credit_pool_allocated, settings, primary_contact_email, contract_start_date, contract_end_date")
+          .in("id", orgIds)
+          .in("type", ["school", "university"])
+          .is("deleted_at", null)
+          .order("name", { ascending: true }),
+      [],)
+    : [];
+
+  if (orgs.length === 0) {
+    return json({
+      error: "no_school_organization",
+      message: "This account is not attached to a school or university organization yet.",
+      caller: { user_id: auth.userId, email: auth.email, profile: profileRes.data ?? null },
+    }, 403);
+  }
+
+  const activeOrg = orgs.find((org: any) => org.id === requestedOrgId) ?? orgs[0];
+  const activeOrgId = activeOrg.id;
+  const orgMembership = asArray(orgMembershipsRes.data)
+    .find((row: any) => row.organization_id === activeOrgId);
+  const isOrgAdmin = auth.isSuperAdmin || orgMembership?.role === "org_admin";
+  const teacherClassIds = uniqueStrings(
+    asArray(teacherMembershipsRes.data)
+      .filter((row: any) => row.classes?.organization_id === activeOrgId)
+      .map((row: any) => row.class_id),
+  );
+
+  let classes: any[] = [];
+  if (isOrgAdmin) {
+    classes = await safeData<any[]>("school_overview.classes.org_admin", () =>
+      a.from("classes")
+        .select("id, organization_id, name, code, description, term, year, status, max_students, primary_instructor_id, credit_policy, credit_amount, credit_pool, credit_pool_consumed, start_date, end_date, settings, created_at")
+        .eq("organization_id", activeOrgId)
+        .is("deleted_at", null)
+        .order("created_at", { ascending: false }),
+    [],);
+  } else if (teacherClassIds.length > 0) {
+    classes = await safeData<any[]>("school_overview.classes.teacher", () =>
+      a.from("classes")
+        .select("id, organization_id, name, code, description, term, year, status, max_students, primary_instructor_id, credit_policy, credit_amount, credit_pool, credit_pool_consumed, start_date, end_date, settings, created_at")
+        .eq("organization_id", activeOrgId)
+        .in("id", teacherClassIds)
+        .is("deleted_at", null)
+        .order("created_at", { ascending: false }),
+    [],);
+  }
+
+  const classIds = classes.map((row) => row.id);
+  const since = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+
+  const [domains, members, activities, requests, presence, sessions] = await Promise.all([
+    safeData<any[]>("school_overview.domains", () =>
+      a.from("organization_domains")
+        .select("id, domain, is_primary, verified_at, verification_method")
+        .eq("organization_id", activeOrgId)
+        .order("is_primary", { ascending: false }),
+    [],),
+    classIds.length > 0
+      ? safeData<any[]>("school_overview.members", () =>
+          a.from("class_members")
+            .select("id, class_id, user_id, role, status, joined_at, student_code, credit_cap, credits_balance, credits_lifetime_received, credits_lifetime_used")
+            .in("class_id", classIds)
+            .order("joined_at", { ascending: false }),
+        [],)
+      : Promise.resolve([]),
+    safeData<any[]>("school_overview.activity", () =>
+      a.from("workspace_activity")
+        .select("id, user_id, organization_id, class_id, activity_type, model_id, credits_used, created_at, metadata")
+        .eq("organization_id", activeOrgId)
+        .gte("created_at", since)
+        .order("created_at", { ascending: false })
+        .limit(400),
+    [],),
+    classIds.length > 0
+      ? safeData<any[]>("school_overview.credit_requests", () =>
+          a.from("credit_requests")
+            .select("id, class_id, user_id, status, amount_requested, amount_granted, reason, review_note, created_at, reviewed_at")
+            .in("class_id", classIds)
+            .order("created_at", { ascending: false })
+            .limit(200),
+        [],)
+      : Promise.resolve([]),
+    classIds.length > 0
+      ? safeData<any[]>("school_overview.presence", () =>
+          a.from("education_student_screen_presence")
+            .select("id, organization_id, class_id, session_id, user_id, status, screen_state, current_workspace_id, current_canvas_id, current_project_id, current_activity, screen_thumbnail_url, screen_stream_url, last_seen_at, metadata, updated_at")
+            .in("class_id", classIds)
+            .order("last_seen_at", { ascending: false })
+            .limit(250),
+        [],)
+      : Promise.resolve([]),
+    classIds.length > 0
+      ? safeData<any[]>("school_overview.sessions", () =>
+          a.from("education_class_sessions")
+            .select("id, organization_id, class_id, title, status, starts_at, ends_at, settings, created_at")
+            .in("class_id", classIds)
+            .is("deleted_at", null)
+            .order("starts_at", { ascending: false })
+            .limit(120),
+        [],)
+      : Promise.resolve([]),
+  ]);
+
+  const userIds = uniqueStrings([
+    auth.userId,
+    ...members.map((row: any) => row.user_id),
+    ...activities.map((row: any) => row.user_id),
+    ...requests.map((row: any) => row.user_id),
+    ...presence.map((row: any) => row.user_id),
+  ]);
+  const [profiles, usersById] = await Promise.all([
+    userIds.length > 0
+      ? safeData<any[]>("school_overview.profiles", () =>
+          a.from("profiles")
+            .select("user_id, display_name, avatar_url")
+            .in("user_id", userIds),
+        [],)
+      : Promise.resolve([]),
+    userEmailMap(userIds),
+  ]);
+
+  const profilesById = new Map(profiles.map((profile: any) => [profile.user_id, profile]));
+  const activityByUser = new Map<string, any[]>();
+  const activityByClass = new Map<string, any[]>();
+  const activityByModel = new Map<string, { count: number; credits: number }>();
+  for (const activity of activities) {
+    if (!activityByUser.has(activity.user_id)) activityByUser.set(activity.user_id, []);
+    activityByUser.get(activity.user_id)!.push(activity);
+    if (activity.class_id) {
+      if (!activityByClass.has(activity.class_id)) activityByClass.set(activity.class_id, []);
+      activityByClass.get(activity.class_id)!.push(activity);
+    }
+    if (activity.activity_type === "model_use") {
+      const key = activity.model_id ?? "unknown";
+      const bucket = activityByModel.get(key) ?? { count: 0, credits: 0 };
+      bucket.count += 1;
+      bucket.credits += Number(activity.credits_used ?? 0);
+      activityByModel.set(key, bucket);
+    }
+  }
+
+  const presenceByUser = new Map(presence.map((row: any) => [row.user_id, row]));
+  const pendingRequestsByClass = new Map<string, number>();
+  for (const reqRow of requests) {
+    if (reqRow.status === "pending") {
+      pendingRequestsByClass.set(reqRow.class_id, (pendingRequestsByClass.get(reqRow.class_id) ?? 0) + 1);
+    }
+  }
+
+  const enrichedMembers = members.map((row: any) => {
+    const profile = profilesById.get(row.user_id) ?? {};
+    const user = usersById.get(row.user_id) ?? {};
+    const userActivity = activityByUser.get(row.user_id) ?? [];
+    const lastActivity = userActivity[0]?.created_at ?? null;
+    const freshPresence = presenceByUser.get(row.user_id) ?? null;
+    return {
+      ...row,
+      display_name: profile.display_name ?? user.email ?? "Unnamed student",
+      avatar_url: profile.avatar_url ?? null,
+      email: user.email ?? null,
+      last_activity_at: lastActivity,
+      model_uses_30d: userActivity.filter((activity: any) => activity.activity_type === "model_use").length,
+      credits_used_30d: sumNumbers(userActivity, "credits_used"),
+      presence: freshPresence,
+      is_online: isFreshSeen(freshPresence?.last_seen_at),
+      needs_profile: row.role === "student" && !row.student_code,
+    };
+  });
+
+  const classSummaries = classes.map((classRow: any) => {
+    const classMembers = enrichedMembers.filter((member: any) => member.class_id === classRow.id);
+    const students = classMembers.filter((member: any) => member.role === "student");
+    const teachers = classMembers.filter((member: any) => member.role === "teacher");
+    const classActivities = activityByClass.get(classRow.id) ?? [];
+    const onlineStudents = students.filter((member: any) => member.is_online).length;
+    const lowCreditStudents = students.filter((member: any) => Number(member.credits_balance ?? 0) <= 20).length;
+    const noActivityStudents = students.filter((member: any) => !member.last_activity_at).length;
+    return {
+      ...classRow,
+      members_count: classMembers.length,
+      students_count: students.length,
+      teachers_count: teachers.length,
+      online_students: onlineStudents,
+      low_credit_students: lowCreditStudents,
+      no_activity_students: noActivityStudents,
+      pending_credit_requests: pendingRequestsByClass.get(classRow.id) ?? 0,
+      credits_remaining: Math.max(0, Number(classRow.credit_pool ?? 0) - Number(classRow.credit_pool_consumed ?? 0)),
+      credits_used_30d: sumNumbers(classActivities, "credits_used"),
+      generation_count_30d: classActivities.filter((activity: any) => activity.activity_type === "model_use").length,
+    };
+  });
+
+  const recentActivity = activities.slice(0, 60).map((activity: any) => {
+    const profile = profilesById.get(activity.user_id) ?? {};
+    const user = usersById.get(activity.user_id) ?? {};
+    return {
+      ...activity,
+      display_name: profile.display_name ?? user.email ?? "Unknown user",
+      email: user.email ?? null,
+      class_name: classes.find((classRow: any) => classRow.id === activity.class_id)?.name ?? null,
+    };
+  });
+
+  const analytics = {
+    since,
+    total_credits_30d: sumNumbers(activities.filter((row: any) => row.activity_type === "model_use"), "credits_used"),
+    generations_30d: activities.filter((row: any) => row.activity_type === "model_use").length,
+    online_students: enrichedMembers.filter((member: any) => member.role === "student" && member.is_online).length,
+    active_sessions: sessions.filter((session: any) => session.status === "live").length,
+    pending_credit_requests: requests.filter((request: any) => request.status === "pending").length,
+    students_missing_profile: enrichedMembers.filter((member: any) => member.needs_profile).length,
+    low_credit_students: enrichedMembers.filter((member: any) =>
+      member.role === "student" && Number(member.credits_balance ?? 0) <= 20
+    ).length,
+    model_usage: Array.from(activityByModel.entries())
+      .map(([model_id, value]) => ({ model_id, ...value }))
+      .sort((a, b) => b.credits - a.credits),
+  };
+
+  return json({
+    caller: {
+      user_id: auth.userId,
+      email: auth.email,
+      profile: profileRes.data ?? null,
+      is_super_admin: auth.isSuperAdmin,
+    },
+    organizations: orgs,
+    active_organization: activeOrg,
+    role: {
+      org_role: orgMembership?.role ?? null,
+      is_org_admin: isOrgAdmin,
+      is_teacher: teacherClassIds.length > 0,
+      can_manage_org: isOrgAdmin,
+      can_manage_classes: isOrgAdmin || teacherClassIds.length > 0,
+    },
+    domains,
+    classes: classSummaries,
+    members: enrichedMembers,
+    credit_requests: requests,
+    live_presence: presence.map((row: any) => ({
+      ...row,
+      display_name: profilesById.get(row.user_id)?.display_name ?? usersById.get(row.user_id)?.email ?? "Unknown user",
+      email: usersById.get(row.user_id)?.email ?? null,
+      is_online: isFreshSeen(row.last_seen_at),
+    })),
+    sessions,
+    analytics,
+    recent_activity: recentActivity,
+  });
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -177,6 +530,56 @@ Deno.serve(async (req) => {
   }
 
   try {
+    // School / university teacher portal routes. These are deliberately
+    // scoped to the caller's Workspace JWT so the ERP-side school center can
+    // live outside MediaForge Central while still managing only its own
+    // institution.
+    if (segments[0] === "school" && segments[1] === "overview" && segments.length === 2) {
+      if (method === "GET") {
+        return await buildSchoolOverview(req, url.searchParams.get("org_id"));
+      }
+    }
+
+    if (segments[0] === "school" && segments[1] === "profile" && segments.length === 2) {
+      if (method === "POST" || method === "PATCH") {
+        const auth = await getSchoolAuth(req);
+        if (auth instanceof Response) return auth;
+
+        const updates: Record<string, any> = { updated_at: new Date().toISOString() };
+        const displayName = String(body?.display_name ?? "").trim();
+        if (displayName) updates.display_name = displayName;
+        if (body?.avatar_url !== undefined) updates.avatar_url = body.avatar_url || null;
+
+        const a = admin();
+        if (Object.keys(updates).length > 1) {
+          await a.from("profiles")
+            .update(updates)
+            .eq("user_id", auth.userId);
+        }
+
+        const classId = String(body?.class_id ?? "");
+        const studentCode = String(body?.student_code ?? "").trim();
+        if (classId && studentCode) {
+          const { data: member } = await a.from("class_members")
+            .select("id, role, status")
+            .eq("class_id", classId)
+            .eq("user_id", auth.userId)
+            .maybeSingle();
+          if (!member) return json({ error: "class_membership_not_found" }, 404);
+          await a.from("class_members")
+            .update({ student_code: studentCode, updated_at: new Date().toISOString() })
+            .eq("class_id", classId)
+            .eq("user_id", auth.userId);
+        }
+
+        const { data: profile } = await a.from("profiles")
+          .select("user_id, display_name, avatar_url, organization_id, account_type")
+          .eq("user_id", auth.userId)
+          .maybeSingle();
+        return json({ profile });
+      }
+    }
+
     // ─── /orgs (list / create) ──────────────────────────────────────────
     if (segments[0] === "orgs" && segments.length === 1) {
       if (method === "GET") {
@@ -310,7 +713,7 @@ Deno.serve(async (req) => {
         // user-friendly error naming the conflicting org.
         const { data: existing } = await a
           .from("organization_domains")
-          .select("id, org_id, organizations(name, slug)")
+          .select("id, organization_id, organizations(name, slug)")
           .eq("domain", domain)
           .maybeSingle();
         if (existing) {
@@ -333,7 +736,7 @@ Deno.serve(async (req) => {
             is_primary: !!body?.is_primary,
             // Schema C: verified_at IS NOT NULL is the truth — no separate is_verified flag
             verified_at: auto_verify ? new Date().toISOString() : null,
-            verification_method: auto_verify ? "admin_assert" : null,
+            verification_method: auto_verify ? "manual" : null,
           })
           .select()
           .single();
@@ -352,7 +755,7 @@ Deno.serve(async (req) => {
           );
           for (const u of candidates) {
             const { data: prof } = await a
-              .from("profiles").select("user_id, org_id").eq("user_id", u.id).maybeSingle();
+              .from("profiles").select("user_id, organization_id").eq("user_id", u.id).maybeSingle();
             if (!prof || prof.organization_id) continue;
             await a.from("profiles").update({
               organization_id: orgId,
@@ -360,7 +763,7 @@ Deno.serve(async (req) => {
             }).eq("user_id", u.id);
             await a.from("organization_memberships").upsert({
               organization_id: orgId, user_id: u.id, role: "member", status: "active",
-            }, { onConflict: "org_id,user_id", ignoreDuplicates: true });
+            }, { onConflict: "organization_id,user_id", ignoreDuplicates: true });
             assigned += 1;
           }
         }
@@ -378,7 +781,7 @@ Deno.serve(async (req) => {
 
         const { data, error } = await admin()
           .from("organization_domains")
-          .update({ verified_at: new Date().toISOString(), verification_method: "admin_assert" })
+          .update({ verified_at: new Date().toISOString(), verification_method: "manual" })
           .eq("id", domainId)
           .eq("organization_id", orgId)
           .select()
@@ -428,7 +831,7 @@ Deno.serve(async (req) => {
 
         const { data, error } = await admin()
           .from("organization_sso_providers")
-          .upsert(row, { onConflict: "org_id,provider" })
+          .upsert(row, { onConflict: "organization_id,provider" })
           .select()
           .single();
         if (error) return json({ error: error.message }, 400);
@@ -504,6 +907,7 @@ Deno.serve(async (req) => {
         }));
         return json({ members: enriched });
       }
+
     }
 
     // (Deprecated: /orgs/:id/credit-codes — replaced by class enrolment codes)
@@ -770,11 +1174,13 @@ Deno.serve(async (req) => {
 
         // Mirror the primary instructor into class_teachers for consistency
         // with the M:N teacher list. Idempotent — UNIQUE(class_id,user_id).
-        await a.from("class_teachers").upsert({
+        await a.from("class_members").upsert({
           class_id: data.id,
           user_id: primaryInstructorId,
-          role: "primary",
+          role: "teacher",
+          status: "active",
           invited_by: auth.userId,
+          joined_at: new Date().toISOString(),
         }, { onConflict: "class_id,user_id", ignoreDuplicates: true });
 
         return json({ class: data }, 201);
@@ -857,12 +1263,16 @@ Deno.serve(async (req) => {
         if (!Number.isInteger(delta) || delta === 0) {
           return json({ error: "delta_must_be_nonzero_integer" }, 400);
         }
-        const { data, error } = await admin().rpc("allocate_class_pool", {
-          p_class_id: classId, p_delta: delta,
-          p_actor_id: auth.userId, p_reason: String(body?.reason ?? ""),
+        const { data, error } = await admin().rpc("admin_allocate_class_pool", {
+          p_class_id: classId,
+          p_delta: delta,
+          p_actor_id: auth.userId,
+          p_description: String(body?.reason ?? "school_center_class_allocation"),
         });
         if (error) return json({ error: error.message }, 500);
-        return json(data);
+        if (data === -1) return json({ error: "organization_pool_exhausted" }, 409);
+        if (data === -2) return json({ error: "class_pool_remaining_too_low" }, 409);
+        return json({ class_credit_pool: data, delta });
       }
     }
 
@@ -961,7 +1371,7 @@ Deno.serve(async (req) => {
         const a = admin();
         const { data: m, error: mErr } = await a
           .from("class_memberships")
-          .select("id, user_id, status, enrolled_at, enrolled_via, student_code, " +
+          .select("id, user_id, status, enrolled_at, student_code, " +
                   "credits_balance, credits_lifetime_received, credits_lifetime_used")
           .eq("class_id", classId)
           .order("enrolled_at", { ascending: false });
@@ -1002,6 +1412,73 @@ Deno.serve(async (req) => {
         }));
         return json({ members: enriched });
       }
+
+      if (method === "POST") {
+        const auth = await requireClassWriter(req, classId);
+        if (auth instanceof Response) return auth;
+
+        let userId = String(body?.user_id ?? "");
+        const email = String(body?.email ?? body?.user_email ?? "").trim().toLowerCase();
+        if (!userId && email) {
+          const { data: users } = await admin().auth.admin.listUsers({ page: 1, perPage: 1000 });
+          const found = (users?.users ?? []).find(
+            (u: any) => (u.email ?? "").toLowerCase() === email,
+          );
+          if (!found) {
+            return json({
+              error: "user_not_found",
+              message: `No user found with email ${email}. They must sign up with the school domain first.`,
+            }, 404);
+          }
+          userId = found.id;
+        }
+        if (!userId) return json({ error: "user_id_or_email_required" }, 400);
+
+        const a = admin();
+        const studentCode = String(body?.student_code ?? "").trim() || null;
+        const { data: member, error } = await a.from("class_members")
+          .upsert({
+            class_id: classId,
+            user_id: userId,
+            role: "student",
+            status: "active",
+            student_code: studentCode,
+            invited_by: auth.userId,
+            joined_at: new Date().toISOString(),
+          }, { onConflict: "class_id,user_id" })
+          .select()
+          .single();
+        if (error) return json({ error: error.message }, 400);
+
+        await a.from("profiles").update({
+          organization_id: (cls as any).organization_id,
+          account_type: "org_user",
+          updated_at: new Date().toISOString(),
+        }).eq("user_id", userId);
+        await a.from("organization_memberships").upsert({
+          organization_id: (cls as any).organization_id,
+          user_id: userId,
+          role: "member",
+          status: "active",
+        }, { onConflict: "organization_id,user_id", ignoreDuplicates: true });
+
+        const initialCredits = Number(body?.initial_credits ?? 0);
+        let newBalance: number | null = null;
+        if (Number.isInteger(initialCredits) && initialCredits > 0) {
+          const creditRes = await a.rpc("admin_adjust_class_member_credits", {
+            p_class_id: classId,
+            p_user_id: userId,
+            p_delta: initialCredits,
+            p_actor_id: auth.userId,
+            p_reason: String(body?.reason ?? "school_center_initial_student_credit"),
+          });
+          if (creditRes.error) return json({ error: creditRes.error.message }, 400);
+          if (creditRes.data === -1) return json({ error: "class_budget_exhausted" }, 409);
+          newBalance = creditRes.data;
+        }
+
+        return json({ member, new_balance: newBalance }, 201);
+      }
     }
 
     // ─── /classes/:cid/members/:userId/credits (grant/revoke) ────────
@@ -1021,6 +1498,21 @@ Deno.serve(async (req) => {
           return json({ error: "amount_must_be_nonzero_integer" }, 400);
         }
         const reason = String(body?.reason ?? "manual");
+
+        const adjusted = await admin().rpc("admin_adjust_class_member_credits", {
+          p_class_id: classId,
+          p_user_id: userId,
+          p_delta: amount,
+          p_actor_id: auth.userId,
+          p_reason: reason,
+        });
+        if (adjusted.error) return json({ error: adjusted.error.message }, 400);
+        if (adjusted.data === -1) return json({ error: "class_budget_exhausted" }, 409);
+        return json({
+          new_balance: adjusted.data,
+          granted: amount > 0 ? amount : 0,
+          revoked: amount < 0 ? Math.abs(amount) : 0,
+        });
 
         if (amount > 0) {
           const { data, error } = await admin().rpc("grant_credits", {
@@ -1066,13 +1558,12 @@ Deno.serve(async (req) => {
         const auth = await requireClassWriter(req, classId);
         if (auth instanceof Response) return auth;
         const updates: Record<string, any> = { updated_at: new Date().toISOString() };
-        if (body?.status && ["active","suspended","removed"].includes(body.status)) {
+        if (body?.status && ["active","suspended","left"].includes(body.status)) {
           updates.status = body.status;
         }
-        if (typeof body?.student_code === "string") updates.student_code = body.student_code;
         const { data, error } = await admin()
-          .from("class_memberships").update(updates)
-          .eq("class_id", classId).eq("user_id", userId).select().single();
+          .from("class_members").update(updates)
+          .eq("class_id", classId).eq("user_id", userId).eq("role", "student").select().single();
         if (error) return json({ error: error.message }, 400);
         return json({ member: data });
       }
@@ -1080,18 +1571,116 @@ Deno.serve(async (req) => {
         const auth = await requireClassWriter(req, classId);
         if (auth instanceof Response) return auth;
         const { error } = await admin()
-          .from("class_memberships").delete()
-          .eq("class_id", classId).eq("user_id", userId);
+          .from("class_members").delete()
+          .eq("class_id", classId).eq("user_id", userId).eq("role", "student");
         if (error) return json({ error: error.message }, 400);
         return json({ ok: true });
       }
     }
 
     // ─── /classes/:cid/codes (enrolment QR codes) ────────────────────
+    if (segments[0] === "classes" && segments[2] === "sessions" && segments.length === 3) {
+      const classId = segments[1];
+      const { data: cls } = await admin()
+        .from("classes").select("organization_id, name").eq("id", classId).maybeSingle();
+      if (!cls) return json({ error: "class_not_found" }, 404);
+
+      if (method === "GET") {
+        const auth = await requireClassWriter(req, classId);
+        if (auth instanceof Response) return auth;
+        const { data, error } = await admin()
+          .from("education_class_sessions")
+          .select("*")
+          .eq("class_id", classId)
+          .is("deleted_at", null)
+          .order("starts_at", { ascending: false })
+          .limit(100);
+        if (error) return json({ error: error.message }, 500);
+        return json({ sessions: data ?? [] });
+      }
+
+      if (method === "POST") {
+        const auth = await requireClassWriter(req, classId);
+        if (auth instanceof Response) return auth;
+        const status = String(body?.status ?? "live");
+        if (!["scheduled", "live", "ended", "cancelled"].includes(status)) {
+          return json({ error: "invalid_session_status" }, 400);
+        }
+        const sessionId = String(body?.session_id ?? "");
+        if (sessionId && (body?.action === "end" || status === "ended")) {
+          const { data, error } = await admin()
+            .from("education_class_sessions")
+            .update({
+              status: "ended",
+              ends_at: body?.ends_at ?? new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", sessionId)
+            .eq("class_id", classId)
+            .select()
+            .single();
+          if (error) return json({ error: error.message }, 400);
+          return json({ session: data });
+        }
+
+        const { data, error } = await admin()
+          .from("education_class_sessions")
+          .insert({
+            organization_id: (cls as any).organization_id,
+            class_id: classId,
+            title: String(body?.title ?? `${(cls as any).name} live session`),
+            status,
+            starts_at: body?.starts_at ?? (status === "live" ? new Date().toISOString() : null),
+            ends_at: body?.ends_at ?? null,
+            settings: body?.settings ?? {},
+            created_by: auth.userId,
+          })
+          .select()
+          .single();
+        if (error) return json({ error: error.message }, 400);
+        return json({ session: data }, 201);
+      }
+    }
+
+    if (segments[0] === "classes" && segments[2] === "presence" && segments.length === 3) {
+      const classId = segments[1];
+      if (method === "GET") {
+        const auth = await requireClassWriter(req, classId);
+        if (auth instanceof Response) return auth;
+        const { data, error } = await admin()
+          .from("education_student_screen_presence")
+          .select("*")
+          .eq("class_id", classId)
+          .order("last_seen_at", { ascending: false })
+          .limit(250);
+        if (error) return json({ error: error.message }, 500);
+        const ids = uniqueStrings(asArray(data).map((row: any) => row.user_id));
+        const [profiles, usersById] = await Promise.all([
+          ids.length > 0
+            ? safeData<any[]>("class_presence.profiles", () =>
+                admin().from("profiles")
+                  .select("user_id, display_name, avatar_url")
+                  .in("user_id", ids),
+              [],)
+            : Promise.resolve([]),
+          userEmailMap(ids),
+        ]);
+        const profilesById = new Map(profiles.map((profile: any) => [profile.user_id, profile]));
+        return json({
+          presence: asArray(data).map((row: any) => ({
+            ...row,
+            display_name: profilesById.get(row.user_id)?.display_name ?? usersById.get(row.user_id)?.email ?? "Unknown user",
+            email: usersById.get(row.user_id)?.email ?? null,
+            is_online: isFreshSeen(row.last_seen_at),
+          })),
+        });
+      }
+    }
+
     if (segments[0] === "classes" && segments[2] === "codes" && segments.length === 3) {
       const classId = segments[1];
       const { data: cls } = await admin()
-        .from("classes").select("org_id, code").eq("id", classId).maybeSingle();
+        .from("classes").select("organization_id, code").eq("id", classId).maybeSingle();
       if (!cls) return json({ error: "class_not_found" }, 404);
 
       if (method === "GET") {
@@ -1177,7 +1766,7 @@ Deno.serve(async (req) => {
           return json({ error: "amount_required_positive_integer" }, 400);
         }
         const { data: mem } = await admin()
-          .from("class_memberships").select("id, status")
+          .from("class_members").select("id, status")
           .eq("class_id", classId).eq("user_id", c.userId).maybeSingle();
         if (!mem || (mem as any).status !== "active") {
           return json({ error: "not_an_active_member" }, 403);
