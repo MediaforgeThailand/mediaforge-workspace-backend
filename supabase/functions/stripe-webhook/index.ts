@@ -91,6 +91,22 @@ function fmtDateTH(d: Date): string {
   return new Intl.DateTimeFormat("th-TH", { day: "numeric", month: "short", year: "numeric" }).format(d);
 }
 
+function receiptFieldsFromIntent(intent: Stripe.PaymentIntent): Record<string, unknown> {
+  const latestCharge = (intent as any).latest_charge;
+  const charge = latestCharge && typeof latestCharge === "object" ? latestCharge as any : null;
+  const invoice = charge?.invoice;
+  const fields: Record<string, unknown> = {};
+
+  if (typeof latestCharge === "string") fields.stripe_charge_id = latestCharge;
+  if (charge?.id) fields.stripe_charge_id = charge.id;
+  if (charge?.receipt_url) fields.receipt_url = charge.receipt_url;
+  if (charge?.receipt_number) fields.receipt_number = charge.receipt_number;
+  if (invoice) fields.stripe_invoice_id = typeof invoice === "string" ? invoice : invoice.id;
+  if (fields.receipt_url) fields.receipt_generated_at = new Date().toISOString();
+
+  return fields;
+}
+
 async function sendCommissionEmailIfPossible(
   sb: ReturnType<typeof createClient>,
   partnerUserId: string,
@@ -211,7 +227,7 @@ serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
   const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") || "", {
-    apiVersion: "2025-08-27.basil",
+    apiVersion: "2026-02-25.clover" as any,
   });
 
   const supabase = createClient(
@@ -941,6 +957,7 @@ serve(async (req) => {
           package_id: null,
           stripe_session_id: null,
           stripe_payment_intent_id: intent.id,
+          ...receiptFieldsFromIntent(intent),
           amount_thb: amountThb,
           credits_added: finalCredits,
           status: "completed",
@@ -1070,6 +1087,7 @@ serve(async (req) => {
           package_id: null,
           stripe_session_id: null,
           stripe_payment_intent_id: intent.id,
+          ...receiptFieldsFromIntent(intent),
           amount_thb: amountThb,
           credits_added: creditsToAdd,
           status: "completed",
@@ -1152,6 +1170,7 @@ serve(async (req) => {
           package_id: null,
           stripe_session_id: null,
           stripe_payment_intent_id: intent.id,
+          ...receiptFieldsFromIntent(intent),
           amount_thb: amountThb,
           credits_added: creditsToAdd,
           status: "completed",

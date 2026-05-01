@@ -30,6 +30,49 @@ const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61
 const ORG_TOPUP_RATIO_THB_TO_CREDITS = 50;
 const MIN_ORG_TOPUP_THB = 500;
 const MAX_ORG_TOPUP_THB = 100_000;
+const PAYMENT_SELECT = [
+  "id",
+  "user_id",
+  "organization_id",
+  "payment_scope",
+  "stripe_session_id",
+  "stripe_payment_intent_id",
+  "stripe_charge_id",
+  "stripe_invoice_id",
+  "amount_thb",
+  "credits_added",
+  "status",
+  "payment_method",
+  "receipt_url",
+  "invoice_url",
+  "receipt_number",
+  "receipt_generated_at",
+  "created_at",
+  "updated_at",
+].join(",");
+const GENERATION_SELECT = [
+  "id",
+  "user_id",
+  "organization_id",
+  "class_id",
+  "project_id",
+  "workspace_id",
+  "canvas_id",
+  "node_id",
+  "feature",
+  "model",
+  "provider",
+  "output_tier",
+  "output_count",
+  "width",
+  "height",
+  "duration_seconds",
+  "aspect_ratio",
+  "credits_spent",
+  "status",
+  "task_id",
+  "created_at",
+].join(",");
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -61,7 +104,7 @@ function asInt(value: unknown, fallback = 0): number {
 function stripeClient() {
   const key = Deno.env.get("STRIPE_SECRET_KEY") || "";
   if (!key) throw new Error("Stripe is not configured");
-  return new Stripe(key, { apiVersion: "2025-08-27.basil" });
+  return new Stripe(key, { apiVersion: "2026-02-25.clover" as any });
 }
 
 function slugCode(input: string): string {
@@ -100,6 +143,70 @@ function allowedConsoleRedirect(input: unknown): string {
   } catch {
     return fallback;
   }
+}
+
+function firstUrl(...values: Array<unknown>): string | null {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed.startsWith("https://")) return trimmed;
+  }
+  return null;
+}
+
+async function resolvePaymentReceipt(client: SupabaseClient, stripe: Stripe, payment: any) {
+  if (!payment?.id) return payment;
+
+  const updates: Record<string, unknown> = {};
+  try {
+    let invoiceId = asString(payment.stripe_invoice_id);
+    let chargeId = asString(payment.stripe_charge_id);
+
+    if (!payment.receipt_url && payment.stripe_payment_intent_id) {
+      const intent = await stripe.paymentIntents.retrieve(
+        payment.stripe_payment_intent_id,
+        { expand: ["latest_charge"] } as any,
+      ) as any;
+      const latestCharge = intent.latest_charge;
+      const charge = typeof latestCharge === "string"
+        ? await stripe.charges.retrieve(latestCharge)
+        : latestCharge;
+
+      if (charge?.id) {
+        chargeId = charge.id;
+        updates.stripe_charge_id = charge.id;
+        if (charge.receipt_url) updates.receipt_url = charge.receipt_url;
+        if (charge.receipt_number) updates.receipt_number = charge.receipt_number;
+        if (charge.invoice && !invoiceId) {
+          invoiceId = typeof charge.invoice === "string" ? charge.invoice : charge.invoice.id;
+          updates.stripe_invoice_id = invoiceId;
+        }
+      }
+    }
+
+    if (!payment.invoice_url && invoiceId) {
+      const invoice = await stripe.invoices.retrieve(invoiceId) as any;
+      updates.stripe_invoice_id = invoice.id ?? invoiceId;
+      const invoiceUrl = firstUrl(invoice.hosted_invoice_url, invoice.invoice_pdf);
+      if (invoiceUrl) updates.invoice_url = invoiceUrl;
+    }
+
+    if (chargeId && !updates.stripe_charge_id) updates.stripe_charge_id = chargeId;
+    const resolvedUrl = firstUrl(updates.receipt_url, updates.invoice_url, payment.receipt_url, payment.invoice_url);
+    if (resolvedUrl) updates.receipt_generated_at = new Date().toISOString();
+
+    if (Object.keys(updates).length > 0) {
+      const { error } = await client
+        .from("payment_transactions")
+        .update(updates)
+        .eq("id", payment.id);
+      if (error) console.warn("[workspace_org_console] receipt cache update failed:", error);
+    }
+  } catch (err) {
+    console.warn("[workspace_org_console] Stripe receipt lookup failed:", err);
+  }
+
+  return { ...payment, ...updates };
 }
 
 async function currentUser(req: Request): Promise<User | null> {
@@ -257,7 +364,7 @@ async function getOverview(client: SupabaseClient, user: User) {
   if (!ctx) throw new Error("org_admin_required");
   const orgId = ctx.organization_id;
 
-  const [orgRes, domainRes, memberRes, inviteRes, teamRes, paymentRes] = await Promise.all([
+  const [orgRes, domainRes, memberRes, inviteRes, teamRes, paymentRes, generationRes] = await Promise.all([
     client
       .from("organizations")
       .select("id,name,display_name,slug,type,status,logo_url,brand_color,primary_contact_email,credit_pool,credit_pool_allocated,settings,created_at,updated_at")
@@ -286,10 +393,16 @@ async function getOverview(client: SupabaseClient, user: User) {
       .order("created_at", { ascending: false }),
     client
       .from("payment_transactions")
-      .select("id,user_id,organization_id,stripe_payment_intent_id,amount_thb,credits_added,status,payment_method,created_at,updated_at")
+      .select(PAYMENT_SELECT)
       .eq("organization_id", orgId)
       .order("created_at", { ascending: false })
-      .limit(10),
+      .limit(100),
+    client
+      .from("workspace_generation_events")
+      .select(GENERATION_SELECT)
+      .eq("organization_id", orgId)
+      .order("created_at", { ascending: false })
+      .limit(250),
   ]);
 
   if (orgRes.error) throw new Error(`organization read failed: ${orgRes.error.message}`);
@@ -298,13 +411,22 @@ async function getOverview(client: SupabaseClient, user: User) {
   if (inviteRes.error) throw new Error(`invite read failed: ${inviteRes.error.message}`);
   if (teamRes.error) throw new Error(`team read failed: ${teamRes.error.message}`);
   if (paymentRes.error) throw new Error(`payment read failed: ${paymentRes.error.message}`);
+  if (generationRes.error) throw new Error(`generation history read failed: ${generationRes.error.message}`);
 
   const members = await hydrateUsers(client, memberRes.data ?? []);
+  const payments = await hydrateUsers(client, paymentRes.data ?? []);
+  const generations = await hydrateUsers(client, generationRes.data ?? []);
   const teams = (teamRes.data ?? []).map((team: any) => ({
     ...team,
     credit_available: Math.max(0, Number(team.credit_pool ?? 0) - Number(team.credit_pool_consumed ?? 0)),
     member_count: members.filter((member: any) => member.team_id === team.id && member.status === "active").length,
   }));
+  const completedPayments = payments.filter((payment: any) => payment.status === "completed");
+  const cutoff30d = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const recentGenerations = generations.filter((generation: any) => {
+    const t = Date.parse(generation.created_at ?? "");
+    return Number.isFinite(t) && t >= cutoff30d;
+  });
 
   return {
     data: {
@@ -316,7 +438,17 @@ async function getOverview(client: SupabaseClient, user: User) {
       members,
       invites: inviteRes.data ?? [],
       teams,
-      payments: paymentRes.data ?? [],
+      payments,
+      generations,
+      usage_summary: {
+        payment_count: payments.length,
+        topup_amount_thb_total: completedPayments.reduce((sum: number, payment: any) => sum + Number(payment.amount_thb ?? 0), 0),
+        topup_credits_total: completedPayments.reduce((sum: number, payment: any) => sum + Number(payment.credits_added ?? 0), 0),
+        generation_count: generations.length,
+        generation_count_30d: recentGenerations.length,
+        generation_credits_total: generations.reduce((sum: number, generation: any) => sum + Number(generation.credits_spent ?? 0), 0),
+        generation_credits_30d: recentGenerations.reduce((sum: number, generation: any) => sum + Number(generation.credits_spent ?? 0), 0),
+      },
       seat_price_usd: 5,
       org_topup_ratio_thb_to_credits: ORG_TOPUP_RATIO_THB_TO_CREDITS,
     },
@@ -531,13 +663,14 @@ async function createOrgPromptPayIntent(client: SupabaseClient, user: User, body
     },
   });
 
-  const origin = req.headers.get("origin") || "https://mediaforge-admin-hub.vercel.app";
+  const origin = req.headers.get("origin") || "";
+  const returnUrl = allowedConsoleRedirect(origin ? `${origin}/org/console?topup=success` : null);
   const confirmed = await stripe.paymentIntents.confirm(paymentIntent.id, {
     payment_method_data: {
       type: "promptpay",
       billing_details: { email: user.email, name: customerName },
     },
-    return_url: `${origin}/org/console?topup=success`,
+    return_url: returnUrl,
   });
 
   const expiresAt = confirmed.next_action?.promptpay_display_qr_code?.expires_at ?? null;
@@ -562,12 +695,41 @@ async function getOrgPaymentStatus(client: SupabaseClient, user: User, body: Rec
 
   const { data, error } = await client
     .from("payment_transactions")
-    .select("id,stripe_payment_intent_id,amount_thb,credits_added,status,payment_method,created_at,updated_at")
+    .select(PAYMENT_SELECT)
     .eq("organization_id", ctx.organization_id)
     .eq("stripe_payment_intent_id", paymentIntentId)
     .maybeSingle();
   if (error) throw new Error(`payment status lookup failed: ${error.message}`);
   return { data: { payment: data ?? null } };
+}
+
+async function getOrgReceipt(client: SupabaseClient, user: User, body: Record<string, unknown>) {
+  const ctx = await orgAdminContext(client, user);
+  if (!ctx) throw new Error("org_admin_required");
+  const paymentId = asString(body.payment_id);
+  if (!paymentId) throw new Error("payment_id is required");
+
+  const { data, error } = await client
+    .from("payment_transactions")
+    .select(PAYMENT_SELECT)
+    .eq("id", paymentId)
+    .eq("organization_id", ctx.organization_id)
+    .maybeSingle();
+  if (error) throw new Error(`payment lookup failed: ${error.message}`);
+  if (!data) throw new Error("payment_not_found");
+
+  const payment = await resolvePaymentReceipt(client, stripeClient(), data);
+  const downloadUrl = firstUrl(payment.receipt_url, payment.invoice_url);
+  if (!downloadUrl) throw new Error("receipt_not_available_yet");
+
+  return {
+    data: {
+      payment,
+      receipt_url: payment.receipt_url ?? null,
+      invoice_url: payment.invoice_url ?? null,
+      download_url: downloadUrl,
+    },
+  };
 }
 
 const ACTIONS: Record<string, (client: SupabaseClient, user: User, body: Record<string, unknown>) => Promise<unknown>> = {
@@ -581,6 +743,7 @@ const ACTIONS: Record<string, (client: SupabaseClient, user: User, body: Record<
   create_team: createTeam,
   allocate_team_credits: allocateTeamCredits,
   get_org_payment_status: getOrgPaymentStatus,
+  get_org_receipt: getOrgReceipt,
 };
 
 Deno.serve(async (req) => {
