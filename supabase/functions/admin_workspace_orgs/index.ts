@@ -18,7 +18,7 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type, x-admin-email",
+    "authorization, x-client-info, apikey, content-type, x-admin-email, x-admin-auth-key",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 };
 
@@ -225,17 +225,30 @@ async function saveWorkspaceOrg(client: SupabaseClient, body: Record<string, unk
     contact_notes: asString(body.contact_notes) || null,
   };
 
-  const result = id
-    ? await client.from("organizations").update(row).eq("id", id).select("*").single()
+  let existingOrgId = id;
+  if (!existingOrgId) {
+    const { data: existingOrg, error: lookupError } = await client
+      .from("organizations")
+      .select("id")
+      .eq("slug", slug)
+      .is("deleted_at", null)
+      .maybeSingle();
+    if (lookupError) throw new Error(`organization lookup failed: ${lookupError.message}`);
+    existingOrgId = String((existingOrg as any)?.id ?? "");
+  }
+
+  const result = existingOrgId
+    ? await client.from("organizations").update(row).eq("id", existingOrgId).select("*").single()
     : await client.from("organizations").insert(row).select("*").single();
   if (result.error) throw new Error(`organization save failed: ${result.error.message}`);
 
   const org = result.data as any;
   const initialCredits = Math.max(0, asInt(body.initial_credits, 0));
-  if (!id && initialCredits > 0) {
+  const initialTopUp = Math.max(0, initialCredits - Number(org.credit_pool ?? 0));
+  if (!id && initialTopUp > 0) {
     const { data, error } = await client.rpc("admin_adjust_org_credit_pool", {
       p_org_id: org.id,
-      p_delta: initialCredits,
+      p_delta: initialTopUp,
       p_actor_id: null,
       p_description: "Initial workspace org credits from ERP",
     });

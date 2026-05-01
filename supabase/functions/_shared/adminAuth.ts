@@ -1,4 +1,5 @@
 /// <reference lib="deno.ns" />
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 /**
  * Shared admin-JWT verifier used by all admin_workspace_* functions.
  *
@@ -38,6 +39,22 @@ export interface AdminJwtPayload {
   exp: number;
 }
 
+function adminAuthProjectConfig(req: Request): { url: string; anonKey: string } | null {
+  const url =
+    Deno.env.get("ADMIN_AUTH_SUPABASE_URL") ??
+    Deno.env.get("ADMIN_SUPABASE_URL") ??
+    Deno.env.get("ERP_ADMIN_SUPABASE_URL") ??
+    "https://jonueleuisfarcepwkuo.supabase.co";
+  const anonKey =
+    Deno.env.get("ADMIN_AUTH_SUPABASE_ANON_KEY") ??
+    Deno.env.get("ADMIN_SUPABASE_ANON_KEY") ??
+    Deno.env.get("ERP_ADMIN_SUPABASE_ANON_KEY") ??
+    req.headers.get("x-admin-auth-key") ??
+    "";
+  if (!url || !anonKey) return null;
+  return { url, anonKey };
+}
+
 function b64urlToBytes(s: string): Uint8Array {
   const padded = s.replace(/-/g, "+").replace(/_/g, "/");
   // Pad with '=' to a multiple of 4 so atob() doesn't trip on
@@ -48,39 +65,71 @@ function b64urlToBytes(s: string): Uint8Array {
 
 export async function verifyAdminJwt(req: Request): Promise<AdminJwtPayload | null> {
   const secret = Deno.env.get("JWT_SECRET");
-  if (!secret) return null; // fail closed when the secret is missing
 
   const auth = req.headers.get("Authorization") ?? req.headers.get("authorization");
   if (!auth?.startsWith("Bearer ")) return null;
 
   const parts = auth.slice(7).split(".");
-  if (parts.length !== 3) return null;
+  if (secret && parts.length === 3) {
+    try {
+      const enc = new TextEncoder();
+      const key = await crypto.subtle.importKey(
+        "raw",
+        enc.encode(secret),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["verify"],
+      );
+      const sigBytes = b64urlToBytes(parts[2]);
+      const ok = await crypto.subtle.verify(
+        "HMAC",
+        key,
+        sigBytes,
+        enc.encode(`${parts[0]}.${parts[1]}`),
+      );
+      if (ok) {
+        const payloadJson = new TextDecoder().decode(b64urlToBytes(parts[1]));
+        const payload = JSON.parse(payloadJson) as AdminJwtPayload;
+
+        if (payload.type !== "admin") return null;
+        if (typeof payload.exp !== "number" || payload.exp * 1000 < Date.now()) return null;
+
+        return payload;
+      }
+    } catch {
+      // Fall through to ERP Supabase-session verification below.
+    }
+  }
+
+  const adminAuth = adminAuthProjectConfig(req);
+  if (!adminAuth) return null;
 
   try {
-    const enc = new TextEncoder();
-    const key = await crypto.subtle.importKey(
-      "raw",
-      enc.encode(secret),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["verify"],
-    );
-    const sigBytes = b64urlToBytes(parts[2]);
-    const ok = await crypto.subtle.verify(
-      "HMAC",
-      key,
-      sigBytes,
-      enc.encode(`${parts[0]}.${parts[1]}`),
-    );
-    if (!ok) return null;
+    const adminClient = createClient(adminAuth.url, adminAuth.anonKey, {
+      global: { headers: { Authorization: auth } },
+    });
+    const { data: userData, error: userError } = await adminClient.auth.getUser();
+    const user = userData.user;
+    if (userError || !user) return null;
 
-    const payloadJson = new TextDecoder().decode(b64urlToBytes(parts[1]));
-    const payload = JSON.parse(payloadJson) as AdminJwtPayload;
+    const { data: roles, error: roleError } = await adminClient
+      .from("user_roles")
+      .select("role")
+      .eq("user_id", user.id);
+    if (roleError) return null;
+    const role = (roles ?? []).map((row: { role: string }) => row.role).find((value) => value === "admin");
+    if (!role) return null;
 
-    if (payload.type !== "admin") return null;
-    if (typeof payload.exp !== "number" || payload.exp * 1000 < Date.now()) return null;
-
-    return payload;
+    const now = Math.floor(Date.now() / 1000);
+    return {
+      sub: user.id,
+      email: user.email ?? "",
+      role,
+      display_name: user.user_metadata?.display_name ?? user.email ?? "",
+      type: "admin",
+      iat: now,
+      exp: now + 3600,
+    };
   } catch {
     return null;
   }
