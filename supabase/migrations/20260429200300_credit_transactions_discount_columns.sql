@@ -6,15 +6,25 @@ alter table public.credit_transactions
   add column if not exists effective_amount int,
   add column if not exists discount_percent int default 0;
 
-alter table public.team_credit_transactions
-  add column if not exists effective_amount int,
-  add column if not exists discount_percent int default 0;
+do $$
+begin
+  if to_regclass('public.team_credit_transactions') is not null then
+    alter table public.team_credit_transactions
+      add column if not exists effective_amount int,
+      add column if not exists discount_percent int default 0;
+  end if;
+end $$;
 
 comment on column public.credit_transactions.effective_amount is
   'Credits actually deducted after applying credit_discount_percent. Negative on usage rows.';
 comment on column public.credit_transactions.discount_percent is
   'Discount percent applied to this transaction (0 if no plan discount).';
-comment on column public.team_credit_transactions.effective_amount is
-  'Credits actually deducted from team pool after applying credit_discount_percent. Negative on usage rows.';
-comment on column public.team_credit_transactions.discount_percent is
-  'Discount percent applied (typically 20 for Team plan).';
+do $$
+begin
+  if to_regclass('public.team_credit_transactions') is not null then
+    comment on column public.team_credit_transactions.effective_amount is
+      'Credits actually deducted from team pool after applying credit_discount_percent. Negative on usage rows.';
+    comment on column public.team_credit_transactions.discount_percent is
+      'Discount percent applied (typically 20 for Team plan).';
+  end if;
+end $$;

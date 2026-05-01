@@ -28,6 +28,26 @@ create table if not exists public.workspace_generation_jobs (
   updated_at timestamptz not null default now()
 );
 
+alter table public.workspace_generation_jobs
+  add column if not exists user_id uuid,
+  add column if not exists workspace_id text,
+  add column if not exists canvas_id text,
+  add column if not exists node_id text,
+  add column if not exists node_type text,
+  add column if not exists provider text,
+  add column if not exists model text,
+  add column if not exists request jsonb not null default '{}'::jsonb,
+  add column if not exists status text not null default 'queued',
+  add column if not exists attempts integer not null default 0,
+  add column if not exists max_attempts integer not null default 18,
+  add column if not exists result jsonb,
+  add column if not exists error text,
+  add column if not exists last_error text,
+  add column if not exists started_at timestamptz,
+  add column if not exists completed_at timestamptz,
+  add column if not exists created_at timestamptz not null default now(),
+  add column if not exists updated_at timestamptz not null default now();
+
 create index if not exists workspace_generation_jobs_user_created_idx
   on public.workspace_generation_jobs (user_id, created_at desc);
 

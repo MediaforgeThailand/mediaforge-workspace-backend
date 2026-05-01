@@ -47,6 +47,25 @@ create table if not exists public.workspace_generation_events (
   created_at timestamptz not null default now()
 );
 
+alter table public.workspace_generation_events
+  add column if not exists user_id uuid,
+  add column if not exists workspace_id text,
+  add column if not exists canvas_id text,
+  add column if not exists node_id text,
+  add column if not exists feature text,
+  add column if not exists model text,
+  add column if not exists provider text,
+  add column if not exists output_tier text,
+  add column if not exists output_count int not null default 1,
+  add column if not exists width int,
+  add column if not exists height int,
+  add column if not exists duration_seconds numeric,
+  add column if not exists aspect_ratio text,
+  add column if not exists credits_spent int,
+  add column if not exists status text not null default 'completed',
+  add column if not exists task_id text,
+  add column if not exists created_at timestamptz not null default now();
+
 -- Primary aggregation index. Analytics queries always group by
 -- (feature, model, created_at), often filtered by since/until.
 create index if not exists idx_wge_feature_model_created
@@ -73,6 +92,7 @@ alter table public.workspace_generation_events enable row level security;
 -- policy here. Keeping the user policy narrow (read-only, own rows)
 -- means a future workspace-frontend "your usage" widget works without
 -- any further RLS work.
+drop policy if exists "wge_select_own" on public.workspace_generation_events;
 create policy "wge_select_own"
   on public.workspace_generation_events
   for select
