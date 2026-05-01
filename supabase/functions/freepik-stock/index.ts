@@ -25,7 +25,7 @@ function setIfPresent(params: URLSearchParams, key: string, value: unknown): voi
   if (s) params.set(key, s);
 }
 
-async function readFreepik(res: Response): Promise<unknown> {
+async function readProviderResponse(res: Response): Promise<unknown> {
   const text = await res.text();
   if (!text) return null;
   try {
@@ -42,7 +42,7 @@ Deno.serve(async (req) => {
 
   try {
     const apiKey = Deno.env.get("FREEPIK_API_KEY");
-    if (!apiKey) return json({ error: "FREEPIK_API_KEY not configured" }, 500);
+    if (!apiKey) return json({ error: "Stock provider key not configured" }, 500);
 
     const authUser = await getAuthUser(req);
     if (!authUser) return json({ error: "Unauthorized" }, 401);
@@ -59,9 +59,6 @@ Deno.serve(async (req) => {
     const freepikHeaders = {
       Accept: "application/json",
       "Accept-Language": String(body?.language ?? "en-US"),
-      // Freepik's public docs reference x-freepik-api-key. The docs
-      // currently redirect to Magnific pages that use x-magnific-api-key,
-      // so send both to keep this proxy compatible during the transition.
       "x-freepik-api-key": apiKey,
       "x-magnific-api-key": apiKey,
     };
@@ -78,11 +75,11 @@ Deno.serve(async (req) => {
       const res = await fetch(`${FREEPIK_BASE}/resources?${params.toString()}`, {
         headers: freepikHeaders,
       });
-      const payload = await readFreepik(res);
+      const payload = await readProviderResponse(res);
       if (!res.ok) {
-        console.error("Freepik resources error:", res.status, payload);
+        console.error("Stock provider resources error:", res.status, payload);
         return json({
-          error: "Freepik search failed",
+          error: "Stock search failed",
           status: res.status,
           details: payload,
         });
@@ -100,11 +97,11 @@ Deno.serve(async (req) => {
       const res = await fetch(`${FREEPIK_BASE}/resources/${resourceId}/download${suffix}`, {
         headers: freepikHeaders,
       });
-      const payload = await readFreepik(res);
+      const payload = await readProviderResponse(res);
       if (!res.ok) {
-        console.error("Freepik download error:", res.status, payload);
+        console.error("Stock provider download error:", res.status, payload);
         return json({
-          error: "Freepik download failed",
+          error: "Stock download failed",
           status: res.status,
           details: payload,
         });
@@ -129,7 +126,7 @@ Deno.serve(async (req) => {
 
     return json({ error: "Unknown action" }, 400);
   } catch (err) {
-    console.error("freepik-stock error:", err);
+    console.error("stock library error:", err);
     return json({ error: "Internal server error" }, 500);
   }
 });
