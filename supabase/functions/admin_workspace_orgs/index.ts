@@ -21,7 +21,18 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type, x-admin-email, x-admin-auth-key",
+    [
+      "authorization",
+      "x-client-info",
+      "apikey",
+      "content-type",
+      "x-admin-email",
+      "x-admin-auth-key",
+      "x-supabase-client-platform",
+      "x-supabase-client-platform-version",
+      "x-supabase-client-runtime",
+      "x-supabase-client-runtime-version",
+    ].join(", "),
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 };
 
@@ -536,6 +547,159 @@ async function allocateWorkspaceTeamCredits(client: SupabaseClient, body: Record
   return { data: { credit_pool: data } };
 }
 
+async function hydrateWorkspaceMembers(client: SupabaseClient, rows: any[]) {
+  const ids = [...new Set(rows.map((row) => String(row.user_id ?? "")).filter(Boolean))];
+  const authById = new Map<string, { email: string | null; display_name: string | null }>();
+
+  await Promise.all(ids.map(async (id) => {
+    try {
+      const { data } = await client.auth.admin.getUserById(id);
+      const user = data?.user;
+      authById.set(id, {
+        email: user?.email ?? null,
+        display_name: (user?.user_metadata?.display_name ?? user?.user_metadata?.full_name ?? null) as string | null,
+      });
+    } catch {
+      authById.set(id, { email: null, display_name: null });
+    }
+  }));
+
+  const profilesById = new Map<string, any>();
+  if (ids.length > 0) {
+    const { data } = await client
+      .from("profiles")
+      .select("user_id,display_name,avatar_url,organization_id,account_type")
+      .in("user_id", ids);
+    for (const profile of data ?? []) {
+      profilesById.set(String((profile as any).user_id), profile);
+    }
+  }
+
+  return rows.map((row) => {
+    const auth = authById.get(String(row.user_id)) ?? { email: null, display_name: null };
+    const profile = profilesById.get(String(row.user_id));
+    return {
+      ...row,
+      email: auth.email,
+      display_name: profile?.display_name ?? auth.display_name,
+      avatar_url: profile?.avatar_url ?? null,
+      account_type: profile?.account_type ?? null,
+    };
+  });
+}
+
+async function listWorkspaceOrgMembers(client: SupabaseClient, body: Record<string, unknown>) {
+  const organizationId = asString(body.organization_id);
+  if (!organizationId) throw new Error("organization_id is required");
+
+  const [membersRes, teamsRes, invitesRes] = await Promise.all([
+    client
+      .from("organization_memberships")
+      .select("id,organization_id,user_id,role,status,source,team_id,requested_at,approved_at,approved_by,invited_by,joined_at,suspended_at,created_at,updated_at")
+      .eq("organization_id", organizationId)
+      .order("created_at", { ascending: false }),
+    client
+      .from("classes")
+      .select("id,organization_id,name,code,status,credit_pool,credit_pool_consumed,credit_policy,credit_amount,created_at,updated_at")
+      .eq("organization_id", organizationId)
+      .is("deleted_at", null)
+      .order("created_at", { ascending: false }),
+    client
+      .from("organization_member_invites")
+      .select("id,organization_id,email,role,team_id,status,expires_at,created_at,updated_at")
+      .eq("organization_id", organizationId)
+      .order("created_at", { ascending: false }),
+  ]);
+
+  if (membersRes.error) throw new Error(`members read failed: ${membersRes.error.message}`);
+  if (teamsRes.error) throw new Error(`teams read failed: ${teamsRes.error.message}`);
+  if (invitesRes.error) throw new Error(`invites read failed: ${invitesRes.error.message}`);
+
+  const teams = (teamsRes.data ?? []).map((team: any) => ({
+    ...team,
+    credit_available: Math.max(0, Number(team.credit_pool ?? 0) - Number(team.credit_pool_consumed ?? 0)),
+  }));
+  const teamById = new Map(teams.map((team: any) => [team.id, team]));
+  const members = (await hydrateWorkspaceMembers(client, membersRes.data ?? [])).map((member: any) => ({
+    ...member,
+    team: member.team_id ? teamById.get(member.team_id) ?? null : null,
+  }));
+
+  return {
+    data: {
+      members,
+      teams,
+      invites: invitesRes.data ?? [],
+    },
+  };
+}
+
+async function updateWorkspaceOrgMember(client: SupabaseClient, body: Record<string, unknown>) {
+  const organizationId = asString(body.organization_id);
+  const membershipId = asString(body.membership_id);
+  if (!organizationId || !membershipId) throw new Error("organization_id and membership_id are required");
+
+  const role = asString(body.role);
+  const status = asString(body.status);
+  const hasTeam = Object.prototype.hasOwnProperty.call(body, "team_id");
+
+  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if (role) {
+    if (role !== "org_admin" && role !== "member") throw new Error("invalid member role");
+    updates.role = role;
+  }
+  if (status) {
+    if (!["active", "pending", "invited", "rejected", "suspended"].includes(status)) {
+      throw new Error("invalid member status");
+    }
+    updates.status = status;
+    if (status === "active") {
+      updates.approved_at = new Date().toISOString();
+      updates.suspended_at = null;
+    }
+    if (status === "suspended") updates.suspended_at = new Date().toISOString();
+  }
+  if (hasTeam) {
+    const rawTeam = body.team_id;
+    const teamId = rawTeam === null ? "" : asString(rawTeam);
+    if (!teamId || teamId === "__none" || teamId === "none") {
+      updates.team_id = null;
+    } else {
+      const { data: team, error: teamError } = await client
+        .from("classes")
+        .select("id")
+        .eq("id", teamId)
+        .eq("organization_id", organizationId)
+        .is("deleted_at", null)
+        .maybeSingle();
+      if (teamError) throw new Error(`team lookup failed: ${teamError.message}`);
+      if (!team) throw new Error("team does not belong to this organization");
+      updates.team_id = teamId;
+    }
+  }
+  if (Object.keys(updates).length === 1) throw new Error("no member changes supplied");
+
+  const { data, error } = await client
+    .from("organization_memberships")
+    .update(updates)
+    .eq("id", membershipId)
+    .eq("organization_id", organizationId)
+    .select("id,organization_id,user_id,role,status,source,team_id,requested_at,approved_at,approved_by,invited_by,joined_at,suspended_at,created_at,updated_at")
+    .single();
+  if (error) throw new Error(`member update failed: ${error.message}`);
+
+  if ((data as any).status === "active") {
+    await client.from("profiles").update({
+      organization_id: organizationId,
+      account_type: "org_user",
+      updated_at: new Date().toISOString(),
+    }).eq("user_id", (data as any).user_id);
+  }
+
+  const members = await hydrateWorkspaceMembers(client, [data]);
+  return { data: { member: members[0] } };
+}
+
 function rowDate(value: unknown): string | null {
   return typeof value === "string" && value ? value : null;
 }
@@ -988,6 +1152,8 @@ const ACTIONS: Record<string, (client: SupabaseClient, body: Record<string, unkn
   list_workspace_teams: (client) => listWorkspaceTeams(client),
   save_workspace_team: saveWorkspaceTeam,
   allocate_workspace_team_credits: allocateWorkspaceTeamCredits,
+  list_workspace_org_members: listWorkspaceOrgMembers,
+  update_workspace_org_member: updateWorkspaceOrgMember,
   list_workspace_education_dashboard: (client) => listWorkspaceEducation(client),
   save_workspace_education_institution: saveWorkspaceEducationInstitution,
   save_workspace_education_class: saveWorkspaceEducationClass,

@@ -187,6 +187,9 @@ verify_jwt = false
 [functions.admin_workspace_orgs]
 verify_jwt = false
 
+[functions.workspace_org_console]
+verify_jwt = false
+
 [functions.mf-um-resolve-login]
 verify_jwt = false
 
