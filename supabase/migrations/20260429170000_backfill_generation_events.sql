@@ -98,14 +98,20 @@ select
   1 as output_count,
   -- width / height: gen first, else parse params.size like "1024x1024"
   coalesce(
-    nullif(g->>'width', '')::int,
+    case when nullif(g->>'width', '') ~ '^\d+$'
+         then (g->>'width')::int
+         else null
+    end,
     case when (n->'data'->'params'->>'size') ~ '^\d+x\d+$'
          then split_part(n->'data'->'params'->>'size', 'x', 1)::int
          else null
     end
   ) as width,
   coalesce(
-    nullif(g->>'height', '')::int,
+    case when nullif(g->>'height', '') ~ '^\d+$'
+         then (g->>'height')::int
+         else null
+    end,
     case when (n->'data'->'params'->>'size') ~ '^\d+x\d+$'
          then split_part(n->'data'->'params'->>'size', 'x', 2)::int
          else null
@@ -113,12 +119,24 @@ select
   ) as height,
   -- duration_seconds: gen first, else params.duration_seconds, else params.duration
   coalesce(
-    nullif(g->>'duration_seconds', '')::numeric,
-    nullif(n->'data'->'params'->>'duration_seconds', '')::numeric,
-    nullif(n->'data'->'params'->>'duration', '')::numeric
+    case when nullif(g->>'duration_seconds', '') ~ '^\d+(\.\d+)?$'
+         then (g->>'duration_seconds')::numeric
+         else null
+    end,
+    case when nullif(n->'data'->'params'->>'duration_seconds', '') ~ '^\d+(\.\d+)?$'
+         then (n->'data'->'params'->>'duration_seconds')::numeric
+         else null
+    end,
+    case when nullif(n->'data'->'params'->>'duration', '') ~ '^\d+(\.\d+)?$'
+         then (n->'data'->'params'->>'duration')::numeric
+         else null
+    end
   ) as duration_seconds,
   nullif(n->'data'->'params'->>'aspect_ratio', '') as aspect_ratio,
-  nullif(g->>'credit_cost', '')::int as credits_spent,
+  case when nullif(g->>'credit_cost', '') ~ '^-?\d+$'
+       then (g->>'credit_cost')::int
+       else null
+  end as credits_spent,
   'completed' as status,
   -- createdAt is epoch ms in the canvas jsonb. Fall back to wc.updated_at
   -- so old rows still sort somewhere reasonable.

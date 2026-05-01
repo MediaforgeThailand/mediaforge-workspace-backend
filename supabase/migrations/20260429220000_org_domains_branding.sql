@@ -23,6 +23,13 @@
 -- ───────────────────────────────────────────────────────────────
 -- 1. SCHEMA — short display name
 -- ───────────────────────────────────────────────────────────────
+-- Some branch databases are cloned from the final Schema C state, where
+-- the old Schema A SSO tables have already been dropped. Recreate the
+-- minimum old anchor table so this legacy migration can be replayed and
+-- then cleaned up by 20260430000010_drop_schema_a_and_v3_staging.sql.
+create table if not exists public.sso_organizations (
+  id uuid primary key default gen_random_uuid()
+);
 
 alter table public.sso_organizations
   add column if not exists display_name_short text
