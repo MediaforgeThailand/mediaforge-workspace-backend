@@ -26,7 +26,6 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
 const ORG_TOPUP_RATIO_THB_TO_CREDITS = 50;
 const MIN_ORG_TOPUP_THB = 500;
 const MAX_ORG_TOPUP_THB = 100_000;
@@ -114,10 +113,6 @@ function slugCode(input: string): string {
     .replace(/^-+|-+$/g, "")
     .slice(0, 14);
   return base || `TEAM-${Math.floor(Math.random() * 9999)}`;
-}
-
-function emailDomain(email: string): string {
-  return email.toLowerCase().split("@")[1] ?? "";
 }
 
 function allowedConsoleRedirect(input: unknown): string {
@@ -455,14 +450,20 @@ async function getOverview(client: SupabaseClient, user: User) {
   };
 }
 
-async function verifiedDomains(client: SupabaseClient, orgId: string): Promise<string[]> {
+async function normalizeTeamId(client: SupabaseClient, orgId: string, value: unknown): Promise<string | null> {
+  const teamId = asString(value) || null;
+  if (!teamId) return null;
+
   const { data, error } = await client
-    .from("organization_domains")
-    .select("domain")
+    .from("classes")
+    .select("id")
+    .eq("id", teamId)
     .eq("organization_id", orgId)
-    .not("verified_at", "is", null);
-  if (error) throw new Error(`domain lookup failed: ${error.message}`);
-  return (data ?? []).map((row: any) => String(row.domain).toLowerCase()).filter((value) => DOMAIN_RE.test(value));
+    .is("deleted_at", null)
+    .maybeSingle();
+  if (error) throw new Error(`team lookup failed: ${error.message}`);
+  if (!data) throw new Error("team does not belong to this organization");
+  return teamId;
 }
 
 async function inviteMember(client: SupabaseClient, user: User, body: Record<string, unknown>) {
@@ -471,12 +472,7 @@ async function inviteMember(client: SupabaseClient, user: User, body: Record<str
   const email = asString(body.email).toLowerCase();
   if (!email || !email.includes("@")) throw new Error("valid email is required");
   const role = asString(body.role, "member") === "org_admin" ? "org_admin" : "member";
-  const teamId = asString(body.team_id) || null;
-
-  const domains = await verifiedDomains(client, ctx.organization_id);
-  if (domains.length > 0 && !domains.includes(emailDomain(email))) {
-    throw new Error("email domain is not verified for this organization");
-  }
+  const teamId = await normalizeTeamId(client, ctx.organization_id, body.team_id);
 
   const existingUser = await findUserByEmail(client, email);
   if (existingUser) {
@@ -529,7 +525,7 @@ async function updateMemberStatus(client: SupabaseClient, user: User, body: Reco
   const membershipId = asString(body.membership_id);
   if (!membershipId) throw new Error("membership_id is required");
   const role = asString(body.role);
-  const teamId = asString(body.team_id);
+  const teamId = await normalizeTeamId(client, ctx.organization_id, body.team_id);
 
   const updates: Record<string, unknown> = {
     status,
