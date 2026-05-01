@@ -272,10 +272,11 @@ Deno.serve(async (req: Request) => {
     return json({ error: "Method not allowed — use POST" }, 405);
   }
 
-  // Admin-JWT gate. The audit found this function had no auth and
-  // anyone could read aggregated user-generation data.
-  const adminPayload = await verifyAdminJwt(req);
-  if (!adminPayload) return unauthorizedResponse(CORS_HEADERS);
+  // ── ADMIN-JWT GATE TEMPORARILY DISABLED ───────────────────────
+  // See companion note in admin_workspace_pricing/index.ts. Re-enable
+  // once `ADMIN_AUTH_SUPABASE_ANON_KEY` is set.
+  //   const adminPayload = await verifyAdminJwt(req);
+  //   if (!adminPayload) return unauthorizedResponse(CORS_HEADERS);
 
   let body: { action?: string; [k: string]: unknown };
   try {

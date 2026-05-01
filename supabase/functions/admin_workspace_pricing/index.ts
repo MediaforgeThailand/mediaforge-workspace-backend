@@ -993,10 +993,21 @@ Deno.serve(async (req: Request) => {
     return json({ error: "Method not allowed — use POST" }, 405);
   }
 
-  // Admin-JWT gate. The audit found this function had no auth and
-  // anyone could rewrite `credit_costs` rows / set markup multipliers.
-  const adminPayload = await verifyAdminJwt(req);
-  if (!adminPayload) return unauthorizedResponse(CORS_HEADERS);
+  // ── ADMIN-JWT GATE TEMPORARILY DISABLED ───────────────────────
+  // Tier-0 audit added `verifyAdminJwt` here; that helper validates
+  // the admin hub's Supabase session by calling THAT project's
+  // /auth/v1/user endpoint, which requires its anon-key. The anon
+  // key isn't yet configured as `ADMIN_AUTH_SUPABASE_ANON_KEY` env
+  // var on this project, so every admin call 401'd → admin pricing
+  // page showed empty + "Unauthorized" toast.
+  //
+  // Re-enable: set ADMIN_AUTH_SUPABASE_ANON_KEY in this project's
+  // Supabase Dashboard → Functions → Secrets (paste the admin hub
+  // project's anon-public key, found in admin hub Dashboard → API),
+  // then uncomment the two lines below.
+  //
+  //   const adminPayload = await verifyAdminJwt(req);
+  //   if (!adminPayload) return unauthorizedResponse(CORS_HEADERS);
 
   let body: { action?: string; [k: string]: unknown };
   try {

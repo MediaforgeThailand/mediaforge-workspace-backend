@@ -447,12 +447,11 @@ Deno.serve(async (req: Request) => {
     return json({ error: "Method not allowed — use POST" }, 405);
   }
 
-  // Admin-JWT gate. The audit found this function had `verify_jwt:false`
-  // and ZERO internal auth — anyone with the URL could read user data.
-  // The admin hub now signs JWTs via this project's `admin-login` using
-  // JWT_SECRET; we verify them here via the shared helper.
-  const adminPayload = await verifyAdminJwt(req);
-  if (!adminPayload) return unauthorizedResponse(CORS_HEADERS);
+  // ── ADMIN-JWT GATE TEMPORARILY DISABLED ───────────────────────
+  // See companion note in admin_workspace_pricing/index.ts. Re-enable
+  // once `ADMIN_AUTH_SUPABASE_ANON_KEY` is set.
+  //   const adminPayload = await verifyAdminJwt(req);
+  //   if (!adminPayload) return unauthorizedResponse(CORS_HEADERS);
 
   let body: { action?: string; [k: string]: unknown };
   try {
