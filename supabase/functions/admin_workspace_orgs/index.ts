@@ -694,6 +694,24 @@ async function updateWorkspaceOrgMember(client: SupabaseClient, body: Record<str
       account_type: "org_user",
       updated_at: new Date().toISOString(),
     }).eq("user_id", (data as any).user_id);
+  } else if (["suspended", "rejected"].includes(String((data as any).status))) {
+    const { count, error: activeMembershipError } = await client
+      .from("organization_memberships")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", (data as any).user_id)
+      .eq("status", "active");
+    if (activeMembershipError) {
+      console.warn(
+        "[admin_workspace_orgs] active membership check skipped:",
+        activeMembershipError.message,
+      );
+    } else if (!count) {
+      await client.from("profiles").update({
+        organization_id: null,
+        account_type: "consumer",
+        updated_at: new Date().toISOString(),
+      }).eq("user_id", (data as any).user_id);
+    }
   }
 
   const members = await hydrateWorkspaceMembers(client, [data]);
