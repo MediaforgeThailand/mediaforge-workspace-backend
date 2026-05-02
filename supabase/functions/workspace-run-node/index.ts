@@ -21,6 +21,7 @@ import {
 } from "../_shared/providerRetry.ts";
 import { recordGenerationEvent } from "../_shared/analytics.ts";
 import { acceptPendingOrgInviteForUser } from "../_shared/orgInvite.ts";
+import { isPublicEmailDomain } from "../_shared/publicEmailDomains.ts";
 import {
   SEEDANCE_BASE,
   SEEDANCE_TASKS_PATH,
@@ -3809,7 +3810,7 @@ async function resolveWorkspaceCreditOwner(
   // existed. If their email domain is now verified, pin membership so future
   // calls resolve through workspace_org_credit_scope.
   const domain = String(resolvedEmail ?? "").toLowerCase().split("@")[1] ?? "";
-  if (domain) {
+  if (domain && !isPublicEmailDomain(domain)) {
     try {
       const { data: domainRow } = await supabase
         .from("organization_domains")

@@ -14,6 +14,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { verifyAdminJwt, unauthorizedResponse } from "../_shared/adminAuth.ts";
+import { assertPrivateEmailDomain } from "../_shared/publicEmailDomains.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -88,6 +89,7 @@ function randomClassCode(): string {
 }
 
 async function listUsersByDomain(client: SupabaseClient, domain: string) {
+  const normalizedDomain = assertWorkspaceOrgDomain(domain);
   const matches: Array<{ id: string; email: string | null }> = [];
   for (let page = 1; page <= 50; page += 1) {
     const { data, error } = await client.auth.admin.listUsers({ page, perPage: 1000 });
@@ -95,11 +97,17 @@ async function listUsersByDomain(client: SupabaseClient, domain: string) {
     const users = data?.users ?? [];
     for (const user of users) {
       const email = String(user.email ?? "").toLowerCase();
-      if (email.endsWith(`@${domain}`)) matches.push({ id: user.id, email });
+      if (email.endsWith(`@${normalizedDomain}`)) matches.push({ id: user.id, email });
     }
     if (users.length < 1000) break;
   }
   return matches;
+}
+
+function assertWorkspaceOrgDomain(value: string): string {
+  const domain = assertPrivateEmailDomain(value);
+  if (!DOMAIN_RE.test(domain)) throw new Error("invalid domain");
+  return domain;
 }
 
 async function retroactivelyAssignDomainUsers(
@@ -296,9 +304,8 @@ async function saveWorkspaceOrg(client: SupabaseClient, body: Record<string, unk
 
 async function addWorkspaceOrgDomain(client: SupabaseClient, body: Record<string, unknown>) {
   const organizationId = asString(body.organization_id);
-  const domain = asString(body.domain).toLowerCase();
+  const domain = assertWorkspaceOrgDomain(asString(body.domain));
   if (!organizationId) throw new Error("organization_id is required");
-  if (!DOMAIN_RE.test(domain)) throw new Error("invalid domain");
   const isPrimary = asBool(body.is_primary, false);
   const autoVerify = asBool(body.auto_verify, true);
 
@@ -344,6 +351,16 @@ async function verifyWorkspaceOrgDomain(client: SupabaseClient, body: Record<str
   const domainId = asString(body.domain_id);
   if (!organizationId || !domainId) throw new Error("organization_id and domain_id are required");
 
+  const { data: existing, error: existingError } = await client
+    .from("organization_domains")
+    .select("id, domain")
+    .eq("id", domainId)
+    .eq("organization_id", organizationId)
+    .maybeSingle();
+  if (existingError) throw new Error(`domain read failed: ${existingError.message}`);
+  if (!existing) throw new Error("domain not found");
+  const domain = assertWorkspaceOrgDomain(String((existing as any).domain ?? ""));
+
   const { data, error } = await client
     .from("organization_domains")
     .update({ verified_at: new Date().toISOString(), verification_method: "manual" })
@@ -353,7 +370,7 @@ async function verifyWorkspaceOrgDomain(client: SupabaseClient, body: Record<str
     .single();
   if (error) throw new Error(`domain verify failed: ${error.message}`);
 
-  const assigned = await retroactivelyAssignDomainUsers(client, organizationId, String((data as any).domain));
+  const assigned = await retroactivelyAssignDomainUsers(client, organizationId, domain);
   return { data: { domain: data, retroactively_assigned: assigned } };
 }
 
