@@ -84,6 +84,35 @@ async function imageUrlToBase64(url: string): Promise<string> {
   return bytesToBase64(await fetchImageBuffer(url));
 }
 
+function isProviderBillingLike(status: number, text: string): boolean {
+  // 429 is provider pressure/rate limiting, so it must stay retryable in the
+  // durable workspace queue. Only stop immediately on real balance/payment
+  // failures or explicit non-429 quota/billing messages.
+  if (status === 429) return false;
+  if (status === 402) return true;
+  return /account balance not enough|insufficient balance|insufficient_quota|billing|payment required|prepaid|top[ -]?up|quota exceeded/i.test(text);
+}
+
+async function fetchWithAttemptTimeout(
+  input: string | URL | Request,
+  init: RequestInit,
+  timeoutMs: number,
+  label: string,
+): Promise<Response> {
+  const aborter = new AbortController();
+  const timer = setTimeout(() => aborter.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: init.signal ?? aborter.signal });
+  } catch (err) {
+    if ((err as { name?: string })?.name === "AbortError") {
+      throw new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /* ─── Image dimension extraction (lightweight header parsing) ─── */
 
 interface ImageDimensions { width: number; height: number }
@@ -567,7 +596,7 @@ async function executeKlingMotionControl(
   if (!res.ok) {
     const errText = await res.text();
     console.error(`[kling-motion] API HTTP ${res.status}: ${errText.substring(0, 500)}`);
-    if (res.status === 402 || res.status === 429 || /account balance not enough|insufficient balance|quota exceeded|billing/i.test(errText)) {
+    if (isProviderBillingLike(res.status, errText)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
     throw new Error(`Kling Motion API error (HTTP ${res.status}): ${errText.substring(0, 200)}`);
@@ -584,7 +613,7 @@ async function executeKlingMotionControl(
 
   const message = String(result?.message ?? "Kling Motion API error");
   if (result?.code !== 0) {
-    if (/account balance not enough|insufficient balance|quota exceeded|billing/i.test(message)) {
+    if (isProviderBillingLike(0, message)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
     throw new Error(message || "Kling Motion API error");
@@ -711,7 +740,7 @@ async function executeKlingStandard(
   if (!res.ok) {
     const errText = await res.text();
     console.error(`[kling] API HTTP ${res.status}: ${errText.substring(0, 500)}`);
-    if (res.status === 402 || res.status === 429 || /account balance not enough|insufficient balance|quota exceeded|billing/i.test(errText)) {
+    if (isProviderBillingLike(res.status, errText)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
     throw new Error(`Kling API error (HTTP ${res.status}): ${errText.substring(0, 200)}`);
@@ -728,7 +757,7 @@ async function executeKlingStandard(
 
   const message = String(result?.message ?? "Kling API error");
   if (result?.code !== 0) {
-    if (/account balance not enough|insufficient balance|quota exceeded|billing/i.test(message)) {
+    if (isProviderBillingLike(0, message)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
     throw new Error(message || "Kling API error");
@@ -1153,7 +1182,7 @@ async function executeKlingOmni(
   if (!res.ok) {
     const errText = await res.text();
     console.error(`[kling-omni] API HTTP ${res.status}: ${errText.substring(0, 500)}`);
-    if (res.status === 402 || res.status === 429 || /account balance not enough|insufficient balance|quota exceeded|billing/i.test(errText)) {
+    if (isProviderBillingLike(res.status, errText)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
     throw new Error(`Kling Omni API error (HTTP ${res.status}): ${errText.substring(0, 200)}`);
@@ -1170,7 +1199,7 @@ async function executeKlingOmni(
 
   const message = String(result?.message ?? "Kling Omni API error");
   if (result?.code !== 0) {
-    if (/account balance not enough|insufficient balance|quota exceeded|billing/i.test(message)) {
+    if (isProviderBillingLike(0, message)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
     throw new Error(message || "Kling Omni API error");
@@ -1756,7 +1785,7 @@ async function executeBanana(
     const statusCode = aiResponse.status;
     const errorText = await aiResponse.text();
     console.error(`[banana-direct] Gemini API error: ${statusCode}`, errorText.substring(0, 500));
-    if (statusCode === 429 || (statusCode < 500 && /billing|quota|exceeded|resource exhausted/i.test(errorText))) {
+    if (isProviderBillingLike(statusCode, errorText)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
     throw new Error(`${modelLabel} failed (HTTP ${statusCode}). Please try again.`);
@@ -1874,7 +1903,7 @@ async function executeChatAi(params: Record<string, unknown>): Promise<ProviderR
     });
     if (!res.ok) {
       const errText = await res.text();
-      if (res.status === 429 || (res.status < 500 && /billing|quota|exceeded|resource exhausted/i.test(errText))) throw new Error("PROVIDER_BILLING_ERROR");
+      if (isProviderBillingLike(res.status, errText)) throw new Error("PROVIDER_BILLING_ERROR");
       throw new Error(`Google AI API error (${res.status})`);
     }
     const data = await res.json();
@@ -1899,7 +1928,7 @@ async function executeChatAi(params: Record<string, unknown>): Promise<ProviderR
     });
     if (!res.ok) {
       const errText = await res.text();
-      if (res.status === 429 || res.status === 402 || /billing|quota|insufficient_quota|rate limit/i.test(errText)) throw new Error("PROVIDER_BILLING_ERROR");
+      if (isProviderBillingLike(res.status, errText)) throw new Error("PROVIDER_BILLING_ERROR");
       throw new Error(`OpenAI API error (${res.status})`);
     }
     const data = await res.json();
@@ -2032,7 +2061,7 @@ async function executeTripo3D(
         `Tripo3D authentication failed (HTTP ${submitRes.status}) — check TRIO_API_KEY.`,
       );
     }
-    if (submitRes.status === 429 || /billing|quota|insufficient/i.test(errText)) {
+    if (isProviderBillingLike(submitRes.status, errText)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
     // Surface invalid-version specifically so the user knows to pick a
@@ -3493,19 +3522,24 @@ async function executeVideoToPrompt(params: Record<string, unknown>): Promise<Pr
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${KEY}`;
   console.log(`[video-to-prompt] Calling ${model}, video=${(bytes.byteLength / 1024).toFixed(0)}KB`);
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Server-Timeout": "280",
+  const resp = await fetchWithAttemptTimeout(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Server-Timeout": "110",
+      },
+      body: JSON.stringify(requestBody),
     },
-    body: JSON.stringify(requestBody),
-  });
+    105_000,
+    "Video to Prompt",
+  );
 
   if (!resp.ok) {
     const errText = (await resp.text()).substring(0, 500);
     console.error(`[video-to-prompt] Gemini ${resp.status}:`, errText);
-    if (resp.status === 429 || /billing|quota|exceeded/i.test(errText)) {
+    if (isProviderBillingLike(resp.status, errText)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
     throw new Error(`Video to Prompt failed (HTTP ${resp.status}): ${errText}`);
@@ -4436,29 +4470,39 @@ async function executeOpenAIImage2(
       throw new Error("All reference images failed to load");
     }
 
-    response = await fetch("https://api.openai.com/v1/images/edits", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: form,
-    });
-  } else {
-    response = await fetch("https://api.openai.com/v1/images/generations", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+    response = await fetchWithAttemptTimeout(
+      "https://api.openai.com/v1/images/edits",
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+        body: form,
       },
-      body: JSON.stringify({
-        model,
-        prompt,
-        n: 1,
-        size,
-        quality,
-        output_format: outputFormat,
-        background,
-        moderation,
-      }),
-    });
+      105_000,
+      "OpenAI Image 2 edit",
+    );
+  } else {
+    response = await fetchWithAttemptTimeout(
+      "https://api.openai.com/v1/images/generations",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model,
+          prompt,
+          n: 1,
+          size,
+          quality,
+          output_format: outputFormat,
+          background,
+          moderation,
+        }),
+      },
+      105_000,
+      "OpenAI Image 2 generation",
+    );
   }
 
   if (!response.ok) {
@@ -4472,7 +4516,7 @@ async function executeOpenAIImage2(
 
     console.error(`[openai-image-2] HTTP ${status}: ${errorMsg.substring(0, 200)}`);
 
-    if (status === 429 || /billing|quota|exceeded|insufficient/i.test(errorText)) {
+    if (isProviderBillingLike(status, errorText)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
     if (status === 401 || status === 403) {
@@ -4668,7 +4712,7 @@ function isPermanentWorkspaceJobError(err: unknown): boolean {
     /\bnot configured\b|missing.*key|credentials missing/i.test(msg) ||
     /is not defined|is not a function|cannot read prop(?:erty|erties) of (?:undefined|null)/i.test(msg) ||
     /ReferenceError|TypeError|SyntaxError/i.test(msg) ||
-    /HTTP 4\d\d/i.test(msg) ||
+    /HTTP (?:400|401|403|404|422)\b/i.test(msg) ||
     /(prompt|input|argument).*required|Validation/i.test(msg)
   );
 }

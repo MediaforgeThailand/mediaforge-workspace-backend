@@ -334,8 +334,8 @@ export async function submitSeedanceTask(
     console.error(`[seedance] submit HTTP ${res.status}: ${text.substring(0, 500)}`);
     if (
       res.status === 402 ||
-      res.status === 429 ||
-      /balance|insufficient|quota|billing/i.test(text)
+      (res.status !== 429 &&
+        /account balance not enough|insufficient balance|insufficient_quota|billing|payment required|prepaid|top[ -]?up|quota exceeded/i.test(text))
     ) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
