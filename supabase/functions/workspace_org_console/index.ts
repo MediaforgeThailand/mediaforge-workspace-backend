@@ -73,6 +73,18 @@ const GENERATION_SELECT = [
   "task_id",
   "created_at",
 ].join(",");
+const POOL_TRANSACTION_SELECT = [
+  "id",
+  "user_id",
+  "class_id",
+  "organization_id",
+  "triggered_by",
+  "amount",
+  "reason",
+  "description",
+  "metadata",
+  "created_at",
+].join(",");
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -228,6 +240,33 @@ async function findUserByEmail(client: SupabaseClient, email: string): Promise<U
 
 async function hydrateUsers(client: SupabaseClient, rows: any[]) {
   const ids = [...new Set(rows.map((row) => row.user_id).filter(Boolean))];
+  const byId = new Map<string, {
+    email: string | null;
+    name: string | null;
+    last_sign_in_at: string | null;
+    created_at: string | null;
+  }>();
+  await Promise.all(ids.map(async (id) => {
+    const { data } = await client.auth.admin.getUserById(id);
+    const user = data?.user;
+    byId.set(id, {
+      email: user?.email ?? null,
+      name: (user?.user_metadata?.display_name ?? user?.user_metadata?.full_name ?? null) as string | null,
+      last_sign_in_at: user?.last_sign_in_at ?? null,
+      created_at: user?.created_at ?? null,
+    });
+  }));
+  return rows.map((row) => ({
+    ...row,
+    email: byId.get(row.user_id)?.email ?? null,
+    display_name: byId.get(row.user_id)?.name ?? null,
+    last_sign_in_at: byId.get(row.user_id)?.last_sign_in_at ?? null,
+    auth_created_at: byId.get(row.user_id)?.created_at ?? null,
+  }));
+}
+
+async function hydrateActors(client: SupabaseClient, rows: any[]) {
+  const ids = [...new Set(rows.map((row) => row.triggered_by).filter(Boolean))];
   const byId = new Map<string, { email: string | null; name: string | null }>();
   await Promise.all(ids.map(async (id) => {
     const { data } = await client.auth.admin.getUserById(id);
@@ -239,8 +278,8 @@ async function hydrateUsers(client: SupabaseClient, rows: any[]) {
   }));
   return rows.map((row) => ({
     ...row,
-    email: byId.get(row.user_id)?.email ?? null,
-    display_name: byId.get(row.user_id)?.name ?? null,
+    actor_email: byId.get(row.triggered_by)?.email ?? null,
+    actor_display_name: byId.get(row.triggered_by)?.name ?? null,
   }));
 }
 
@@ -434,10 +473,47 @@ async function getOverview(client: SupabaseClient, user: User) {
   if (teamRes.error) throw new Error(`team read failed: ${teamRes.error.message}`);
   if (paymentRes.error) throw new Error(`payment read failed: ${paymentRes.error.message}`);
   if (generationRes.error) throw new Error(`generation history read failed: ${generationRes.error.message}`);
+  const teamIds = (teamRes.data ?? []).map((team: any) => team.id).filter(Boolean);
+  const poolTxFilter = teamIds.length
+    ? `organization_id.eq.${orgId},class_id.in.(${teamIds.join(",")})`
+    : `organization_id.eq.${orgId}`;
+  const poolTxRes = await client
+    .from("pool_transactions")
+    .select(POOL_TRANSACTION_SELECT)
+    .or(poolTxFilter)
+    .order("created_at", { ascending: false })
+    .limit(100);
+  if (poolTxRes.error) throw new Error(`pool transaction read failed: ${poolTxRes.error.message}`);
 
-  const members = await hydrateUsers(client, memberRes.data ?? []);
+  const hydratedMembers = await hydrateUsers(client, memberRes.data ?? []);
   const payments = await hydrateUsers(client, paymentRes.data ?? []);
   const generations = await hydrateUsers(client, generationRes.data ?? []);
+  const pool_transactions = await hydrateActors(client, poolTxRes.data ?? []);
+  const memberUserIds = hydratedMembers.map((member: any) => member.user_id).filter(Boolean);
+  const activityRes = memberUserIds.length
+    ? await client
+      .from("workspace_activity")
+      .select("user_id,activity_type,created_at")
+      .eq("organization_id", orgId)
+      .in("user_id", memberUserIds)
+      .order("created_at", { ascending: false })
+      .limit(1000)
+    : { data: [] as any[], error: null };
+  if (activityRes.error) throw new Error(`activity read failed: ${activityRes.error.message}`);
+  const latestActivityByUser = new Map<string, any>();
+  for (const activity of activityRes.data ?? []) {
+    if (activity.user_id && !latestActivityByUser.has(activity.user_id)) {
+      latestActivityByUser.set(activity.user_id, activity);
+    }
+  }
+  const members = hydratedMembers.map((member: any) => {
+    const latest = latestActivityByUser.get(member.user_id);
+    return {
+      ...member,
+      last_active_at: latest?.created_at ?? member.last_sign_in_at ?? member.updated_at ?? member.created_at ?? null,
+      last_activity_type: latest?.activity_type ?? null,
+    };
+  });
   const teams = (teamRes.data ?? []).map((team: any) => ({
     ...team,
     credit_available: Math.max(0, Number(team.credit_pool ?? 0) - Number(team.credit_pool_consumed ?? 0)),
@@ -462,6 +538,7 @@ async function getOverview(client: SupabaseClient, user: User) {
       teams,
       payments,
       generations,
+      pool_transactions,
       usage_summary: {
         payment_count: payments.length,
         topup_amount_thb_total: completedPayments.reduce((sum: number, payment: any) => sum + Number(payment.amount_thb ?? 0), 0),
