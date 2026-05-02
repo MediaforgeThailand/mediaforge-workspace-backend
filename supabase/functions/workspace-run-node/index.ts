@@ -1719,9 +1719,10 @@ async function executeBanana(
    * upload + JSON-parse work below to finish before the platform
    * pulls the plug. The caller gets a friendly error instead of a
    * generic platform 500. */
-  // Keep in sync with WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS; Banana 2
-  // standard-tier calls may complete after the old 120s cutoff.
-  const ABORT_MS = 240_000;
+  // Keep this lower than WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS and the Edge runtime
+  // gateway ceiling. If Gemini is slow/queued, the durable workspace queue will
+  // retry instead of letting the worker get killed and marked as dropped.
+  const ABORT_MS = 105_000;
   const aborter = new AbortController();
   const abortTimer = setTimeout(() => aborter.abort(), ABORT_MS);
   const modelLabel = modelId === "nano-banana-pro" ? "Nano Banana Pro" : "Nano Banana 2";
@@ -1732,9 +1733,8 @@ async function executeBanana(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        // Tell Gemini to wait up to 280s before returning a 504, matching
-        // what the legacy editor uses for long Banana generations.
-        "X-Server-Timeout": "280",
+        // Ask Gemini to return before our Edge attempt budget expires.
+        "X-Server-Timeout": "110",
       },
       body: geminiRequestBody,
       signal: aborter.signal,
@@ -4588,10 +4588,14 @@ interface WorkspaceRunBody {
 }
 
 const WORKSPACE_JOB_MAX_MS = 30 * 60_000;
-const WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS = 260_000;
+// Supabase Edge requests can be terminated by the platform well before
+// long image providers return. Keep each synchronous provider attempt under
+// that ceiling, then let the durable queue retry until the 30 minute deadline.
+const WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS = 125_000;
 const WORKSPACE_JOB_BACKOFF_MS = [3_000, 5_000, 10_000, 15_000, 30_000, 60_000];
 const WORKSPACE_JOB_WORKER_BATCH_SIZE = 2;
 const WORKSPACE_JOB_LOCK_SEC = 360;
+const WORKSPACE_JOB_HEARTBEAT_MS = 45_000;
 const WORKSPACE_JOB_EXPIRE_SWEEP_LIMIT = 25;
 
 type WorkspaceJobStatus =
@@ -4711,6 +4715,35 @@ async function invokeWorkspaceRunOnce(args: {
   } finally {
     clearTimeout(timer);
   }
+}
+
+function startWorkspaceJobHeartbeat(args: {
+  supabase: ReturnType<typeof createClient>;
+  jobId: string;
+  workerId: string;
+}): () => void {
+  let stopped = false;
+  const beat = async () => {
+    if (stopped) return;
+    const now = new Date();
+    const { error } = await args.supabase
+      .from("workspace_generation_jobs")
+      .update({
+        worker_heartbeat_at: now.toISOString(),
+        lock_expires_at: new Date(now.getTime() + WORKSPACE_JOB_LOCK_SEC * 1000).toISOString(),
+      })
+      .eq("id", args.jobId)
+      .eq("locked_by", args.workerId)
+      .eq("status", "running");
+    if (error) {
+      console.warn("[workspace-job-worker] heartbeat failed", args.jobId, error.message);
+    }
+  };
+  const timer = setInterval(() => void beat(), WORKSPACE_JOB_HEARTBEAT_MS);
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
 }
 
 async function pollWorkspaceAsyncResult(args: {
@@ -5276,12 +5309,22 @@ async function processWorkspaceGenerationJobTick(args: {
     .eq("id", job.id);
 
   try {
-    const initial = await invokeWorkspaceRunOnce({
-      functionUrl: args.functionUrl,
-      authHeader,
-      extraHeaders,
-      body: job.request,
+    const stopHeartbeat = startWorkspaceJobHeartbeat({
+      supabase: args.supabase,
+      jobId: job.id,
+      workerId: args.workerId,
     });
+    let initial: Record<string, unknown>;
+    try {
+      initial = await invokeWorkspaceRunOnce({
+        functionUrl: args.functionUrl,
+        authHeader,
+        extraHeaders,
+        body: job.request,
+      });
+    } finally {
+      stopHeartbeat();
+    }
     const initialWithCredits = {
       ...initial,
       credits_spent: Number.isFinite(charged) ? charged : 0,
