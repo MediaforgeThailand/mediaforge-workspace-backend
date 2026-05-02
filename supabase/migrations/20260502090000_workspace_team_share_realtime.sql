@@ -37,9 +37,46 @@ CREATE TABLE IF NOT EXISTS public.workspace_shares (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- Some remote environments already had an early `workspace_shares`
+-- table. `CREATE TABLE IF NOT EXISTS` intentionally leaves that
+-- table untouched, so make the migration upgrade the old shape before
+-- functions/policies reference newer columns such as revoked_at.
+ALTER TABLE public.workspace_shares
+  ADD COLUMN IF NOT EXISTS workspace_id text,
+  ADD COLUMN IF NOT EXISTS created_by uuid,
+  ADD COLUMN IF NOT EXISTS role text DEFAULT 'viewer',
+  ADD COLUMN IF NOT EXISTS token text DEFAULT gen_random_uuid()::text,
+  ADD COLUMN IF NOT EXISTS expires_at timestamptz,
+  ADD COLUMN IF NOT EXISTS revoked_at timestamptz,
+  ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now(),
+  ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
+
+UPDATE public.workspace_shares
+SET
+  role = COALESCE(role, 'viewer'),
+  token = COALESCE(token, gen_random_uuid()::text),
+  created_at = COALESCE(created_at, now()),
+  updated_at = COALESCE(updated_at, now());
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'workspace_shares_role_check'
+      AND conrelid = 'public.workspace_shares'::regclass
+  ) THEN
+    ALTER TABLE public.workspace_shares
+      ADD CONSTRAINT workspace_shares_role_check
+      CHECK (role IN ('viewer', 'editor')) NOT VALID;
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS workspace_shares_workspace_idx
   ON public.workspace_shares (workspace_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS workspace_shares_token_idx
+  ON public.workspace_shares (token);
+CREATE UNIQUE INDEX IF NOT EXISTS workspace_shares_token_uidx
   ON public.workspace_shares (token);
 
 CREATE TABLE IF NOT EXISTS public.workspace_share_grants (
@@ -53,8 +90,38 @@ CREATE TABLE IF NOT EXISTS public.workspace_share_grants (
   UNIQUE (share_id, user_id)
 );
 
+ALTER TABLE public.workspace_share_grants
+  ADD COLUMN IF NOT EXISTS share_id uuid,
+  ADD COLUMN IF NOT EXISTS workspace_id text,
+  ADD COLUMN IF NOT EXISTS user_id uuid,
+  ADD COLUMN IF NOT EXISTS role text DEFAULT 'viewer',
+  ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now(),
+  ADD COLUMN IF NOT EXISTS last_resolved_at timestamptz DEFAULT now();
+
+UPDATE public.workspace_share_grants
+SET
+  role = COALESCE(role, 'viewer'),
+  created_at = COALESCE(created_at, now()),
+  last_resolved_at = COALESCE(last_resolved_at, now());
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'workspace_share_grants_role_check'
+      AND conrelid = 'public.workspace_share_grants'::regclass
+  ) THEN
+    ALTER TABLE public.workspace_share_grants
+      ADD CONSTRAINT workspace_share_grants_role_check
+      CHECK (role IN ('viewer', 'editor')) NOT VALID;
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS workspace_share_grants_user_workspace_idx
   ON public.workspace_share_grants (user_id, workspace_id);
+CREATE UNIQUE INDEX IF NOT EXISTS workspace_share_grants_share_user_uidx
+  ON public.workspace_share_grants (share_id, user_id);
 
 CREATE TABLE IF NOT EXISTS public.workspace_canvas_save_audit (
   id bigserial PRIMARY KEY,
