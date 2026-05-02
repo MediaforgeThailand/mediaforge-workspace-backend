@@ -312,12 +312,12 @@ const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   { feature: "generate_seedream_image", model: "seedream-5-0-260128", label: "Seedream 5.0", cost: 60, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-5-0-260128", source: "master_pricing_sheet", source_url: "https://www.byteplus.com/en/product/modelark", provider_unit: "per image", notes: "Master Pricing Sheet: $0.035/image -> approx 60 credits/image at Workspace ratio." },
   { feature: "generate_seedream_image", model: "seedream-5-0", label: "Seedream 5.0 alias", cost: 60, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-5-0-260128", source: "master_pricing_sheet", source_url: "https://www.byteplus.com/en/product/modelark", provider_unit: "per image", notes: "Runtime alias for Seedream 5.0." },
   { feature: "generate_seedream_image", model: "seedream-5-0-lite-260128", label: "Seedream 5.0 Lite", cost: 60, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-5-0-lite-260128", source: "master_pricing_sheet", source_url: "https://www.byteplus.com/en/product/modelark", provider_unit: "per image", notes: "Master Pricing Sheet: Seedream 5.0 Lite official $0.035/image -> 60 credits/image." },
-  { feature: "generate_seedream_image", model: "seedream-4-5-251128", label: "Seedream 4.5", cost: 1, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-4-5-251128", source: "unverified_placeholder", provider_unit: "per image", notes: "Existing UI model without a supplied SKU price in the master sheet. Placeholder set to 1 until a confirmed price is provided." },
+  { feature: "generate_seedream_image", model: "seedream-4-5-251128", label: "Seedream 4.5", cost: 60, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-4-5-251128", source: "needs_provider_invoice", provider_unit: "per image", notes: "Emergency pricing floor: previous placeholder was 1 credit and could undercharge. Keep aligned with Seedream 5.0 until the provider invoice/SKU rate is confirmed." },
   { feature: "chat_ai", model: "google/gemini-3-pro-preview", label: "Gemini 3 Pro Preview", cost: 100, pricing_type: "per_operation", provider: "google", price_key: "gemini-3-pro-preview", source: "official_docs", source_url: "https://ai.google.dev/gemini-api/docs/gemini-3", provider_unit: "per operation", notes: "Official Gemini 3 Pro Preview model code. Master Pricing Sheet fixed-operation placeholder: 100 credits/op." },
   { feature: "chat_ai", model: "google/gemini-3.1-pro-preview", label: "Gemini 3 Pro Preview (legacy 3.1 alias)", cost: 100, pricing_type: "per_operation", provider: "google", price_key: "gemini-3-pro-preview:legacy-3.1-alias", source: "legacy_alias", source_url: "https://ai.google.dev/gemini-api/docs/gemini-3", provider_unit: "per operation", notes: "Legacy Workspace alias retained so saved canvases using google/gemini-3.1-pro-preview still price and route to official gemini-3-pro-preview." },
   { feature: "chat_ai", model: "google/gemini-3-flash-preview", label: "Gemini 3 Flash Preview", cost: 20, pricing_type: "per_operation", provider: "google", price_key: "gemini-3-flash-preview", source: "master_pricing_sheet", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per operation", notes: "Master Pricing Sheet fixed-operation placeholder: 20 credits/op. Token-price reference: input about 0.50 USD / 1M tokens, output about 3 USD / 1M tokens." },
-  { feature: "text_to_speech", model: "gemini-2.5-flash-preview-tts", label: "Gemini 2.5 Flash Preview TTS", cost: 1, pricing_type: "per_operation", provider: "google", price_key: "gemini-2.5-flash-preview-tts", source: "unverified_placeholder", provider_unit: "per operation", notes: "Workspace TTS proxy model. Placeholder set to 1 so the UI and strict pricing never fall back to an unrelated TTS row." },
-  { feature: "text_to_speech", model: "gemini-2.5-pro-preview-tts", label: "Gemini 2.5 Pro Preview TTS", cost: 1, pricing_type: "per_operation", provider: "google", price_key: "gemini-2.5-pro-preview-tts", source: "unverified_placeholder", provider_unit: "per operation", notes: "Workspace TTS proxy model. Placeholder set to 1 so the UI and strict pricing never fall back to an unrelated TTS row." },
+  { feature: "text_to_speech", model: "gemini-2.5-flash-preview-tts", label: "Gemini 2.5 Flash Preview TTS / 1K chars", cost: 50, pricing_type: "per_1k_chars", provider: "google", price_key: "gemini-2.5-flash-preview-tts", source: "official_docs_estimate", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per 1K chars", notes: "Emergency estimate. Gemini lists Flash Preview TTS at $0.50/1M text input tokens and $10/1M audio output tokens; runtime bills by text length, so use a conservative per-1K-character floor until audio-token metering is implemented." },
+  { feature: "text_to_speech", model: "gemini-2.5-pro-preview-tts", label: "Gemini 2.5 Pro Preview TTS / 1K chars", cost: 100, pricing_type: "per_1k_chars", provider: "google", price_key: "gemini-2.5-pro-preview-tts", source: "official_docs_estimate", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per 1K chars", notes: "Emergency estimate. Gemini Pro Preview TTS output audio is more expensive than Flash; runtime bills by text length, so use a conservative per-1K-character floor until audio-token metering is implemented." },
   ...ELEVENLABS_TTS_ROWS,
   { feature: "text_to_speech", model: "google-tts-studio", label: "Google Cloud TTS Studio / 1K chars", cost: 280, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-studio", quality: "studio", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
   { feature: "text_to_speech", model: "google-tts-neural2", label: "Google Cloud TTS Neural2 / 1K chars", cost: 28, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-neural2", quality: "neural2", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
@@ -330,15 +330,28 @@ const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   { feature: "model_3d", model: "tripo3d-v3.1", label: "Tripo3D v3.1 Detailed", cost: 900, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v3.1", quality: "detailed", source: "master_pricing_sheet", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Master Pricing Sheet: detailed/high-quality generation approx 900 credits/model." },
   { feature: "model_3d", model: "tripo3d-p1", label: "Tripo3D P1", cost: 850, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-p1", quality: "premium", source: "master_pricing_sheet", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Master Pricing Sheet: P1 approx 850 credits/model." },
   { feature: "model_3d", model: "tripo3d-turbo", label: "Tripo3D Turbo", cost: 500, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-turbo", quality: "fast", source: "master_pricing_sheet", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Master Pricing Sheet: Turbo approx 500 credits/model." },
-  { feature: "model_3d", model: "tripo3d-v3.0", label: "Tripo3D v3.0", cost: 1, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v3.0", source: "unverified_placeholder", provider_unit: "per model", notes: "Exposed in the workspace 3D model selector but not priced in the supplied sheet. Placeholder set to 1 until a confirmed SKU cost is provided." },
-  { feature: "model_3d", model: "tripo3d-v2.5", label: "Tripo3D v2.5", cost: 1, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v2.5", source: "unverified_placeholder", provider_unit: "per model", notes: "Exposed in the workspace 3D model selector but not priced in the supplied sheet. Placeholder set to 1 until a confirmed SKU cost is provided." },
-  { feature: "model_3d", model: "tripo3d-v2.0", label: "Tripo3D v2.0", cost: 1, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v2.0", source: "unverified_placeholder", provider_unit: "per model", notes: "Exposed in the workspace 3D model selector but not priced in the supplied sheet. Placeholder set to 1 until a confirmed SKU cost is provided." },
-  { feature: "model_3d", model: "tripo3d-v1.4", label: "Tripo3D v1.4", cost: 1, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v1.4", source: "unverified_placeholder", provider_unit: "per model", notes: "Exposed in the workspace 3D model selector but not priced in the supplied sheet. Placeholder set to 1 until a confirmed SKU cost is provided." },
-  { feature: "remove_background", model: "replicate-birefnet", label: "Remove Background (BiRefNet)", cost: 1, pricing_type: "per_operation", provider: "replicate", price_key: "replicate-birefnet", source: "unverified_placeholder", provider_unit: "per image", notes: "Provider SKU price was not found in public docs during setup. Placeholder set to 1 by request." },
+  { feature: "model_3d", model: "tripo3d-v3.0", label: "Tripo3D v3.0", cost: 500, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v3.0", source: "needs_provider_invoice", provider_unit: "per model", notes: "Emergency pricing floor: previous placeholder was 1 credit and could undercharge. Use the Turbo floor until the provider invoice/SKU rate is confirmed." },
+  { feature: "model_3d", model: "tripo3d-v2.5", label: "Tripo3D v2.5", cost: 500, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v2.5", source: "needs_provider_invoice", provider_unit: "per model", notes: "Emergency pricing floor: previous placeholder was 1 credit and could undercharge. Use the Turbo floor until the provider invoice/SKU rate is confirmed." },
+  { feature: "model_3d", model: "tripo3d-v2.0", label: "Tripo3D v2.0", cost: 500, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v2.0", source: "needs_provider_invoice", provider_unit: "per model", notes: "Emergency pricing floor: previous placeholder was 1 credit and could undercharge. Use the Turbo floor until the provider invoice/SKU rate is confirmed." },
+  { feature: "model_3d", model: "tripo3d-v1.4", label: "Tripo3D v1.4", cost: 500, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v1.4", source: "needs_provider_invoice", provider_unit: "per model", notes: "Emergency pricing floor: previous placeholder was 1 credit and could undercharge. Use the Turbo floor until the provider invoice/SKU rate is confirmed." },
+  { feature: "remove_background", model: "replicate-birefnet", label: "Remove Background (BiRefNet)", cost: 20, pricing_type: "per_operation", provider: "replicate", price_key: "replicate-birefnet", source: "needs_provider_invoice", provider_unit: "per image", notes: "Emergency pricing floor: previous placeholder was 1 credit and could undercharge. Confirm Replicate deployment hardware/runtime cost before lowering." },
   { feature: "merge_audio_video", model: "shotstack", label: "Merge Audio + Video (Shotstack short clip)", cost: 100, pricing_type: "per_operation", provider: "shotstack", price_key: "shotstack:short-op", source: "master_pricing_sheet", provider_unit: "per short operation", notes: "Master Pricing Sheet: use 100 credits/op for short clips <=10s until runtime tracks media duration per minute." },
   { feature: "merge_audio_video", model: "shotstack:per-minute", label: "Merge Audio + Video (Shotstack per minute)", cost: 500, pricing_type: "per_minute", provider: "shotstack", price_key: "shotstack:per-minute", source: "master_pricing_sheet", provider_unit: "per minute", notes: "Master Pricing Sheet: Shotstack PAYG/subscription blended recommendation = 500 credits/minute." },
-  { feature: "mp3_input", model: "mp3-input", label: "MP3 Input", cost: 1, pricing_type: "per_operation", provider: "internal", price_key: "mp3-input", source: "unverified_placeholder", provider_unit: "per file", notes: "Infrastructure-only operation. Placeholder set to 1 by request." },
+  { feature: "mp3_input", model: "mp3-input", label: "MP3 Input", cost: 1, pricing_type: "per_operation", provider: "internal", price_key: "mp3-input", source: "internal_metering", provider_unit: "per file", notes: "Infrastructure-only operation. No external generation API call." },
 ];
+
+function pricingRowKey(row: Pick<CreditCostWriteRow, "feature" | "model" | "duration_seconds" | "has_audio">): string {
+  return [
+    row.feature,
+    row.model ?? "",
+    row.duration_seconds ?? "",
+    row.has_audio ? "audio" : "video",
+  ].join("::");
+}
+
+const RECOMMENDED_WORKSPACE_PRICING_KEYS = new Set(
+  RECOMMENDED_WORKSPACE_PRICING.map((row) => pricingRowKey(row)),
+);
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -757,6 +770,12 @@ async function cleanupLegacyPricingRows(client: SupabaseClient): Promise<number>
       .delete()
       .eq("feature", "text_to_speech")
       .eq("model", "gemini-3.1-flash-tts-preview"),
+    client
+      .from("credit_costs")
+      .delete()
+      .eq("feature", "generate_openai_image")
+      .in("model", ["gpt-image-2-low", "gpt-image-2-medium", "gpt-image-2-high"])
+      .eq("source", "flow_erp_converted"),
   ];
   for (const deleteQuery of staleDeletes) {
     const { count, error } = await deleteQuery.select("id", { count: "exact", head: true });
@@ -830,10 +849,21 @@ async function importFlowCreditCosts(
   }
 
   const written: unknown[] = [];
+  let skippedRecommended = 0;
   for (const rawRow of sourceRows) {
     const r = rawRow as Record<string, unknown>;
     const cost = Math.max(1, Math.ceil(Number(r.cost ?? 0) * FLOW_TO_WORKSPACE_RATIO));
     if (!r.feature || !Number.isFinite(cost)) continue;
+    const candidateKey = pricingRowKey({
+      feature: String(r.feature),
+      model: r.model == null ? null : String(r.model),
+      duration_seconds: r.duration_seconds == null ? null : Number(r.duration_seconds),
+      has_audio: Boolean(r.has_audio),
+    });
+    if (RECOMMENDED_WORKSPACE_PRICING_KEYS.has(candidateKey)) {
+      skippedRecommended += 1;
+      continue;
+    }
     written.push(await saveCreditCostRow(client, {
       feature: String(r.feature),
       model: r.model == null ? null : String(r.model),
@@ -857,9 +887,9 @@ async function importFlowCreditCosts(
     adminUserId: audit.adminUserId,
     action: "flow_credit_costs.import",
     targetTable: "credit_costs",
-    details: { imported: written.length, ratio: FLOW_TO_WORKSPACE_RATIO },
+    details: { imported: written.length, skipped_recommended: skippedRecommended, ratio: FLOW_TO_WORKSPACE_RATIO },
   });
-  return { data: { imported: written.length, ratio: FLOW_TO_WORKSPACE_RATIO, rows: written } };
+  return { data: { imported: written.length, skipped_recommended: skippedRecommended, ratio: FLOW_TO_WORKSPACE_RATIO, rows: written } };
 }
 
 // ── Mutation handlers ────────────────────────────────────────────────
