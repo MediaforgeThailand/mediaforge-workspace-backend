@@ -1659,6 +1659,8 @@ async function executeBanana(
 
   // Resolve reference images to base64 inline data for Gemini
   const imageUrls: string[] = mentionImageUrls ?? (imageUrl ? [imageUrl] : []);
+  let resolvedReferenceCount = 0;
+  let failedReferenceCount = 0;
   if (imageUrls.length > 0) {
     for (const url of imageUrls) {
       try {
@@ -1669,14 +1671,28 @@ async function executeBanana(
         if (bytes[0] === 0xFF && bytes[1] === 0xD8) mime = "image/jpeg";
         else if (bytes[0] === 0x52 && bytes[1] === 0x49) mime = "image/webp";
         parts.push({ inlineData: { mimeType: mime, data: base64 } });
+        resolvedReferenceCount += 1;
       } catch (imgErr) {
+        failedReferenceCount += 1;
         console.warn(`[banana-direct] Failed to resolve image: ${imgErr}`);
       }
     }
-    console.log(`[banana-direct] Added ${imageUrls.length} reference images`);
+    console.log(
+      `[banana-direct] Added ${resolvedReferenceCount}/${imageUrls.length} reference images` +
+        (failedReferenceCount > 0 ? ` (${failedReferenceCount} failed to load)` : ""),
+    );
+    if (resolvedReferenceCount === 0) {
+      throw new Error(
+        `Reference images could not be loaded for this attempt (${failedReferenceCount}/${imageUrls.length} failed). ` +
+          "The background worker will retry automatically.",
+      );
+    }
   }
 
-  console.log(`[banana-direct] Requesting ${modelId} (${modelConfig.gemini_model}), ref_images: ${imageUrls.length}`);
+  console.log(
+    `[banana-direct] Requesting ${modelId} (${modelConfig.gemini_model}), ` +
+      `ref_images: ${resolvedReferenceCount}/${imageUrls.length}`,
+  );
 
   // Build generationConfig — both aspectRatio and imageSize live
   // under `imageConfig`. We only include keys the user actually
@@ -1772,9 +1788,13 @@ async function executeBanana(
     clearTimeout(abortTimer);
     if ((fetchErr as { name?: string })?.name === "AbortError") {
       console.error(`[banana-direct] Gemini fetch aborted after ${ABORT_MS}ms`);
+      const refSummary =
+        imageUrls.length > 0
+          ? `refs loaded ${resolvedReferenceCount}/${imageUrls.length}`
+          : "no refs";
       throw new Error(
-        `${modelLabel} ใช้เวลานานเกิน ${Math.round(ABORT_MS / 1000)} วินาที — ลองลดจำนวน reference images ` +
-          `หรือทำ prompt ให้สั้นลง แล้วกด Run ใหม่`,
+        `${modelLabel} timed out after ${Math.round(ABORT_MS / 1000)}s on this attempt (${refSummary}). ` +
+          "This is provider latency/queue timeout, not a reference-image format error; the background worker will retry automatically.",
       );
     }
     throw fetchErr;
@@ -1841,7 +1861,12 @@ async function executeBanana(
     result_url: publicUrl,
     outputs: { output_image: publicUrl },
     output_type: "image_url" as const,
-    provider_meta: { model: modelId },
+    provider_meta: {
+      model: modelId,
+      reference_image_count: resolvedReferenceCount,
+      reference_image_requested_count: imageUrls.length,
+      reference_image_failed_count: failedReferenceCount,
+    },
   };
 }
 
