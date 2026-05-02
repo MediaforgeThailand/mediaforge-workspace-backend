@@ -115,7 +115,6 @@ const QUALITY_LABEL: Record<"low" | "medium" | "high", string> = {
 const GPT_IMAGE_2_ROWS: CreditCostWriteRow[] = ([
   ["1k", 1024, 1024],
   ["2k", 2048, 2048],
-  ["3k", 2880, 2880],
   ["4k", 3840, 2160],
 ] as const).flatMap(([tier, width, height]) =>
   (["low", "medium", "high"] as const).map((quality) => ({

@@ -65,19 +65,19 @@ const DEFAULT_VIDEO_MODEL = "kling-v2-6-pro";
 const DEFAULT_INFRASTRUCTURE_BUFFER_PERCENT = 40;
 const DEFAULT_WORKSPACE_MULTIPLIER = 1 + DEFAULT_INFRASTRUCTURE_BUFFER_PERCENT / 100;
 
-function normaliseResolutionTier(size: string): "1k" | "2k" | "3k" | "4k" | "auto" {
+function normaliseResolutionTier(size: string): "1k" | "2k" | "4k" | "auto" {
   const s = size.toLowerCase().trim();
   if (!s || s === "auto") return "auto";
   const m = s.match(/^(\d+)x(\d+)$/);
   if (!m) {
     if (s.includes("4k")) return "4k";
-    if (s.includes("3k")) return "3k";
+    if (s.includes("3k")) return "4k";
     if (s.includes("2k")) return "2k";
     return "1k";
   }
   const maxEdge = Math.max(Number(m[1]), Number(m[2]));
   if (maxEdge >= 3600) return "4k";
-  if (maxEdge >= 2800) return "3k";
+  if (maxEdge >= 2800) return "4k";
   if (maxEdge >= 1900) return "2k";
   return "1k";
 }
