@@ -82,6 +82,17 @@ function admin() {
   return createClient(SUPABASE_URL, SERVICE_ROLE);
 }
 
+function nullIfBlank(value: unknown): unknown | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  return value;
+}
+
+function optionalDate(value: unknown): string | null {
+  const normalized = nullIfBlank(value);
+  return normalized === null ? null : String(normalized);
+}
+
 /** Resolve caller from JWT (returns user id or a 401 Response). */
 async function resolveCaller(req: Request): Promise<{ userId: string } | Response> {
   const authHeader = req.headers.get("Authorization") ?? "";
@@ -1161,8 +1172,8 @@ Deno.serve(async (req) => {
             year: body?.year ?? null,
             max_students: body?.max_students ?? null,
             primary_instructor_id: primaryInstructorId,
-            start_date: body?.start_date ?? null,
-            end_date: body?.end_date ?? null,
+            start_date: optionalDate(body?.start_date),
+            end_date: optionalDate(body?.end_date),
             credit_policy,
             credit_amount,
             reset_day_of_month: body?.reset_day_of_month ?? 1,
@@ -1231,6 +1242,8 @@ Deno.serve(async (req) => {
           "reset_day_of_month", "reset_day_of_week", "settings"];
         const updates: Record<string, any> = {};
         for (const k of allowed) if (k in (body ?? {})) updates[k] = body[k];
+        if ("start_date" in updates) updates.start_date = optionalDate(updates.start_date);
+        if ("end_date" in updates) updates.end_date = optionalDate(updates.end_date);
         updates.updated_at = new Date().toISOString();
 
         const { data, error } = await admin()
