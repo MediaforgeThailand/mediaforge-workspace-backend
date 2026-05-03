@@ -666,6 +666,106 @@ async function listWorkspaceOrgMembers(client: SupabaseClient, body: Record<stri
   };
 }
 
+async function normalizeWorkspaceOrgTeamId(
+  client: SupabaseClient,
+  organizationId: string,
+  rawTeamId: unknown,
+): Promise<string | null> {
+  const teamId = rawTeamId === null ? "" : asString(rawTeamId);
+  if (!teamId || teamId === "__none" || teamId === "none") return null;
+
+  const { data: team, error } = await client
+    .from("classes")
+    .select("id")
+    .eq("id", teamId)
+    .eq("organization_id", organizationId)
+    .is("deleted_at", null)
+    .maybeSingle();
+  if (error) throw new Error(`team lookup failed: ${error.message}`);
+  if (!team) throw new Error("team does not belong to this organization");
+  return teamId;
+}
+
+async function addWorkspaceOrgMember(client: SupabaseClient, body: Record<string, unknown>) {
+  const organizationId = asString(body.organization_id);
+  const email = asString(body.email).toLowerCase();
+  if (!organizationId || !email) throw new Error("organization_id and email are required");
+  if (!email.includes("@")) throw new Error("valid email is required");
+
+  const role = asString(body.role, "member") === "org_admin" ? "org_admin" : "member";
+  const teamId = await normalizeWorkspaceOrgTeamId(client, organizationId, body.team_id);
+
+  const { data: org, error: orgError } = await client
+    .from("organizations")
+    .select("id,type,status")
+    .eq("id", organizationId)
+    .eq("type", "enterprise")
+    .is("deleted_at", null)
+    .maybeSingle();
+  if (orgError) throw new Error(`enterprise lookup failed: ${orgError.message}`);
+  if (!org) throw new Error("enterprise account not found");
+
+  const user = await findAuthUserByEmail(client, email);
+  const now = new Date().toISOString();
+
+  if (user) {
+    const { error: profileError } = await client.from("profiles").upsert(
+      {
+        user_id: user.id,
+        organization_id: organizationId,
+        account_type: "org_user",
+        updated_at: now,
+      },
+      { onConflict: "user_id" },
+    );
+    if (profileError) throw new Error(`profile update failed: ${profileError.message}`);
+
+    const { data: membership, error: membershipError } = await client
+      .from("organization_memberships")
+      .upsert(
+        {
+          organization_id: organizationId,
+          user_id: user.id,
+          role,
+          status: "active",
+          source: "manual",
+          team_id: teamId,
+          joined_at: now,
+          approved_at: now,
+          suspended_at: null,
+          updated_at: now,
+        },
+        { onConflict: "organization_id,user_id" },
+      )
+      .select("id,organization_id,user_id,role,status,source,team_id,requested_at,approved_at,approved_by,invited_by,joined_at,suspended_at,created_at,updated_at")
+      .single();
+    if (membershipError) throw new Error(`member save failed: ${membershipError.message}`);
+
+    const members = await hydrateWorkspaceMembers(client, [membership]);
+    return { data: { mode: "activated", member: members[0] } };
+  }
+
+  const { data: invite, error: inviteError } = await client
+    .from("organization_member_invites")
+    .upsert(
+      {
+        organization_id: organizationId,
+        email,
+        role,
+        team_id: teamId,
+        status: "pending",
+        expires_at: null,
+        updated_at: now,
+      },
+      { onConflict: "organization_id,email" },
+    )
+    .select("id,organization_id,email,role,team_id,status,expires_at,created_at,updated_at")
+    .single();
+  if (inviteError) throw new Error(`member invite failed: ${inviteError.message}`);
+
+  return { data: { mode: "invited", invite } };
+}
+
 async function updateWorkspaceOrgMember(client: SupabaseClient, body: Record<string, unknown>) {
   const organizationId = asString(body.organization_id);
   const membershipId = asString(body.membership_id);
@@ -692,20 +792,10 @@ async function updateWorkspaceOrgMember(client: SupabaseClient, body: Record<str
     if (status === "suspended") updates.suspended_at = new Date().toISOString();
   }
   if (hasTeam) {
-    const rawTeam = body.team_id;
-    const teamId = rawTeam === null ? "" : asString(rawTeam);
-    if (!teamId || teamId === "__none" || teamId === "none") {
+    const teamId = await normalizeWorkspaceOrgTeamId(client, organizationId, body.team_id);
+    if (!teamId) {
       updates.team_id = null;
     } else {
-      const { data: team, error: teamError } = await client
-        .from("classes")
-        .select("id")
-        .eq("id", teamId)
-        .eq("organization_id", organizationId)
-        .is("deleted_at", null)
-        .maybeSingle();
-      if (teamError) throw new Error(`team lookup failed: ${teamError.message}`);
-      if (!team) throw new Error("team does not belong to this organization");
       updates.team_id = teamId;
     }
   }
@@ -1296,6 +1386,7 @@ const ACTIONS: Record<string, (client: SupabaseClient, body: Record<string, unkn
   save_workspace_team: saveWorkspaceTeam,
   allocate_workspace_team_credits: allocateWorkspaceTeamCredits,
   list_workspace_org_members: listWorkspaceOrgMembers,
+  add_workspace_org_member: addWorkspaceOrgMember,
   update_workspace_org_member: updateWorkspaceOrgMember,
   list_workspace_education_dashboard: (client) => listWorkspaceEducation(client),
   save_workspace_education_institution: saveWorkspaceEducationInstitution,
