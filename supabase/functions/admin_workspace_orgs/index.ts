@@ -104,6 +104,21 @@ async function listUsersByDomain(client: SupabaseClient, domain: string) {
   return matches;
 }
 
+async function findAuthUserByEmail(client: SupabaseClient, email: string) {
+  const normalizedEmail = email.trim().toLowerCase();
+  if (!normalizedEmail) return null;
+  for (let page = 1; page <= 20; page += 1) {
+    const { data, error } = await client.auth.admin.listUsers({ page, perPage: 1000 });
+    if (error) throw new Error(`auth users read failed: ${error.message}`);
+    const found = (data?.users ?? []).find((user) =>
+      String(user.email ?? "").toLowerCase() === normalizedEmail
+    );
+    if (found) return { id: found.id, email: found.email ?? normalizedEmail };
+    if ((data?.users ?? []).length < 1000) break;
+  }
+  return null;
+}
+
 function assertWorkspaceOrgDomain(value: string): string {
   const domain = assertPrivateEmailDomain(value);
   if (!DOMAIN_RE.test(domain)) throw new Error("invalid domain");
@@ -742,7 +757,7 @@ function rowDate(value: unknown): string | null {
 async function listWorkspaceEducation(client: SupabaseClient) {
   const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
-  const [orgsRes, domainsRes, providersRes, classesRes, membersRes, profilesRes] = await Promise.all([
+  const [orgsRes, domainsRes, providersRes, classesRes, membersRes, orgMembersRes, profilesRes] = await Promise.all([
     client
       .from("organizations")
       .select("id,name,slug,display_name,type,status,logo_url,brand_color,primary_contact_email,credit_pool,credit_pool_allocated,settings,created_at,updated_at")
@@ -766,6 +781,10 @@ async function listWorkspaceEducation(client: SupabaseClient) {
       .from("class_members")
       .select("id,class_id,user_id,role,status,student_code,credit_cap,credits_balance,credits_lifetime_received,credits_lifetime_used,joined_at,created_at,updated_at"),
     client
+      .from("organization_memberships")
+      .select("id,organization_id,user_id,role,status,joined_at,created_at,updated_at")
+      .eq("role", "org_admin"),
+    client
       .from("profiles")
       .select("user_id,display_name,avatar_url,organization_id,account_type"),
   ]);
@@ -775,13 +794,18 @@ async function listWorkspaceEducation(client: SupabaseClient) {
   if (providersRes.error) throw new Error(`education providers read failed: ${providersRes.error.message}`);
   if (classesRes.error) throw new Error(`education classes read failed: ${classesRes.error.message}`);
   if (membersRes.error) throw new Error(`education members read failed: ${membersRes.error.message}`);
+  if (orgMembersRes.error) throw new Error(`education org admins read failed: ${orgMembersRes.error.message}`);
   if (profilesRes.error) throw new Error(`education profiles read failed: ${profilesRes.error.message}`);
 
   const orgIds = new Set((orgsRes.data ?? []).map((org: any) => String(org.id)));
   const classRows = (classesRes.data ?? []).filter((row: any) => orgIds.has(String(row.organization_id)));
   const classIds = new Set(classRows.map((row: any) => String(row.id)));
   const members = (membersRes.data ?? []).filter((row: any) => classIds.has(String((row as any).class_id)));
-  const userIds = Array.from(new Set(members.map((row: any) => String(row.user_id))));
+  const orgAdminMembers = (orgMembersRes.data ?? []).filter((row: any) => orgIds.has(String(row.organization_id)));
+  const userIds = Array.from(new Set([
+    ...members.map((row: any) => String(row.user_id)),
+    ...orgAdminMembers.map((row: any) => String(row.user_id)),
+  ]));
 
   const usersById = new Map<string, { email: string | null }>();
   try {
@@ -810,6 +834,22 @@ async function listWorkspaceEducation(client: SupabaseClient) {
     const orgId = String((row as any).organization_id);
     if (!orgIds.has(orgId)) continue;
     providersByOrg.set(orgId, [...(providersByOrg.get(orgId) ?? []), row]);
+  }
+
+  const adminsByOrg = new Map<string, any[]>();
+  for (const row of orgAdminMembers as any[]) {
+    const orgId = String(row.organization_id);
+    const userId = String(row.user_id);
+    const profile = profilesById.get(userId);
+    adminsByOrg.set(orgId, [
+      ...(adminsByOrg.get(orgId) ?? []),
+      {
+        ...row,
+        email: usersById.get(userId)?.email ?? null,
+        display_name: profile?.display_name ?? null,
+        avatar_url: profile?.avatar_url ?? null,
+      },
+    ]);
   }
 
   const membersByClass = new Map<string, any[]>();
@@ -972,6 +1012,8 @@ async function listWorkspaceEducation(client: SupabaseClient) {
       ...org,
       domains: domainsByOrg.get(String(org.id)) ?? [],
       sso_providers: providersByOrg.get(String(org.id)) ?? [],
+      admins: adminsByOrg.get(String(org.id)) ?? [],
+      admin_count: (adminsByOrg.get(String(org.id)) ?? []).filter((admin) => admin.status === "active").length,
       class_count: orgClasses.length,
       student_count: orgStudents.length,
       online_count: online,
@@ -1010,11 +1052,77 @@ async function saveWorkspaceEducationInstitution(client: SupabaseClient, body: R
   if (type !== "university" && type !== "school") {
     throw new Error("education institution type must be school or university");
   }
-  return saveWorkspaceOrg(client, {
+  const saved = await saveWorkspaceOrg(client, {
     ...body,
     type,
     provider: asString(body.provider, "email_otp"),
   });
+  const adminEmail = asString(body.admin_email).toLowerCase();
+  if (!adminEmail) return saved;
+
+  const orgId = String((saved as any)?.data?.org?.id ?? "");
+  const adminResult = orgId
+    ? await addWorkspaceEducationAdmin(client, { organization_id: orgId, email: adminEmail })
+    : null;
+  return { data: { ...(saved as any).data, admin_result: (adminResult as any)?.data ?? null } };
+}
+
+async function addWorkspaceEducationAdmin(client: SupabaseClient, body: Record<string, unknown>) {
+  const organizationId = asString(body.organization_id);
+  const email = asString(body.email).toLowerCase();
+  if (!organizationId || !email) throw new Error("organization_id and email are required");
+
+  const { data: org, error: orgError } = await client
+    .from("organizations")
+    .select("id,type")
+    .eq("id", organizationId)
+    .in("type", ["school", "university"])
+    .is("deleted_at", null)
+    .maybeSingle();
+  if (orgError) throw new Error(`education institution lookup failed: ${orgError.message}`);
+  if (!org) throw new Error("education institution not found");
+
+  const user = await findAuthUserByEmail(client, email);
+  if (!user) {
+    return {
+      data: {
+        ok: false,
+        error: "user_not_found",
+        message: `No workspace user found for ${email}. Ask the admin to sign in once before granting university admin access.`,
+      },
+    };
+  }
+
+  const now = new Date().toISOString();
+  const { error: profileError } = await client.from("profiles").upsert(
+    {
+      user_id: user.id,
+      organization_id: organizationId,
+      account_type: "org_user",
+      updated_at: now,
+    },
+    { onConflict: "user_id" },
+  );
+  if (profileError) throw new Error(`profile update failed: ${profileError.message}`);
+
+  const { data: membership, error: membershipError } = await client
+    .from("organization_memberships")
+    .upsert(
+      {
+        organization_id: organizationId,
+        user_id: user.id,
+        role: "org_admin",
+        status: "active",
+        suspended_at: null,
+        updated_at: now,
+      },
+      { onConflict: "organization_id,user_id" },
+    )
+    .select()
+    .single();
+  if (membershipError) throw new Error(`university admin save failed: ${membershipError.message}`);
+
+  return { data: { ok: true, admin: { ...membership, email: user.email } } };
 }
 
 async function saveWorkspaceEducationClass(client: SupabaseClient, body: Record<string, unknown>) {
@@ -1191,6 +1299,7 @@ const ACTIONS: Record<string, (client: SupabaseClient, body: Record<string, unkn
   update_workspace_org_member: updateWorkspaceOrgMember,
   list_workspace_education_dashboard: (client) => listWorkspaceEducation(client),
   save_workspace_education_institution: saveWorkspaceEducationInstitution,
+  add_workspace_education_admin: addWorkspaceEducationAdmin,
   save_workspace_education_class: saveWorkspaceEducationClass,
   add_workspace_education_student: addWorkspaceEducationStudent,
   adjust_workspace_education_student_credits: adjustWorkspaceEducationStudentCredits,
