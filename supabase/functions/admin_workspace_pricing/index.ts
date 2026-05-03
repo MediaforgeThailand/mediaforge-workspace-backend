@@ -135,22 +135,6 @@ const GPT_IMAGE_2_ROWS: CreditCostWriteRow[] = ([
   }))
 );
 
-const GPT_IMAGE_2_FALLBACK_ROWS: CreditCostWriteRow[] = (["low", "medium", "high"] as const).map((quality) => ({
-  feature: "generate_openai_image",
-  model: `gpt-image-2-${quality}`,
-  label: `GPT Image 2 ${QUALITY_LABEL[quality]} fallback`,
-  cost: gptImage2Credits(1024, 1024, quality),
-  pricing_type: "per_operation",
-  provider: "openai",
-  price_key: `gpt-image-2:1k:${quality}`,
-  resolution: "1K",
-  quality,
-  source: "official_docs",
-  source_url: "https://developers.openai.com/api/docs/guides/image-generation#calculating-costs",
-  provider_unit: "per image",
-  notes: "Runtime fallback row for older callers that only pass quality.",
-}));
-
 const NANO_BANANA_ROWS: CreditCostWriteRow[] = [
   { model: "nano-banana-2", mappedModel: "gemini-3.1-flash-image-preview", label: "Nano Banana 2", prices: { "1k": 0.067, "2k": 0.101, "4k": 0.151 } },
   { model: "nano-banana-pro", mappedModel: "gemini-3-pro-image-preview", label: "Nano Banana Pro", prices: { "1k": 0.134, "2k": 0.134, "4k": 0.24 } },
@@ -303,7 +287,6 @@ const ELEVENLABS_TTS_ROWS: CreditCostWriteRow[] = [
 
 const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   ...GPT_IMAGE_2_ROWS,
-  ...GPT_IMAGE_2_FALLBACK_ROWS,
   ...NANO_BANANA_ROWS,
   ...NANO_BANANA_FALLBACK_ROWS,
   ...KLING_ROWS,
@@ -773,8 +756,12 @@ async function cleanupLegacyPricingRows(client: SupabaseClient): Promise<number>
       .from("credit_costs")
       .delete()
       .eq("feature", "generate_openai_image")
-      .in("model", ["gpt-image-2-low", "gpt-image-2-medium", "gpt-image-2-high"])
-      .eq("source", "flow_erp_converted"),
+      .in("model", ["gpt-image-2-low", "gpt-image-2-medium", "gpt-image-2-high"]),
+    client
+      .from("credit_costs")
+      .delete()
+      .eq("feature", "generate_openai_image")
+      .ilike("label", "%fallback%"),
   ];
   for (const deleteQuery of staleDeletes) {
     const { count, error } = await deleteQuery.select("id", { count: "exact", head: true });

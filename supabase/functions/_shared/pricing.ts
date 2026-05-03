@@ -90,11 +90,19 @@ function openAiImagePriceKeys(params: Record<string, unknown>): string[] {
   const rawSize = String(params.size ?? "1024x1024").toLowerCase();
   const size = rawSize === "auto" ? "1024x1024" : rawSize;
   const tier = normaliseResolutionTier(size);
+  const exactGptImage2Sku = baseModel.match(/^gpt-image-2:(1k|2k|4k):(low|medium|high)$/);
+  if (exactGptImage2Sku) return [baseModel];
+
+  if (baseModel === "gpt-image-2") {
+    return Array.from(new Set([
+      `${baseModel}:${size}:${quality}`,
+      `${baseModel}:${tier}:${quality}`,
+    ]));
+  }
 
   return Array.from(new Set([
     `${baseModel}:${size}:${quality}`,
     `${baseModel}:${tier}:${quality}`,
-    `${baseModel}-${quality}`,
     baseModel,
   ]));
 }
