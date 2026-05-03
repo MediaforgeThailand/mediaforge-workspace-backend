@@ -463,7 +463,7 @@ async function getWorkspaceCreditBalance(
     organization_id?: string | null;
     organization_name?: string | null;
     organization_type?: string | null;
-    credit_scope?: "user" | "organization" | "team";
+    credit_scope?: "user" | "organization" | "team" | "education_space";
     team_id?: string | null;
     team_name?: string | null;
     personal_balance?: number;
@@ -617,17 +617,45 @@ async function getWorkspaceCreditBalance(
     );
   }
 
+  if (educationScope) {
+    const educationBalance = Number(educationScope.credit_balance ?? 0);
+    const educationReceived = Number(educationScope.credits_lifetime_received ?? educationBalance);
+    const educationUsed = Number(educationScope.credits_lifetime_used ?? 0);
+    return {
+      data: {
+        balance: educationBalance,
+        total_purchased: educationReceived,
+        total_used: educationUsed,
+        is_shared_pool: true,
+        pool_domain: educationScope.class_code ? String(educationScope.class_code) : null,
+        pool_user_id: null,
+        organization_id: educationScope.organization_id ? String(educationScope.organization_id) : null,
+        organization_name: educationScope.organization_name ? String(educationScope.organization_name) : null,
+        organization_type: educationScope.organization_type ? String(educationScope.organization_type) : null,
+        credit_scope: "education_space",
+        team_id: educationScope.class_id ? String(educationScope.class_id) : null,
+        team_name: educationScope.class_name ? String(educationScope.class_name) : null,
+        personal_balance: personalBalance,
+        personal_total_purchased: personalTotalPurchased,
+        personal_total_used: personalTotalUsed,
+        shared_balance: educationBalance,
+        shared_total: educationReceived,
+        shared_used: educationUsed,
+      },
+    };
+  }
+
   return {
     data: {
       balance: personalBalance,
       total_purchased: personalTotalPurchased,
       total_used: personalTotalUsed,
       is_shared_pool: false,
-      pool_domain: educationScope?.class_code ? String(educationScope.class_code) : null,
+      pool_domain: null,
       pool_user_id: null,
-      organization_id: educationScope?.organization_id ? String(educationScope.organization_id) : null,
-      organization_name: educationScope?.organization_name ? String(educationScope.organization_name) : null,
-      organization_type: educationScope?.organization_type ? String(educationScope.organization_type) : null,
+      organization_id: null,
+      organization_name: null,
+      organization_type: null,
       credit_scope: "user",
       team_id: null,
       team_name: null,

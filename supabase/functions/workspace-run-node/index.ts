@@ -3838,7 +3838,7 @@ function workspaceMultiplierForProvider(
 
 type WorkspaceCreditCharge = {
   amount: number;
-  scope: "user" | "organization" | "team";
+  scope: "user" | "organization" | "team" | "education_space";
   teamId: string | null;
   organizationId: string | null;
   classId: string | null;
@@ -3846,6 +3846,13 @@ type WorkspaceCreditCharge = {
   referenceId: string;
   feature: string;
 };
+
+const DEFAULT_EDUCATION_BLOCKED_MODELS = [
+  "seedance-2-0-lite",
+  "seedance-2-0-pro",
+  "dreamina-seedance-2-0-260128",
+  "dreamina-seedance-2-0-fast-260128",
+];
 
 type WorkspaceCreditOwner =
   | {
@@ -4112,6 +4119,52 @@ async function resolveWorkspaceTeamId(
   }
 }
 
+function normalizedModelKey(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function educationBlockedModelsFromSettings(settings: unknown): string[] {
+  const raw =
+    settings && typeof settings === "object"
+      ? (settings as Record<string, unknown>).blocked_model_ids
+      : null;
+  if (Array.isArray(raw)) {
+    return raw.map(normalizedModelKey).filter(Boolean);
+  }
+  return DEFAULT_EDUCATION_BLOCKED_MODELS;
+}
+
+function educationModelMatchesBlock(model: string, blocked: string): boolean {
+  if (!model || !blocked) return false;
+  if (model === blocked) return true;
+  if (model.includes(blocked) || blocked.includes(model)) return true;
+  if (blocked.includes("seedance-2-0")) {
+    return model.includes("seedance-2-0") || model.includes("dreamina-seedance-2-0");
+  }
+  return false;
+}
+
+async function assertEducationModelAllowed(args: {
+  supabase: ReturnType<typeof createClient>;
+  classId: string;
+  modelId: string;
+}): Promise<void> {
+  const model = normalizedModelKey(args.modelId);
+  if (!model) return;
+  const { data, error } = await args.supabase
+    .from("classes")
+    .select("settings")
+    .eq("id", args.classId)
+    .maybeSingle();
+  if (error) {
+    throw new Error(`Class model policy lookup failed: ${error.message}`);
+  }
+  const blocked = educationBlockedModelsFromSettings((data as { settings?: unknown } | null)?.settings);
+  if (blocked.some((blockedModel) => educationModelMatchesBlock(model, blockedModel))) {
+    throw new Error("MODEL_BLOCKED_BY_CLASS");
+  }
+}
+
 async function ensureSpendableUserCreditBatch(
   supabase: ReturnType<typeof createClient>,
   creditUserId: string,
@@ -4211,6 +4264,55 @@ async function consumeWorkspaceCredits(args: {
     creditOwner.scope === "organization"
       ? `${descriptionBase} (${creditOwner.organizationName ?? "org"} shared pool; actual user ${creditOwner.email ?? args.userId})`
       : descriptionBase;
+
+  if (
+    creditOwner.scope === "user" &&
+    creditOwner.organizationType &&
+    ["school", "university"].includes(String(creditOwner.organizationType)) &&
+    creditOwner.classRole !== "teacher"
+  ) {
+    if (!creditOwner.classId) {
+      throw new Error("EDUCATION_CLASS_REQUIRED");
+    }
+    if (!args.body.workspace_id) {
+      throw new Error("EDUCATION_SPACE_REQUIRED");
+    }
+    const modelId = String(args.params.model_name ?? args.params.model ?? args.provider);
+    await assertEducationModelAllowed({
+      supabase: args.supabase,
+      classId: creditOwner.classId,
+      modelId,
+    });
+    const { data, error } = await args.supabase.rpc("consume_education_space_credits", {
+      p_user_id: args.userId,
+      p_workspace_id: args.body.workspace_id,
+      p_amount: amount,
+      p_feature: def.feature,
+      p_description: description,
+      p_reference_id: referenceId,
+      p_canvas_id: args.body.canvas_id ?? null,
+      p_model_id: modelId,
+    });
+    if (error) {
+      throw new Error(error.message);
+    }
+    if (data !== true) {
+      throw new Error("INSUFFICIENT_CREDITS");
+    }
+    console.log(
+      `[workspace-credits] charged ${amount} education-space credits user=${args.userId} class=${creditOwner.classId} workspace=${args.body.workspace_id} ref=${referenceId}`,
+    );
+    return {
+      amount,
+      scope: "education_space",
+      teamId: null,
+      organizationId: creditOwner.organizationId ?? null,
+      classId: creditOwner.classId,
+      creditUserId: args.userId,
+      referenceId,
+      feature: def.feature,
+    };
+  }
 
   if (!teamId && creditOwner.scope === "organization") {
     const { data, error } = await args.supabase.rpc("consume_workspace_org_credits", {
@@ -4313,6 +4415,19 @@ async function refundWorkspaceCredits(args: {
 }): Promise<void> {
   if (!args.charge || args.charge.amount <= 0) return;
   try {
+    if (args.charge.scope === "education_space") {
+      const { error } = await args.supabase.rpc("refund_education_space_credits", {
+        p_user_id: args.charge.creditUserId ?? args.userId,
+        p_workspace_id: args.workspaceId ?? null,
+        p_amount: args.charge.amount,
+        p_reason: args.reason,
+        p_reference_id: args.charge.referenceId,
+        p_canvas_id: args.canvasId ?? null,
+      });
+      if (error) throw error;
+      return;
+    }
+
     if (args.charge.scope === "organization" && args.charge.organizationId) {
       const { error } = await args.supabase.rpc("refund_workspace_org_credits", {
         p_user_id: args.userId,
@@ -4784,7 +4899,7 @@ interface WorkspaceRunBody {
    *  the worker replays the request with charging disabled. */
   skip_credit_charge?: boolean;
   precharged_credits?: number;
-  credit_scope?: "user" | "organization" | "team";
+  credit_scope?: "user" | "organization" | "team" | "education_space";
   credit_organization_id?: string | null;
   credit_class_id?: string | null;
 }

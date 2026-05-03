@@ -50,7 +50,10 @@
 //   GET    /classes/:cid/members
 //   PATCH  /classes/:cid/members/:userId
 //   DELETE /classes/:cid/members/:userId
-//   POST   /classes/:cid/members/:userId/credits   teacher grant (positive) or revoke (negative)
+//   POST   /classes/:cid/members/:userId/credits   legacy teacher space-credit adjustment (requires workspace_id)
+//   GET    /classes/:cid/spaces
+//   POST   /classes/:cid/spaces/:workspaceId/credits
+//   POST   /classes/:cid/spaces/:workspaceId/status
 //   GET    /classes/:cid/codes
 //   POST   /classes/:cid/codes
 //   DELETE /classes/:cid/codes/:codeId
@@ -91,6 +94,23 @@ function nullIfBlank(value: unknown): unknown | null {
 function optionalDate(value: unknown): string | null {
   const normalized = nullIfBlank(value);
   return normalized === null ? null : String(normalized);
+}
+
+const DEFAULT_EDUCATION_BLOCKED_MODELS = [
+  "seedance-2-0-lite",
+  "seedance-2-0-pro",
+  "dreamina-seedance-2-0-260128",
+  "dreamina-seedance-2-0-fast-260128",
+];
+
+function withDefaultClassSettings(input: unknown): Record<string, unknown> {
+  const settings = input && typeof input === "object" && !Array.isArray(input)
+    ? { ...(input as Record<string, unknown>) }
+    : {};
+  if (!Array.isArray(settings.blocked_model_ids)) {
+    settings.blocked_model_ids = DEFAULT_EDUCATION_BLOCKED_MODELS;
+  }
+  return settings;
 }
 
 /** Resolve caller from JWT (returns user id or a 401 Response). */
@@ -246,6 +266,96 @@ async function userEmailMap(ids: string[]): Promise<Map<string, any>> {
   return byId;
 }
 
+async function listEducationSpacesForClass(classId: string): Promise<any[]> {
+  const a = admin();
+  const spaces = await safeData<any[]>("class_spaces.education_student_spaces", () =>
+    a.from("education_student_spaces")
+      .select("id, organization_id, class_id, user_id, project_id, workspace_id, student_code, status, credits_balance, credits_lifetime_received, credits_lifetime_used, last_activity_at, completed_at, completed_by, settings, created_at, updated_at")
+      .eq("class_id", classId)
+      .order("updated_at", { ascending: false })
+      .limit(500),
+  [],);
+  if (spaces.length === 0) return [];
+
+  const userIds = uniqueStrings(spaces.map((row: any) => row.user_id));
+  const workspaceIds = uniqueStrings(spaces.map((row: any) => row.workspace_id));
+  const since = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+  const [profiles, usersById, workspaces, activities, presence] = await Promise.all([
+    userIds.length > 0
+      ? safeData<any[]>("class_spaces.profiles", () =>
+          a.from("profiles")
+            .select("user_id, display_name, avatar_url")
+            .in("user_id", userIds),
+        [],)
+      : Promise.resolve([]),
+    userEmailMap(userIds),
+    workspaceIds.length > 0
+      ? safeData<any[]>("class_spaces.workspaces", () =>
+          a.from("workspaces")
+            .select("id, name, project_id, class_id, education_status, education_completed_at, updated_at")
+            .in("id", workspaceIds),
+        [],)
+      : Promise.resolve([]),
+    safeData<any[]>("class_spaces.activity", () =>
+      a.from("workspace_activity")
+        .select("id, user_id, class_id, activity_type, model_id, credits_used, created_at, metadata")
+        .eq("class_id", classId)
+        .gte("created_at", since)
+        .order("created_at", { ascending: false })
+        .limit(500),
+    [],),
+    safeData<any[]>("class_spaces.presence", () =>
+      a.from("education_student_screen_presence")
+        .select("id, class_id, user_id, status, screen_state, current_workspace_id, current_canvas_id, current_project_id, current_activity, last_seen_at")
+        .eq("class_id", classId)
+        .order("last_seen_at", { ascending: false })
+        .limit(250),
+    [],),
+  ]);
+
+  const profilesById = new Map(profiles.map((profile: any) => [profile.user_id, profile]));
+  const workspacesById = new Map(workspaces.map((workspace: any) => [workspace.id, workspace]));
+  const presenceByWorkspace = new Map<string, any>();
+  const presenceByUser = new Map<string, any>();
+  for (const row of presence) {
+    if (row.current_workspace_id && !presenceByWorkspace.has(row.current_workspace_id)) {
+      presenceByWorkspace.set(row.current_workspace_id, row);
+    }
+    if (row.user_id && !presenceByUser.has(row.user_id)) {
+      presenceByUser.set(row.user_id, row);
+    }
+  }
+
+  return spaces.map((row: any) => {
+    const profile = profilesById.get(row.user_id) ?? {};
+    const user = usersById.get(row.user_id) ?? {};
+    const workspace = workspacesById.get(row.workspace_id) ?? {};
+    const rowActivities = activities.filter((activity: any) =>
+      activity.user_id === row.user_id &&
+      (
+        activity.metadata?.workspace_id === row.workspace_id ||
+        activity.metadata?.workspace_id === String(row.workspace_id)
+      )
+    );
+    const live = presenceByWorkspace.get(row.workspace_id) ?? presenceByUser.get(row.user_id) ?? null;
+    const lastActivity = row.last_activity_at ?? rowActivities[0]?.created_at ?? null;
+    return {
+      ...row,
+      workspace_name: workspace.name ?? null,
+      workspace_updated_at: workspace.updated_at ?? row.updated_at,
+      display_name: profile.display_name ?? user.email ?? "Unnamed student",
+      avatar_url: profile.avatar_url ?? null,
+      email: user.email ?? null,
+      last_activity_at: lastActivity,
+      generation_count_30d: rowActivities.filter((activity: any) => activity.activity_type === "model_use").length,
+      credits_used_30d: sumNumbers(rowActivities, "credits_used"),
+      presence: live,
+      is_online: isFreshSeen(live?.last_seen_at),
+      is_locked: row.status === "passed" || row.status === "ended",
+    };
+  });
+}
+
 async function buildSchoolOverview(req: Request, requestedOrgId?: string | null): Promise<Response> {
   const auth = await getSchoolAuth(req);
   if (auth instanceof Response) return auth;
@@ -326,7 +436,7 @@ async function buildSchoolOverview(req: Request, requestedOrgId?: string | null)
   const classIds = classes.map((row) => row.id);
   const since = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
 
-  const [domains, members, activities, requests, presence, sessions] = await Promise.all([
+  const [domains, members, spaces, activities, requests, presence, sessions] = await Promise.all([
     safeData<any[]>("school_overview.domains", () =>
       a.from("organization_domains")
         .select("id, domain, is_primary, verified_at, verification_method")
@@ -339,6 +449,15 @@ async function buildSchoolOverview(req: Request, requestedOrgId?: string | null)
             .select("id, class_id, user_id, role, status, joined_at, student_code, credit_cap, credits_balance, credits_lifetime_received, credits_lifetime_used")
             .in("class_id", classIds)
             .order("joined_at", { ascending: false }),
+        [],)
+      : Promise.resolve([]),
+    classIds.length > 0
+      ? safeData<any[]>("school_overview.education_spaces", () =>
+          a.from("education_student_spaces")
+            .select("id, organization_id, class_id, user_id, project_id, workspace_id, student_code, status, credits_balance, credits_lifetime_received, credits_lifetime_used, last_activity_at, completed_at, completed_by, settings, created_at, updated_at")
+            .in("class_id", classIds)
+            .order("updated_at", { ascending: false })
+            .limit(500),
         [],)
       : Promise.resolve([]),
     safeData<any[]>("school_overview.activity", () =>
@@ -382,11 +501,13 @@ async function buildSchoolOverview(req: Request, requestedOrgId?: string | null)
   const userIds = uniqueStrings([
     auth.userId,
     ...members.map((row: any) => row.user_id),
+    ...spaces.map((row: any) => row.user_id),
     ...activities.map((row: any) => row.user_id),
     ...requests.map((row: any) => row.user_id),
     ...presence.map((row: any) => row.user_id),
   ]);
-  const [profiles, usersById] = await Promise.all([
+  const workspaceIds = uniqueStrings(spaces.map((row: any) => row.workspace_id));
+  const [profiles, usersById, workspaceRows] = await Promise.all([
     userIds.length > 0
       ? safeData<any[]>("school_overview.profiles", () =>
           a.from("profiles")
@@ -395,9 +516,17 @@ async function buildSchoolOverview(req: Request, requestedOrgId?: string | null)
         [],)
       : Promise.resolve([]),
     userEmailMap(userIds),
+    workspaceIds.length > 0
+      ? safeData<any[]>("school_overview.workspaces", () =>
+          a.from("workspaces")
+            .select("id, name, project_id, class_id, education_status, education_completed_at, updated_at")
+            .in("id", workspaceIds),
+        [],)
+      : Promise.resolve([]),
   ]);
 
   const profilesById = new Map(profiles.map((profile: any) => [profile.user_id, profile]));
+  const workspacesById = new Map(workspaceRows.map((workspace: any) => [workspace.id, workspace]));
   const activityByUser = new Map<string, any[]>();
   const activityByClass = new Map<string, any[]>();
   const activityByModel = new Map<string, { count: number; credits: number }>();
@@ -425,6 +554,37 @@ async function buildSchoolOverview(req: Request, requestedOrgId?: string | null)
     }
   }
 
+  const spacesByUserClass = new Map<string, any[]>();
+  const enrichedSpaces = spaces.map((row: any) => {
+    const profile = profilesById.get(row.user_id) ?? {};
+    const user = usersById.get(row.user_id) ?? {};
+    const workspace = workspacesById.get(row.workspace_id) ?? {};
+    const userActivity = activities.filter((activity: any) =>
+      activity.user_id === row.user_id &&
+      (
+        activity.metadata?.workspace_id === row.workspace_id ||
+        activity.metadata?.workspace_id === String(row.workspace_id)
+      )
+    );
+    const lastActivity = row.last_activity_at ?? userActivity[0]?.created_at ?? null;
+    const enriched = {
+      ...row,
+      workspace_name: workspace.name ?? null,
+      workspace_updated_at: workspace.updated_at ?? row.updated_at,
+      display_name: profile.display_name ?? user.email ?? "Unnamed student",
+      avatar_url: profile.avatar_url ?? null,
+      email: user.email ?? null,
+      last_activity_at: lastActivity,
+      generation_count_30d: userActivity.filter((activity: any) => activity.activity_type === "model_use").length,
+      credits_used_30d: sumNumbers(userActivity, "credits_used"),
+      is_locked: row.status === "passed" || row.status === "ended",
+    };
+    const key = `${row.class_id}:${row.user_id}`;
+    if (!spacesByUserClass.has(key)) spacesByUserClass.set(key, []);
+    spacesByUserClass.get(key)!.push(enriched);
+    return enriched;
+  });
+
   const enrichedMembers = members.map((row: any) => {
     const profile = profilesById.get(row.user_id) ?? {};
     const user = usersById.get(row.user_id) ?? {};
@@ -439,6 +599,7 @@ async function buildSchoolOverview(req: Request, requestedOrgId?: string | null)
       last_activity_at: lastActivity,
       model_uses_30d: userActivity.filter((activity: any) => activity.activity_type === "model_use").length,
       credits_used_30d: sumNumbers(userActivity, "credits_used"),
+      spaces: spacesByUserClass.get(`${row.class_id}:${row.user_id}`) ?? [],
       presence: freshPresence,
       is_online: isFreshSeen(freshPresence?.last_seen_at),
       needs_profile: row.role === "student" && !row.student_code,
@@ -453,6 +614,7 @@ async function buildSchoolOverview(req: Request, requestedOrgId?: string | null)
     const onlineStudents = students.filter((member: any) => member.is_online).length;
     const lowCreditStudents = students.filter((member: any) => Number(member.credits_balance ?? 0) <= 20).length;
     const noActivityStudents = students.filter((member: any) => !member.last_activity_at).length;
+    const classSpaces = enrichedSpaces.filter((space: any) => space.class_id === classRow.id);
     return {
       ...classRow,
       members_count: classMembers.length,
@@ -462,6 +624,8 @@ async function buildSchoolOverview(req: Request, requestedOrgId?: string | null)
       low_credit_students: lowCreditStudents,
       no_activity_students: noActivityStudents,
       pending_credit_requests: pendingRequestsByClass.get(classRow.id) ?? 0,
+      active_spaces: classSpaces.filter((space: any) => space.status === "active" || space.status === "submitted").length,
+      passed_spaces: classSpaces.filter((space: any) => space.status === "passed").length,
       credits_remaining: Math.max(0, Number(classRow.credit_pool ?? 0) - Number(classRow.credit_pool_consumed ?? 0)),
       credits_used_30d: sumNumbers(classActivities, "credits_used"),
       generation_count_30d: classActivities.filter((activity: any) => activity.activity_type === "model_use").length,
@@ -514,6 +678,7 @@ async function buildSchoolOverview(req: Request, requestedOrgId?: string | null)
     domains,
     classes: classSummaries,
     members: enrichedMembers,
+    spaces: enrichedSpaces,
     credit_requests: requests,
     live_presence: presence.map((row: any) => ({
       ...row,
@@ -1128,7 +1293,7 @@ Deno.serve(async (req) => {
           .from("classes")
           .select("id, name, code, term, year, status, max_students, primary_instructor_id, " +
                   "credit_policy, credit_amount, credit_pool, credit_pool_consumed, " +
-                  "start_date, end_date, created_at")
+                  "start_date, end_date, settings, created_at")
           .eq("organization_id", orgId)
           .neq("status", "ended")
           .is("deleted_at", null)
@@ -1181,6 +1346,7 @@ Deno.serve(async (req) => {
             credit_amount,
             reset_day_of_month: body?.reset_day_of_month ?? 1,
             reset_day_of_week: body?.reset_day_of_week ?? 1,
+            settings: withDefaultClassSettings(body?.settings),
           })
           .select()
           .single();
@@ -1218,7 +1384,7 @@ Deno.serve(async (req) => {
           a.from("class_memberships").select("id", { count: "exact", head: true })
             .eq("class_id", classId).eq("status", "active"),
           a.from("class_enrollment_codes")
-            .select("id, code, max_uses, uses_count, expires_at, created_at")
+            .select("id, code, max_uses, uses_count, expires_at, credit_amount, settings, created_at")
             .eq("class_id", classId).is("revoked_at", null)
             .order("created_at", { ascending: false }).limit(10),
           a.from("credit_requests").select("id", { count: "exact", head: true })
@@ -1480,24 +1646,26 @@ Deno.serve(async (req) => {
 
         const initialCredits = Number(body?.initial_credits ?? 0);
         let newBalance: number | null = null;
-        if (Number.isInteger(initialCredits) && initialCredits > 0) {
-          const creditRes = await a.rpc("admin_adjust_class_member_credits", {
+        let space: any = null;
+        if (Number.isInteger(initialCredits) && initialCredits >= 0) {
+          const spaceRes = await a.rpc("ensure_education_student_space", {
             p_class_id: classId,
             p_user_id: userId,
-            p_delta: initialCredits,
+            p_student_code: studentCode,
+            p_credit_amount: initialCredits,
             p_actor_id: auth.userId,
             p_reason: String(body?.reason ?? "school_center_initial_student_credit"),
           });
-          if (creditRes.error) return json({ error: creditRes.error.message }, 400);
-          if (creditRes.data === -1) return json({ error: "class_budget_exhausted" }, 409);
-          newBalance = creditRes.data;
+          if (spaceRes.error) return json({ error: spaceRes.error.message }, 400);
+          space = spaceRes.data;
+          newBalance = Number(space?.starting_balance ?? 0);
         }
 
-        return json({ member, new_balance: newBalance }, 201);
+        return json({ member, space, new_balance: newBalance }, 201);
       }
     }
 
-    // ─── /classes/:cid/members/:userId/credits (grant/revoke) ────────
+    // ─── /classes/:cid/members/:userId/credits (legacy space adjustment) ───
     if (segments[0] === "classes" && segments[2] === "members"
         && segments[4] === "credits" && segments.length === 5) {
       const classId = segments[1];
@@ -1510,14 +1678,28 @@ Deno.serve(async (req) => {
         if (auth instanceof Response) return auth;
 
         const amount = Number(body?.amount ?? 0);
-        if (!Number.isFinite(amount) || amount === 0) {
+        if (!Number.isInteger(amount) || amount === 0) {
           return json({ error: "amount_must_be_nonzero_integer" }, 400);
         }
         const reason = String(body?.reason ?? "manual");
+        const workspaceId = String(body?.workspace_id ?? body?.space_id ?? "").trim();
+        if (!workspaceId) {
+          return json({
+            error: "workspace_id_required",
+            message: "Credits are scoped to a class student space. Select a workspace_id before adjusting credits.",
+          }, 400);
+        }
+        const { data: spaceRow } = await admin()
+          .from("education_student_spaces")
+          .select("workspace_id, class_id, user_id")
+          .eq("class_id", classId)
+          .eq("user_id", userId)
+          .eq("workspace_id", workspaceId)
+          .maybeSingle();
+        if (!spaceRow) return json({ error: "education_space_not_found" }, 404);
 
-        const adjusted = await admin().rpc("admin_adjust_class_member_credits", {
-          p_class_id: classId,
-          p_user_id: userId,
+        const adjusted = await admin().rpc("admin_adjust_education_space_credits", {
+          p_workspace_id: workspaceId,
           p_delta: amount,
           p_actor_id: auth.userId,
           p_reason: reason,
@@ -1528,37 +1710,80 @@ Deno.serve(async (req) => {
           new_balance: adjusted.data,
           granted: amount > 0 ? amount : 0,
           revoked: amount < 0 ? Math.abs(amount) : 0,
+          workspace_id: workspaceId,
         });
+      }
+    }
 
-        if (amount > 0) {
-          const { data, error } = await admin().rpc("grant_credits", {
-            p_class_id: classId,
-            p_user_id: userId,
-            p_amount: amount,
-            p_actor_id: auth.userId,
-            p_metadata: { reason },
-          });
-          if (error) return json({ error: error.message }, 400);
-          if (data === null) return json({ error: "class_budget_exhausted" }, 409);
-          return json({ new_balance: data, granted: amount });
+    // ─── /classes/:cid/spaces (student class spaces) ───────────────────
+    if (segments[0] === "classes" && segments[2] === "spaces" && segments.length === 3) {
+      const classId = segments[1];
+      if (method === "GET") {
+        const auth = await requireClassWriter(req, classId);
+        if (auth instanceof Response) return auth;
+        const { data: cls } = await admin()
+          .from("classes").select("id").eq("id", classId).maybeSingle();
+        if (!cls) return json({ error: "class_not_found" }, 404);
+        const spaces = await listEducationSpacesForClass(classId);
+        return json({ spaces });
+      }
+    }
+
+    if (segments[0] === "classes" && segments[2] === "spaces" && segments.length === 5) {
+      const classId = segments[1];
+      const workspaceId = decodeURIComponent(segments[3]);
+      const action = segments[4];
+      if (method === "POST" && action === "credits") {
+        const auth = await requireClassWriter(req, classId);
+        if (auth instanceof Response) return auth;
+        const amount = Number(body?.amount ?? 0);
+        if (!Number.isInteger(amount) || amount === 0) {
+          return json({ error: "amount_must_be_nonzero_integer" }, 400);
         }
-
-        // Negative → revoke via the dedicated SECURITY DEFINER helper.
-        // It clamps to current balance, decrements credits_lifetime_received,
-        // and writes a typed activity_logs row in one atomic txn.
-        const revoke = Math.abs(amount);
-        const { data, error } = await admin().rpc("revoke_credits", {
-          p_class_id: classId,
-          p_user_id: userId,
-          p_amount: revoke,
+        const { data: spaceRow } = await admin()
+          .from("education_student_spaces")
+          .select("workspace_id, class_id, user_id")
+          .eq("class_id", classId)
+          .eq("workspace_id", workspaceId)
+          .maybeSingle();
+        if (!spaceRow) return json({ error: "education_space_not_found" }, 404);
+        const adjusted = await admin().rpc("admin_adjust_education_space_credits", {
+          p_workspace_id: workspaceId,
+          p_delta: amount,
           p_actor_id: auth.userId,
-          p_reason: reason,
+          p_reason: String(body?.reason ?? "manual_space_adjustment"),
         });
-        if (error) return json({ error: error.message }, 400);
-        // Helper returns the new balance. We don't know the exact `taken`
-        // amount from the return shape — but the activity_logs row records
-        // it, and the UI reads new_balance to refresh.
-        return json({ new_balance: data, revoked: revoke });
+        if (adjusted.error) return json({ error: adjusted.error.message }, 400);
+        if (adjusted.data === -1) return json({ error: "class_budget_exhausted" }, 409);
+        return json({
+          new_balance: adjusted.data,
+          granted: amount > 0 ? amount : 0,
+          revoked: amount < 0 ? Math.abs(amount) : 0,
+          workspace_id: workspaceId,
+        });
+      }
+
+      if (method === "POST" && action === "status") {
+        const auth = await requireClassWriter(req, classId);
+        if (auth instanceof Response) return auth;
+        const nextStatus = String(body?.status ?? "passed");
+        if (!["active", "submitted", "passed", "ended"].includes(nextStatus)) {
+          return json({ error: "invalid_status" }, 400);
+        }
+        const { data: spaceRow } = await admin()
+          .from("education_student_spaces")
+          .select("workspace_id, class_id")
+          .eq("class_id", classId)
+          .eq("workspace_id", workspaceId)
+          .maybeSingle();
+        if (!spaceRow) return json({ error: "education_space_not_found" }, 404);
+        const updated = await admin().rpc("admin_set_education_space_status", {
+          p_workspace_id: workspaceId,
+          p_status: nextStatus,
+          p_actor_id: auth.userId,
+        });
+        if (updated.error) return json({ error: updated.error.message }, 400);
+        return json({ space: updated.data, workspace_id: workspaceId, status: nextStatus });
       }
     }
 
@@ -1696,7 +1921,7 @@ Deno.serve(async (req) => {
     if (segments[0] === "classes" && segments[2] === "codes" && segments.length === 3) {
       const classId = segments[1];
       const { data: cls } = await admin()
-        .from("classes").select("organization_id, code").eq("id", classId).maybeSingle();
+        .from("classes").select("organization_id, code, credit_amount").eq("id", classId).maybeSingle();
       if (!cls) return json({ error: "class_not_found" }, 404);
 
       if (method === "GET") {
@@ -1704,7 +1929,7 @@ Deno.serve(async (req) => {
         if (auth instanceof Response) return auth;
         const { data } = await admin()
           .from("class_enrollment_codes")
-          .select("id, code, max_uses, uses_count, expires_at, created_at")
+          .select("id, code, max_uses, uses_count, expires_at, credit_amount, settings, created_at")
           .eq("class_id", classId).is("revoked_at", null)
           .order("created_at", { ascending: false });
         return json({ codes: data ?? [] });
@@ -1718,6 +1943,10 @@ Deno.serve(async (req) => {
         if (max_uses !== null && (!Number.isInteger(max_uses) || max_uses <= 0)) {
           return json({ error: "max_uses_must_be_positive_integer_or_null" }, 400);
         }
+        const creditAmount = Number(body?.credit_amount ?? (cls as any).credit_amount ?? 0);
+        if (!Number.isInteger(creditAmount) || creditAmount < 0) {
+          return json({ error: "credit_amount_must_be_nonnegative_integer" }, 400);
+        }
         const ALPHA = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
         const rand = Array.from(crypto.getRandomValues(new Uint8Array(4)),
                                 (b) => ALPHA[b % ALPHA.length]).join("");
@@ -1730,6 +1959,8 @@ Deno.serve(async (req) => {
             code,
             max_uses,
             expires_at: body?.expires_at ?? null,
+            credit_amount: creditAmount,
+            settings: body?.settings ?? {},
             created_by: auth.userId,
           })
           .select().single();
