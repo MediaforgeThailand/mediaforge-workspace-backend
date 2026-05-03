@@ -277,7 +277,7 @@ serve(async (req) => {
     const wavData = pcmToWav(pcmBytes, 24000, 1, 16);
 
     // Upload to Supabase storage (reuse supabaseAdmin from above)
-    const fileName = `tts/${user.id}/${Date.now()}.wav`;
+    const fileName = `${user.id}/tts/${Date.now()}.wav`;
     const { error: uploadError } = await supabaseAdmin.storage
       .from("user_assets")
       .upload(fileName, wavData, { contentType: "audio/wav", upsert: true });
@@ -289,7 +289,7 @@ serve(async (req) => {
 
     const { data: signedData, error: signError } = await supabaseAdmin.storage
       .from("user_assets")
-      .createSignedUrl(fileName, 86400); // 24 hour expiry
+      .createSignedUrl(fileName, 60 * 60 * 24 * 365);
 
     if (signError || !signedData?.signedUrl) {
       console.error("Signed URL error:", signError);

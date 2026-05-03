@@ -2379,7 +2379,7 @@ async function executeGoogleTts(
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
-  const fileName = `tts/${userId}/${Date.now()}_${voiceId}.mp3`;
+  const fileName = `${userId}/tts/${Date.now()}_${voiceId}.mp3`;
   const { error: uploadErr } = await supabaseClient.storage
     .from("user_assets")
     .upload(fileName, bytes, { contentType: "audio/mpeg", upsert: true });
@@ -2390,7 +2390,7 @@ async function executeGoogleTts(
 
   const { data: signedData, error: signErr } = await supabaseClient.storage
     .from("user_assets")
-    .createSignedUrl(fileName, 86400); // 24h
+    .createSignedUrl(fileName, 60 * 60 * 24 * 365);
   if (signErr || !signedData?.signedUrl) {
     console.error("[google-tts] signed URL error:", signErr);
     throw new Error("Failed to save audio. Please try again.");
@@ -2644,7 +2644,7 @@ async function executeElevenLabsTts(
     throw new Error("ElevenLabs returned no audio content.");
   }
 
-  const fileName = `tts/${userId}/${Date.now()}_eleven_${voiceId.slice(0, 8)}.mp3`;
+  const fileName = `${userId}/tts/${Date.now()}_eleven_${voiceId.slice(0, 8)}.mp3`;
   const { error: uploadErr } = await supabaseClient.storage
     .from("user_assets")
     .upload(fileName, bytes, { contentType: "audio/mpeg", upsert: true });
@@ -2655,7 +2655,7 @@ async function executeElevenLabsTts(
 
   const { data: signedData, error: signErr } = await supabaseClient.storage
     .from("user_assets")
-    .createSignedUrl(fileName, 86400);
+    .createSignedUrl(fileName, 60 * 60 * 24 * 365);
   if (signErr || !signedData?.signedUrl) {
     console.error("[elevenlabs-tts] signed URL error:", signErr);
     throw new Error("Failed to save audio. Please try again.");
@@ -4629,7 +4629,8 @@ interface WorkspaceRunBody {
     | "poll_seedance"
     | "poll_hyper3d"
     | "poll_tripo3d"
-    | "mirror_tripo_url";
+    | "mirror_tripo_url"
+    | "refresh_storage_url";
   job_id?: string;
   task_id?: string;
   poll_endpoint?: string;
@@ -5700,6 +5701,29 @@ async function processWorkspaceGenerationJob(args: {
   console.warn(`[workspace-job] failed job=${job.id} attempts=${attempt}: ${lastError}`);
 }
 
+function parseSupabaseStorageUrl(
+  rawUrl: string,
+  supabaseUrl: string,
+): { bucket: string; path: string } | null {
+  try {
+    const url = new URL(rawUrl);
+    const expectedHost = new URL(supabaseUrl).hostname;
+    if (url.hostname !== expectedHost) return null;
+    const match = url.pathname.match(
+      /^\/storage\/v1\/object\/(?:sign|public)\/([^/]+)\/(.+)$/,
+    );
+    if (!match) return null;
+    const bucket = decodeURIComponent(match[1]);
+    const path = decodeURIComponent(match[2]);
+    if (!bucket || !path || path.split("/").some((part) => part === "..")) {
+      return null;
+    }
+    return { bucket, path };
+  } catch {
+    return null;
+  }
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -5773,6 +5797,53 @@ serve(async (req) => {
     activeUserId = user.id;
 
     /* ─── Parse body ───────────────────────────────────────── */
+    if (body.action === "refresh_storage_url") {
+      const srcUrl = String(body.url ?? "").trim();
+      const parsed = parseSupabaseStorageUrl(srcUrl, SUPABASE_URL);
+      if (!parsed) {
+        return new Response(
+          JSON.stringify({ error: "A valid Supabase storage URL is required." }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const ownUserAsset =
+        parsed.bucket === "user_assets" &&
+        (parsed.path.startsWith(`${user.id}/`) ||
+          parsed.path.startsWith(`tts/${user.id}/`));
+      const ownAiMedia =
+        parsed.bucket === "ai-media" &&
+        (parsed.path.startsWith(`${user.id}/`) ||
+          parsed.path.startsWith(`tripo3d-mirror/${user.id}/`));
+
+      if (!ownUserAsset && !ownAiMedia) {
+        return new Response(
+          JSON.stringify({ error: "Storage URL does not belong to this account." }),
+          { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const { data: signed, error: signError } = await supabase.storage
+        .from(parsed.bucket)
+        .createSignedUrl(parsed.path, 60 * 60 * 24 * 365);
+      if (signError || !signed?.signedUrl) {
+        return new Response(
+          JSON.stringify({ error: signError?.message ?? "Could not refresh signed URL." }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          url: signed.signedUrl,
+          signed_url: signed.signedUrl,
+          bucket: parsed.bucket,
+          storage_path: parsed.path,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
     if (body.action === "get_workspace_job") {
       const jobId = String(body.job_id ?? "").trim();
       if (!jobId) {
