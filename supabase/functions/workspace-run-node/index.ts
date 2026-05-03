@@ -44,6 +44,20 @@ import {
   pollHyper3dOnce,
   submitHyper3dTask,
 } from "../_shared/hyper3d.ts";
+import {
+  VEO_BASE,
+  VEO_MODEL_MAP,
+  buildVeoRequest,
+  extractVeoVideoUri,
+  fetchImageAsInline,
+  loadVeoApiKey,
+  pollVeoOnce,
+  submitVeoTask,
+  type VeoAspectRatio,
+  type VeoDuration,
+  type VeoPersonGeneration,
+  type VeoResolution,
+} from "../_shared/veo.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -1378,6 +1392,120 @@ async function executeSeedance(
       is_image2video: !!startFrameUrl,
       has_video_ref: !!referenceVideoUrl,
       poll_endpoint: `${SEEDANCE_BASE}${SEEDANCE_TASKS_PATH}`,
+    },
+  };
+}
+
+/**
+ * Google Veo 3.1 (Standard) video-gen executor.
+ *
+ * Async submit → predictLongRunning returns an operation name; the
+ * frontend polls via the workspace-run-node `poll_veo` action until
+ * the operation reports `done: true`. Audio is always generated
+ * (Veo 3.1 spec) — no toggle.
+ *
+ * Veo's REST API only accepts inline base64 image bytes for
+ * start/end frames, so any upstream URL (image gen output, uploaded
+ * asset) is fetched here and converted on the fly.
+ */
+async function executeVeo(
+  params: Record<string, unknown>,
+): Promise<ProviderResult> {
+  const modelSlug = String(
+    params.model_name ?? params.model ?? "veo-3.1-generate-preview",
+  );
+  const entry = VEO_MODEL_MAP[modelSlug];
+  if (!entry) {
+    throw new Error(
+      `Unknown Veo model: ${modelSlug}. Available: ${Object.keys(VEO_MODEL_MAP).join(", ")}`,
+    );
+  }
+  const apiKey = loadVeoApiKey();
+
+  const prompt = String(params.prompt ?? "").trim();
+  if (!prompt) {
+    throw new Error("Veo requires a prompt.");
+  }
+
+  // Aspect ratio — Veo 3.1 only accepts "16:9" or "9:16". The shared
+  // workspace dropdown also exposes "Auto", "1:1", and "4:3" for
+  // Kling/Seedance; coerce any unsupported value to the default.
+  const rawAspect = String(params.aspect_ratio ?? params.ratio ?? "16:9");
+  const aspectRatio: VeoAspectRatio = rawAspect === "9:16" ? "9:16" : "16:9";
+
+  // Resolution — only "720p" / "1080p" are accepted by Veo 3.1; "4k"
+  // is gated behind preview access we don't surface to users yet.
+  const rawRes = String(params.resolution ?? "720p");
+  const resolution: VeoResolution = rawRes === "1080p" ? "1080p" : "720p";
+
+  // Duration — discrete "4" | "6" | "8". The slider used for other
+  // providers may hand us numbers — coerce + snap to nearest valid.
+  const rawDuration = params.duration;
+  const durationNum =
+    typeof rawDuration === "number"
+      ? rawDuration
+      : parseInt(String(rawDuration ?? "8"), 10) || 8;
+  const durationSeconds: VeoDuration =
+    durationNum <= 4 ? "4" : durationNum <= 6 ? "6" : "8";
+
+  // personGeneration — optional. Default to allow_adult (the safer
+  // permissive setting) when not specified by the schema.
+  const rawPerson = params.person_generation ?? params.personGeneration;
+  const personGeneration: VeoPersonGeneration =
+    String(rawPerson ?? "allow_adult") === "allow_all"
+      ? "allow_all"
+      : "allow_adult";
+
+  const startFrameUrl = (params.start_frame ?? params.image_url) as
+    | string
+    | undefined;
+  const endFrameUrl = (params.end_frame ?? params.image_tail_url) as
+    | string
+    | undefined;
+  const startFrame = startFrameUrl ? await fetchImageAsInline(startFrameUrl) : undefined;
+  const endFrame = endFrameUrl ? await fetchImageAsInline(endFrameUrl) : undefined;
+
+  const body = buildVeoRequest({
+    prompt,
+    startFrame,
+    endFrame,
+    aspectRatio,
+    resolution,
+    durationSeconds,
+    personGeneration,
+  });
+
+  console.log(
+    `[veo] submit model=${entry.model} duration=${durationSeconds}s ` +
+      `resolution=${resolution} aspect=${aspectRatio} ` +
+      `i2v=${!!startFrameUrl} endFrame=${!!endFrameUrl}`,
+  );
+
+  const operationName = await submitVeoTask(entry.model, body, apiKey);
+
+  return {
+    task_id: operationName,
+    outputs: {
+      output_video: "",
+      output_start_frame: startFrameUrl ?? "",
+      output_end_frame: "",
+    },
+    output_type: "video_url",
+    provider_meta: {
+      provider: "veo",
+      model: modelSlug,
+      provider_model_id: entry.model,
+      tier: entry.tier,
+      duration_seconds: durationSeconds,
+      resolution,
+      aspect_ratio: aspectRatio,
+      has_audio: true, // Veo 3.1 always generates audio
+      is_image2video: !!startFrameUrl,
+      // The frontend uses `poll_endpoint` to drive the per-poll URL.
+      // Veo polls against the operation name (returned in task_id)
+      // appended to the v1beta base — host-whitelist check in the
+      // poll handler matches generativelanguage.googleapis.com.
+      poll_endpoint: VEO_BASE,
     },
   };
 }
@@ -3136,6 +3264,8 @@ async function executeOneStep(
       case "kling_extension":
       case "motion_control":
         return await executeKling(stepParams);
+      case "veo":
+        return await executeVeo(stepParams);
       case "banana":
         return await executeBanana(stepParams, SUPABASE_URL, token);
       case "chat_ai":
@@ -3603,6 +3733,7 @@ function getProviderForNodeType(
   }
   if (nodeType === "klingVideoNode" || nodeType === "videoGenNode") {
     if (m.startsWith("seedance") || m.startsWith("dreamina-seedance")) return "seedance";
+    if (m.startsWith("veo-")) return "veo";
     return "kling";
   }
   if (nodeType === "seedDreamNode") return "seedream";
@@ -3639,7 +3770,7 @@ function workspaceProviderDef(
 ): ProviderDef {
   const p = provider as ProviderKey;
   const output: ProviderDef["output_type"] =
-    p === "kling" || p === "seedance" || p === "merge_audio"
+    p === "kling" || p === "seedance" || p === "veo" || p === "merge_audio"
       ? "video_url"
       : p === "tripo3d" || p === "hyper3d"
         ? "model_3d"
@@ -3653,7 +3784,7 @@ function workspaceProviderDef(
     p === "openai" ? "generate_openai_image" :
     p === "seedream" ? "generate_seedream_image" :
     p === "banana" ? "generate_freepik_image" :
-    p === "kling" || p === "seedance" ? "generate_freepik_video" :
+    p === "kling" || p === "seedance" || p === "veo" ? "generate_freepik_video" :
     p === "remove_bg" ? "remove_background" :
     p === "merge_audio" ? "merge_audio_video" :
     p === "chat_ai" ? "chat_ai" :
@@ -3665,7 +3796,7 @@ function workspaceProviderDef(
     provider: p,
     feature,
     output_type: output,
-    is_async: p === "kling" || p === "seedance" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio",
+    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio",
   };
 }
 
@@ -3689,6 +3820,7 @@ function workspaceMultiplierForProvider(
       return multipliers.image;
     case "kling":
     case "seedance":
+    case "veo":
     case "merge_audio":
       return multipliers.video;
     case "chat_ai":
@@ -6486,6 +6618,113 @@ serve(async (req) => {
       );
     }
 
+    /* ─── Async poll path (Google Veo 3.1 video tasks) ─────────
+     * Veo's REST API is a long-running operation: we POSTed a task
+     * and got back `operations/<id>` (returned to the frontend in
+     * `task_id`). Each poll is a GET against generativelanguage with
+     * the API key. The frontend uses the same polling hook as Kling
+     * /Seedance — we normalise statuses and surface the video URL
+     * once the operation reports `done: true`. */
+    if (body.action === "poll_veo") {
+      const taskId = String(body.task_id ?? "").trim();
+      if (!taskId.startsWith("operations/")) {
+        return new Response(
+          JSON.stringify({ error: "task_id must be a Veo operation name (operations/...)" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      let apiKey: string;
+      try {
+        apiKey = loadVeoApiKey();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({ error: msg }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      let statusObj;
+      try {
+        statusObj = await pollVeoOnce(taskId, apiKey);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({
+            status: "polling_error",
+            message: msg.substring(0, 300),
+          }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+      const isDone = statusObj.done === true;
+      const opError = statusObj.error?.message;
+      const videoUri = extractVeoVideoUri(statusObj);
+      const normalised = !isDone
+        ? "processing"
+        : opError
+          ? "failed"
+          : videoUri
+            ? "succeed"
+            : "failed";
+
+      // Veo's `video.uri` requires the API key as `?key=` to download.
+      // We never want that key exposed to the browser, so on success
+      // we fetch the bytes server-side and re-host into the
+      // `user_assets` Supabase bucket. The frontend gets a 1-year
+      // signed URL — same pattern Google TTS uses for synthesised
+      // audio. The taskId (operations/<id>) gives us a stable,
+      // collision-free path so a second poll after success doesn't
+      // re-upload (upsert: false would 409, which is fine — the
+      // existing object stays usable).
+      let publicUrl = "";
+      if (normalised === "succeed" && videoUri) {
+        try {
+          const downloadUrl = `${videoUri}${videoUri.includes("?") ? "&" : "?"}key=${apiKey}`;
+          const videoRes = await fetch(downloadUrl);
+          if (!videoRes.ok) {
+            throw new Error(`download HTTP ${videoRes.status}`);
+          }
+          const bytes = new Uint8Array(await videoRes.arrayBuffer());
+          const opId = taskId.replace(/^operations\//, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+          const path = `veo-renders/${opId}.mp4`;
+          const upload = await supabase.storage
+            .from("user_assets")
+            .upload(path, bytes, { contentType: "video/mp4", upsert: true });
+          if (upload.error) throw upload.error;
+          const signed = await supabase.storage
+            .from("user_assets")
+            .createSignedUrl(path, 60 * 60 * 24 * 365);
+          if (signed.error || !signed.data?.signedUrl) {
+            throw signed.error ?? new Error("no signed URL");
+          }
+          publicUrl = signed.data.signedUrl;
+        } catch (err) {
+          console.error("[poll_veo] rehost failed:", err);
+          return new Response(
+            JSON.stringify({
+              status: "failed",
+              task_id: taskId,
+              url: "",
+              message: `Veo finished but the video couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
+            }),
+            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+      }
+
+      const message =
+        opError ?? (normalised === "failed" ? "Veo operation failed" : "");
+      return new Response(
+        JSON.stringify({
+          status: normalised,
+          task_id: taskId,
+          url: publicUrl,
+          message,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
     /* ─── Async poll path (Hyper3D / BytePlus Ark 3D tasks) ───
      * Same short-poll pattern as Seedance, but the terminal payload
      * carries a model URL instead of a video URL. */
@@ -7041,6 +7280,9 @@ serve(async (req) => {
         break;
       case "seedance":
         result = await executeSeedance(params);
+        break;
+      case "veo":
+        result = await executeVeo(params);
         break;
       case "seedream":
         result = await executeSeedream(params);

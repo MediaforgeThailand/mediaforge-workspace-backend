@@ -22,6 +22,7 @@ export class PricingConfigError extends Error {
 export type ProviderKey =
   | "kling"
   | "seedance"
+  | "veo"
   | "banana"
   | "openai"
   | "seedream"
