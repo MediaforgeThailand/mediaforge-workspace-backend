@@ -162,6 +162,52 @@ function firstUrl(...values: Array<unknown>): string | null {
   return null;
 }
 
+function normalizeBrandShortName(value: unknown): string | null {
+  const shortName = asString(value).toUpperCase();
+  if (!shortName) return null;
+  if (shortName.length < 2 || shortName.length > 8) {
+    throw new Error("short name must be 2-8 characters");
+  }
+  return shortName;
+}
+
+function normalizeBrandColor(value: unknown): string | null {
+  const color = asString(value);
+  if (!color) return null;
+  if (!/^#[0-9a-f]{3}(?:[0-9a-f]{3})?(?:[0-9a-f]{2})?$/i.test(color)) {
+    throw new Error("brand color must be a valid hex color");
+  }
+  return color.toUpperCase();
+}
+
+function logoExtension(contentType: string, filename: string): string {
+  const lowerName = filename.toLowerCase();
+  if (contentType === "image/svg+xml" || lowerName.endsWith(".svg")) return "svg";
+  if (contentType === "image/webp" || lowerName.endsWith(".webp")) return "webp";
+  if (contentType === "image/jpeg" || lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")) return "jpg";
+  return "png";
+}
+
+function decodeDataUrlImage(dataUrl: string): { bytes: Uint8Array; contentType: string } {
+  const match = dataUrl.match(/^data:(image\/(?:png|jpeg|jpg|webp|svg\+xml));base64,([A-Za-z0-9+/=]+)$/);
+  if (!match) throw new Error("logo file must be PNG, JPG, SVG, or WEBP");
+  const contentType = match[1] === "image/jpg" ? "image/jpeg" : match[1];
+  const binary = atob(match[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  if (bytes.byteLength > 2 * 1024 * 1024) throw new Error("logo file must be 2 MB or smaller");
+  return { bytes, contentType };
+}
+
+function normalizeHostname(value: unknown): string {
+  const host = asString(value).toLowerCase();
+  if (!host) throw new Error("hostname is required");
+  if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/.test(host)) {
+    throw new Error("hostname must be a valid DNS name");
+  }
+  return host;
+}
+
 async function resolvePaymentReceipt(client: SupabaseClient, stripe: Stripe, payment: any) {
   if (!payment?.id) return payment;
 
@@ -973,6 +1019,167 @@ async function getOrgReceipt(client: SupabaseClient, user: User, body: Record<st
   };
 }
 
+async function readBrandingDomains(client: SupabaseClient, orgId: string) {
+  const { data, error } = await client
+    .from("org_domains")
+    .select("id,org_id,hostname,is_primary,created_at,updated_at")
+    .eq("org_id", orgId)
+    .order("is_primary", { ascending: false })
+    .order("created_at", { ascending: true });
+  if (error) {
+    console.warn("[workspace_org_console] branding domain read failed:", error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
+async function getOrgBranding(client: SupabaseClient, user: User) {
+  const ctx = await orgAdminContext(client, user);
+  if (!ctx) throw new Error("org_admin_required");
+
+  const { data: org, error } = await client
+    .from("organizations")
+    .select("id,name,display_name,slug,type,status,logo_url,brand_color,settings,updated_at")
+    .eq("id", ctx.organization_id)
+    .single();
+  if (error || !org) throw new Error(`organization lookup failed: ${error?.message ?? "not found"}`);
+
+  const settings = ((org as any).settings && typeof (org as any).settings === "object")
+    ? (org as any).settings
+    : {};
+  const shortName = asString((settings as any).display_name_short ?? (settings as any).brand_short_name);
+
+  return {
+    data: {
+      org: { ...(org as any), display_name_short: shortName || null },
+      domains: await readBrandingDomains(client, ctx.organization_id),
+    },
+  };
+}
+
+async function saveOrgBranding(client: SupabaseClient, user: User, body: Record<string, unknown>) {
+  const ctx = await orgAdminContext(client, user);
+  if (!ctx) throw new Error("org_admin_required");
+
+  const { data: org, error: orgError } = await client
+    .from("organizations")
+    .select("id,settings")
+    .eq("id", ctx.organization_id)
+    .single();
+  if (orgError || !org) throw new Error(`organization lookup failed: ${orgError?.message ?? "not found"}`);
+
+  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  const settings = ((org as any).settings && typeof (org as any).settings === "object")
+    ? { ...((org as any).settings as Record<string, unknown>) }
+    : {};
+
+  if (Object.prototype.hasOwnProperty.call(body, "display_name_short")) {
+    const shortName = normalizeBrandShortName(body.display_name_short);
+    if (shortName) {
+      settings.display_name_short = shortName;
+      settings.brand_short_name = shortName;
+    } else {
+      delete settings.display_name_short;
+      delete settings.brand_short_name;
+    }
+    updates.settings = settings;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, "brand_color")) {
+    updates.brand_color = normalizeBrandColor(body.brand_color);
+  }
+
+  const logoDataUrl = asString(body.logo_data_url);
+  if (logoDataUrl) {
+    const { bytes, contentType } = decodeDataUrlImage(logoDataUrl);
+    const ext = logoExtension(contentType, asString(body.logo_filename, `logo.${contentType.split("/")[1]}`));
+    const path = `${ctx.organization_id}/logo.${ext}`;
+    const { error: uploadError } = await client.storage
+      .from("org-branding")
+      .upload(path, bytes, { contentType, upsert: true });
+    if (uploadError) throw new Error(`logo upload failed: ${uploadError.message}`);
+
+    const { data: publicUrl } = client.storage.from("org-branding").getPublicUrl(path);
+    updates.logo_url = `${publicUrl.publicUrl}?v=${Date.now()}`;
+  }
+
+  if (Object.keys(updates).length === 1) throw new Error("no branding updates provided");
+
+  const { data: updated, error } = await client
+    .from("organizations")
+    .update(updates)
+    .eq("id", ctx.organization_id)
+    .select("id,name,display_name,slug,type,status,logo_url,brand_color,settings,updated_at")
+    .single();
+  if (error) throw new Error(`branding save failed: ${error.message}`);
+
+  return {
+    data: {
+      org: {
+        ...(updated as any),
+        display_name_short: asString((updated as any)?.settings?.display_name_short ?? (updated as any)?.settings?.brand_short_name) || null,
+      },
+      domains: await readBrandingDomains(client, ctx.organization_id),
+    },
+  };
+}
+
+async function addBrandingDomain(client: SupabaseClient, user: User, body: Record<string, unknown>) {
+  const ctx = await orgAdminContext(client, user);
+  if (!ctx) throw new Error("org_admin_required");
+  const hostname = normalizeHostname(body.hostname);
+  const domains = await readBrandingDomains(client, ctx.organization_id);
+  const isPrimary = asBool(body.is_primary, domains.length === 0);
+
+  if (isPrimary) {
+    await client.from("org_domains").update({ is_primary: false }).eq("org_id", ctx.organization_id);
+  }
+
+  const { data, error } = await client
+    .from("org_domains")
+    .upsert(
+      { org_id: ctx.organization_id, hostname, is_primary: isPrimary },
+      { onConflict: "hostname" },
+    )
+    .select("id,org_id,hostname,is_primary,created_at,updated_at")
+    .single();
+  if (error) throw new Error(`domain save failed: ${error.message}`);
+  return { data: { domain: data, domains: await readBrandingDomains(client, ctx.organization_id) } };
+}
+
+async function setPrimaryBrandingDomain(client: SupabaseClient, user: User, body: Record<string, unknown>) {
+  const ctx = await orgAdminContext(client, user);
+  if (!ctx) throw new Error("org_admin_required");
+  const domainId = asString(body.domain_id);
+  if (!domainId) throw new Error("domain_id is required");
+
+  await client.from("org_domains").update({ is_primary: false }).eq("org_id", ctx.organization_id);
+  const { data, error } = await client
+    .from("org_domains")
+    .update({ is_primary: true })
+    .eq("id", domainId)
+    .eq("org_id", ctx.organization_id)
+    .select("id,org_id,hostname,is_primary,created_at,updated_at")
+    .single();
+  if (error) throw new Error(`primary domain update failed: ${error.message}`);
+  return { data: { domain: data, domains: await readBrandingDomains(client, ctx.organization_id) } };
+}
+
+async function removeBrandingDomain(client: SupabaseClient, user: User, body: Record<string, unknown>) {
+  const ctx = await orgAdminContext(client, user);
+  if (!ctx) throw new Error("org_admin_required");
+  const domainId = asString(body.domain_id);
+  if (!domainId) throw new Error("domain_id is required");
+
+  const { error } = await client
+    .from("org_domains")
+    .delete()
+    .eq("id", domainId)
+    .eq("org_id", ctx.organization_id);
+  if (error) throw new Error(`domain remove failed: ${error.message}`);
+  return { data: { ok: true, domains: await readBrandingDomains(client, ctx.organization_id) } };
+}
+
 const ACTIONS: Record<string, (client: SupabaseClient, user: User, body: Record<string, unknown>) => Promise<unknown>> = {
   get_team_status: getTeamStatus,
   create_console_login_link: createConsoleLoginLink,
@@ -987,6 +1194,11 @@ const ACTIONS: Record<string, (client: SupabaseClient, user: User, body: Record<
   delete_team: deleteTeam,
   get_org_payment_status: getOrgPaymentStatus,
   get_org_receipt: getOrgReceipt,
+  get_org_branding: getOrgBranding,
+  save_org_branding: saveOrgBranding,
+  add_branding_domain: addBrandingDomain,
+  set_primary_branding_domain: setPrimaryBrandingDomain,
+  remove_branding_domain: removeBrandingDomain,
 };
 
 Deno.serve(async (req) => {
