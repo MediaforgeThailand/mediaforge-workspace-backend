@@ -307,6 +307,7 @@ async function buildSchoolOverview(req: Request, requestedOrgId?: string | null)
       a.from("classes")
         .select("id, organization_id, name, code, description, term, year, status, max_students, primary_instructor_id, credit_policy, credit_amount, credit_pool, credit_pool_consumed, start_date, end_date, settings, created_at")
         .eq("organization_id", activeOrgId)
+        .neq("status", "ended")
         .is("deleted_at", null)
         .order("created_at", { ascending: false }),
     [],);
@@ -316,6 +317,7 @@ async function buildSchoolOverview(req: Request, requestedOrgId?: string | null)
         .select("id, organization_id, name, code, description, term, year, status, max_students, primary_instructor_id, credit_policy, credit_amount, credit_pool, credit_pool_consumed, start_date, end_date, settings, created_at")
         .eq("organization_id", activeOrgId)
         .in("id", teacherClassIds)
+        .neq("status", "ended")
         .is("deleted_at", null)
         .order("created_at", { ascending: false }),
     [],);
@@ -1128,6 +1130,7 @@ Deno.serve(async (req) => {
                   "credit_policy, credit_amount, credit_pool, credit_pool_consumed, " +
                   "start_date, end_date, created_at")
           .eq("organization_id", orgId)
+          .neq("status", "ended")
           .is("deleted_at", null)
           .order("created_at", { ascending: false });
         if (error) return json({ error: error.message }, 500);
