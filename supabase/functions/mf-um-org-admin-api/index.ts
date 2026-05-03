@@ -1701,7 +1701,7 @@ Deno.serve(async (req) => {
         if (auth instanceof Response) return auth;
         const { data } = await admin()
           .from("class_enrollment_codes")
-          .select("id, code, max_uses, uses_count, expires_at, description, created_at")
+          .select("id, code, max_uses, uses_count, expires_at, created_at")
           .eq("class_id", classId).is("revoked_at", null)
           .order("created_at", { ascending: false });
         return json({ codes: data ?? [] });
@@ -1727,7 +1727,6 @@ Deno.serve(async (req) => {
             code,
             max_uses,
             expires_at: body?.expires_at ?? null,
-            description: body?.description ?? null,
             created_by: auth.userId,
           })
           .select().single();
