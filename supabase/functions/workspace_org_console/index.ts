@@ -30,6 +30,8 @@ const CORS_HEADERS = {
 const ORG_TOPUP_RATIO_THB_TO_CREDITS = 50;
 const MIN_ORG_TOPUP_THB = 500;
 const MAX_ORG_TOPUP_THB = 100_000;
+const TEAM_SEAT_PRICE_USD = 10;
+const TEAM_SEAT_PRICE_THB = 290;
 const PAYMENT_SELECT = [
   "id",
   "user_id",
@@ -594,7 +596,8 @@ async function getOverview(client: SupabaseClient, user: User) {
         generation_credits_total: generations.reduce((sum: number, generation: any) => sum + Number(generation.credits_spent ?? 0), 0),
         generation_credits_30d: recentGenerations.reduce((sum: number, generation: any) => sum + Number(generation.credits_spent ?? 0), 0),
       },
-      seat_price_usd: 5,
+      seat_price_usd: TEAM_SEAT_PRICE_USD,
+      seat_price_thb: TEAM_SEAT_PRICE_THB,
       org_topup_ratio_thb_to_credits: ORG_TOPUP_RATIO_THB_TO_CREDITS,
     },
   };
