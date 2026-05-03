@@ -1584,6 +1584,14 @@ Deno.serve(async (req) => {
           }
         }
 
+        const spaces = await listEducationSpacesForClass(classId);
+        const spacesByUser = new Map<string, any[]>();
+        for (const space of spaces) {
+          const userSpaces = spacesByUser.get(space.user_id) ?? [];
+          userSpaces.push(space);
+          spacesByUser.set(space.user_id, userSpaces);
+        }
+
         const enriched = (m ?? []).map((row: any) => ({
           ...row,
           display_name: profilesMap.get(row.user_id)?.display_name ?? null,
@@ -1591,6 +1599,7 @@ Deno.serve(async (req) => {
           email: usersById.get(row.user_id)?.email ?? null,
           last_activity_at: lastActivity.get(row.user_id) ?? null,
           model_uses_30d: useCount.get(row.user_id) ?? 0,
+          spaces: spacesByUser.get(row.user_id) ?? [],
         }));
         return json({ members: enriched });
       }
@@ -1788,6 +1797,48 @@ Deno.serve(async (req) => {
     }
 
     // ─── /classes/:cid/members/:userId (PATCH / DELETE) ──────────────
+    if (segments[0] === "classes" && segments[2] === "members"
+        && segments[4] === "space" && segments.length === 5) {
+      const classId = segments[1];
+      const userId = segments[3];
+      if (method === "POST") {
+        const { data: cls } = await admin()
+          .from("classes").select("organization_id").eq("id", classId).maybeSingle();
+        if (!cls) return json({ error: "class_not_found" }, 404);
+        const auth = await requireClassWriter(req, classId);
+        if (auth instanceof Response) return auth;
+
+        const { data: member } = await admin()
+          .from("class_members")
+          .select("student_code")
+          .eq("class_id", classId)
+          .eq("user_id", userId)
+          .eq("role", "student")
+          .eq("status", "active")
+          .maybeSingle();
+        if (!member) return json({ error: "student_membership_not_found" }, 404);
+
+        const initialCredits = Number(body?.initial_credits ?? body?.credit_amount ?? 0);
+        if (!Number.isInteger(initialCredits) || initialCredits < 0) {
+          return json({ error: "initial_credits_must_be_nonnegative_integer" }, 400);
+        }
+
+        const spaceRes = await admin().rpc("ensure_education_student_space", {
+          p_class_id: classId,
+          p_user_id: userId,
+          p_student_code: (member as any).student_code ?? null,
+          p_credit_amount: initialCredits,
+          p_actor_id: auth.userId,
+          p_reason: String(body?.reason ?? "teacher_center_create_student_space"),
+        });
+        if (spaceRes.error) return json({ error: spaceRes.error.message }, 400);
+        return json({
+          space: spaceRes.data,
+          new_balance: Number((spaceRes.data as any)?.starting_balance ?? 0),
+        }, 201);
+      }
+    }
+
     if (segments[0] === "classes" && segments[2] === "members" && segments.length === 4) {
       const classId = segments[1];
       const userId = segments[3];

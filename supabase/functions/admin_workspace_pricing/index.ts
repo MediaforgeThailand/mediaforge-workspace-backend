@@ -452,6 +452,7 @@ async function setPricingBuffer(
 async function getWorkspaceCreditBalance(
   client: SupabaseClient,
   authHeader: string | null,
+  body: Record<string, unknown> = {},
 ): Promise<{
   data: {
     balance: number;
@@ -466,6 +467,7 @@ async function getWorkspaceCreditBalance(
     credit_scope?: "user" | "organization" | "team" | "education_space";
     team_id?: string | null;
     team_name?: string | null;
+    workspace_id?: string | null;
     personal_balance?: number;
     personal_total_purchased?: number;
     personal_total_used?: number;
@@ -501,6 +503,69 @@ async function getWorkspaceCreditBalance(
   const personalBalance = Number((personalCredits as { balance?: number } | null)?.balance ?? 0);
   const personalTotalPurchased = Number((personalCredits as { total_purchased?: number } | null)?.total_purchased ?? 0);
   const personalTotalUsed = Number((personalCredits as { total_used?: number } | null)?.total_used ?? 0);
+  const requestedWorkspaceId = String(body.workspace_id ?? body.space_id ?? "").trim();
+
+  if (requestedWorkspaceId) {
+    try {
+      const { data: space, error: spaceError } = await client
+        .from("education_student_spaces")
+        .select(`
+          workspace_id,
+          class_id,
+          user_id,
+          status,
+          credits_balance,
+          credits_lifetime_received,
+          credits_lifetime_used,
+          classes:class_id (
+            id,
+            name,
+            code,
+            organization_id,
+            organizations:organization_id (id, name, display_name, type)
+          )
+        `)
+        .eq("workspace_id", requestedWorkspaceId)
+        .eq("user_id", authData.user.id)
+        .maybeSingle();
+      if (spaceError) throw spaceError;
+      if (space?.workspace_id) {
+        const cls = Array.isArray((space as any).classes) ? (space as any).classes[0] : (space as any).classes;
+        const org = Array.isArray(cls?.organizations) ? cls.organizations[0] : cls?.organizations;
+        const educationBalance = Number((space as any).credits_balance ?? 0);
+        const educationReceived = Number((space as any).credits_lifetime_received ?? educationBalance);
+        const educationUsed = Number((space as any).credits_lifetime_used ?? 0);
+        return {
+          data: {
+            balance: educationBalance,
+            total_purchased: educationReceived,
+            total_used: educationUsed,
+            is_shared_pool: true,
+            pool_domain: cls?.code ? String(cls.code) : null,
+            pool_user_id: null,
+            organization_id: org?.id ? String(org.id) : cls?.organization_id ? String(cls.organization_id) : null,
+            organization_name: org?.display_name ? String(org.display_name) : org?.name ? String(org.name) : null,
+            organization_type: org?.type ? String(org.type) : null,
+            credit_scope: "education_space",
+            team_id: cls?.id ? String(cls.id) : null,
+            team_name: cls?.name ? String(cls.name) : null,
+            workspace_id: requestedWorkspaceId,
+            personal_balance: personalBalance,
+            personal_total_purchased: personalTotalPurchased,
+            personal_total_used: personalTotalUsed,
+            shared_balance: educationBalance,
+            shared_total: educationReceived,
+            shared_used: educationUsed,
+          },
+        };
+      }
+    } catch (err) {
+      console.warn(
+        "admin_workspace_pricing: workspace education credit lookup skipped:",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
 
   try {
     const { data: eduScope, error: eduError } = await client.rpc("workspace_education_credit_scope", {
@@ -1225,7 +1290,7 @@ Deno.serve(async (req: Request) => {
         return json(await getPricingBuffer(admin));
 
       case "get_workspace_credit_balance":
-        return json(await getWorkspaceCreditBalance(admin, req.headers.get("authorization")));
+        return json(await getWorkspaceCreditBalance(admin, req.headers.get("authorization"), body));
 
       case "get_pricing_catalog": {
         const buffer = await getPricingBuffer(admin);
