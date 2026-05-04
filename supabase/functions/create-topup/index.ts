@@ -8,6 +8,42 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
+type CheckoutPaymentMethod = "promptpay" | "card" | "auto";
+
+function normalizePaymentMethod(value: unknown): CheckoutPaymentMethod {
+  return value === "promptpay" || value === "card" ? value : "auto";
+}
+
+function paymentMethodTypes(method: CheckoutPaymentMethod): Array<"promptpay" | "card"> {
+  if (method === "card") return ["card"];
+  if (method === "auto") return ["promptpay", "card"];
+  return ["promptpay"];
+}
+
+function promptPayQrPayload(intent: Stripe.PaymentIntent) {
+  const qr = intent.next_action?.promptpay_display_qr_code;
+  return {
+    qrCodeSvgUrl: qr?.image_url_svg ?? null,
+    qrCodePngUrl: qr?.image_url_png ?? null,
+    expiresAt: qr?.expires_at ?? null,
+  };
+}
+
+async function confirmPromptPayIntent(
+  stripe: Stripe,
+  paymentIntentId: string,
+  email: string,
+  returnUrl: string,
+) {
+  return await stripe.paymentIntents.confirm(paymentIntentId, {
+    payment_method_data: {
+      type: "promptpay",
+      billing_details: { email },
+    },
+    return_url: returnUrl,
+  });
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -31,7 +67,8 @@ serve(async (req) => {
     const user = data.user;
     if (!user?.email) throw new Error("User not authenticated");
 
-    const { packageId, embedded = false, intent = false } = await req.json();
+    const { packageId, embedded = false, intent = false, paymentMethod: rawPaymentMethod } = await req.json();
+    const paymentMethod = normalizePaymentMethod(rawPaymentMethod);
     if (!packageId || typeof packageId !== "string") throw new Error("Missing packageId");
 
     // Fetch top-up package
@@ -115,15 +152,44 @@ serve(async (req) => {
       }
 
       const amountSatang = Math.round(Number(pkg.price_thb) * 100);
+      const piMetadata = {
+        user_id: user.id,
+        topup_package_id: pkg.id,
+        credits: pkg.credits.toString(),
+        type: "promptpay_topup",
+        package_name: pkg.name,
+        amount_thb: String(pkg.price_thb),
+      };
       const pi = await stripe.paymentIntents.create({
         amount: amountSatang,
         currency: "thb",
         customer: customerId,
-        payment_method_types: ["promptpay", "card"],
-        metadata,
+        payment_method_types: paymentMethodTypes(paymentMethod),
+        metadata: piMetadata,
       });
 
       console.log(`[CREATE-TOPUP] PaymentIntent created ${pi.id} for ${pkg.name}`);
+
+      if (paymentMethod === "promptpay") {
+        const origin = req.headers.get("origin") || "https://workspace.mediaforge.co";
+        const confirmed = await confirmPromptPayIntent(
+          stripe,
+          pi.id,
+          user.email,
+          `${origin}/app/pricing?topup=success`,
+        );
+        return new Response(
+          JSON.stringify({
+            clientSecret: confirmed.client_secret,
+            paymentIntentId: confirmed.id,
+            amount: amountSatang,
+            currency: "thb",
+            paymentMethod: "promptpay",
+            ...promptPayQrPayload(confirmed),
+          }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
 
       return new Response(
         JSON.stringify({
@@ -131,25 +197,45 @@ serve(async (req) => {
           paymentIntentId: pi.id,
           amount: amountSatang,
           currency: "thb",
+          paymentMethod,
         }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
       );
     }
 
+    const origin = req.headers.get("origin") || "https://workspace.mediaforge.co";
+    const amountSatang = Math.round(Number(pkg.price_thb) * 100);
+    if (!Number.isFinite(amountSatang) || amountSatang <= 0) {
+      return new Response(JSON.stringify({ error: "Top-up package misconfigured (invalid price)" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
     const sessionParams: any = {
       customer: customerId || undefined,
       customer_email: customerId ? undefined : user.email,
-      line_items: [{ price: pkg.stripe_price_id, quantity: 1 }],
+      line_items: [
+        {
+          price_data: {
+            currency: "thb",
+            product_data: {
+              name: `MediaForge ${pkg.name}`,
+              description: `${Number(pkg.credits).toLocaleString()} credits`,
+            },
+            unit_amount: amountSatang,
+          },
+          quantity: 1,
+        },
+      ],
       mode: "payment",
+      payment_method_types: paymentMethodTypes(paymentMethod),
       metadata,
     };
 
     if (embedded) {
       sessionParams.ui_mode = "embedded";
-      sessionParams.return_url = `${req.headers.get("origin")}/app/pricing?topup=success`;
+      sessionParams.return_url = `${origin}/app/pricing?topup=success`;
     } else {
-      sessionParams.success_url = `${req.headers.get("origin")}/app/pricing?topup=success`;
-      sessionParams.cancel_url = `${req.headers.get("origin")}/app/pricing?topup=cancelled`;
+      sessionParams.success_url = `${origin}/app/pricing?topup=success`;
+      sessionParams.cancel_url = `${origin}/app/pricing?topup=cancelled`;
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);

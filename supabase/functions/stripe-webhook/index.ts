@@ -8,6 +8,16 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
+const TEAM_SEAT_PRICE_THB = 1600;
+const TEAM_SEAT_PLATFORM_FEE_THB = 300;
+const WORKSPACE_CREDITS_PER_THB = 50;
+const TEAM_BASE_CREDITS_PER_SEAT_MONTH =
+  (TEAM_SEAT_PRICE_THB - TEAM_SEAT_PLATFORM_FEE_THB) * WORKSPACE_CREDITS_PER_THB;
+const TEAM_PROMO_CREDITS_PER_SEAT_MONTH = 25_000;
+const TEAM_MIN_SEATS = 2;
+const TEAM_MAX_SEATS = 500;
+const TEAM_ANNUAL_DISCOUNT = 0.2;
+
 // ─── Commission helpers ───
 async function computeCycleIndex(
   sb: ReturnType<typeof createClient>,
@@ -833,6 +843,95 @@ serve(async (req) => {
     if (event.type === "payment_intent.succeeded") {
       const intent = event.data.object as Stripe.PaymentIntent;
       const intentType = intent.metadata?.type;
+      const isTeamSeatPurchase = intentType === "team_seat_purchase";
+
+      if (isTeamSeatPurchase) {
+        const userId = intent.metadata?.user_id;
+        const seatCount = parseInt(intent.metadata?.seat_count ?? "", 10);
+        const billingCycle = intent.metadata?.billing_cycle === "annual" ? "annual" : "monthly";
+        const cycleMonths = billingCycle === "annual" ? 12 : 1;
+
+        if (!userId || !Number.isFinite(seatCount) || seatCount < TEAM_MIN_SEATS || seatCount > TEAM_MAX_SEATS) {
+          console.error("[STRIPE-WEBHOOK] team_seat_purchase invalid metadata", {
+            payment_intent: intent.id,
+            user_id: userId,
+            seat_count: intent.metadata?.seat_count,
+          });
+          throw new Error("Invalid team seat metadata");
+        }
+
+        const grossThb = seatCount * TEAM_SEAT_PRICE_THB * cycleMonths;
+        const expectedAmountThb = billingCycle === "annual"
+          ? Math.round(grossThb * (1 - TEAM_ANNUAL_DISCOUNT))
+          : grossThb;
+        const paidAmountThb = Math.round((intent.amount ?? 0) / 100);
+        if (paidAmountThb !== expectedAmountThb) {
+          console.error("[STRIPE-WEBHOOK] team_seat_purchase amount mismatch", {
+            payment_intent: intent.id,
+            paidAmountThb,
+            expectedAmountThb,
+            seatCount,
+            billingCycle,
+          });
+          throw new Error("Invalid team seat amount");
+        }
+
+        const baseCredits = seatCount * TEAM_BASE_CREDITS_PER_SEAT_MONTH * cycleMonths;
+        const promoCredits = seatCount * TEAM_PROMO_CREDITS_PER_SEAT_MONTH * cycleMonths;
+        const totalCredits = baseCredits + promoCredits;
+
+        const { data: activation, error: activationError } = await supabase.rpc("activate_team_seat_purchase", {
+          p_user_id: userId,
+          p_buyer_email: intent.metadata?.buyer_email ?? null,
+          p_buyer_name: intent.metadata?.buyer_name ?? null,
+          p_payment_intent_id: intent.id,
+          p_seat_count: seatCount,
+          p_billing_cycle: billingCycle,
+          p_amount_thb: paidAmountThb,
+          p_base_credits: baseCredits,
+          p_promo_credits: promoCredits,
+          p_total_credits: totalCredits,
+        });
+
+        if (activationError) {
+          console.error("[STRIPE-WEBHOOK] team_seat_purchase activation failed:", activationError);
+          throw new Error(`Team activation failed: ${activationError.message}`);
+        }
+
+        const organizationId = (activation as any)?.organization_id ?? null;
+        if (organizationId) {
+          const receiptFields = receiptFieldsFromIntent(intent);
+          if (Object.keys(receiptFields).length > 0) {
+            await supabase
+              .from("payment_transactions")
+              .update(receiptFields)
+              .eq("stripe_payment_intent_id", intent.id)
+              .eq("organization_id", organizationId);
+          }
+        }
+
+        try {
+          const { email, first_name } = await getUserEmailAndName(supabase, userId);
+          if (email) {
+            await sendTransactionalEmail("payment_receipt", email, {
+              first_name,
+              invoice_number: intent.id,
+              payment_date: fmtDateTH(new Date()),
+              package_name: `Team seats (${seatCount} seats, ${billingCycle})`,
+              credits_added: fmtNum(totalCredits),
+              amount_thb: fmtNum(paidAmountThb),
+              transactions_url: "https://workspace.mediaforge.co/app/settings?tab=team",
+            });
+          }
+        } catch (e) {
+          console.warn("[STRIPE-WEBHOOK] team_seat_purchase receipt email failed:", e);
+        }
+
+        console.log(`[STRIPE-WEBHOOK] team_seat_purchase success: org=${organizationId}, seats=${seatCount}, credits=${totalCredits}`);
+        return new Response(JSON.stringify({ received: true, team: activation }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
 
       // ─── SUBSCRIPTION ONE-OFF (mode=payment plan purchase) ───
       if (intentType === "subscription_oneoff") {
@@ -1140,7 +1239,7 @@ serve(async (req) => {
         }
       }
 
-      if (intentType === "promptpay_topup") {
+      if (intentType === "promptpay_topup" || intentType === "topup") {
         const userId = intent.metadata.user_id;
         const creditsToAdd = parseInt(intent.metadata.credits || "0", 10);
         const topupPackageId = intent.metadata.topup_package_id;
@@ -1200,7 +1299,7 @@ serve(async (req) => {
           amount_thb: amountThb,
           credits_added: creditsToAdd,
           status: "completed",
-          payment_method: "promptpay",
+          payment_method: intent.payment_method_types?.[0] || "stripe",
         });
 
         console.log(`[STRIPE-WEBHOOK] PromptPay success: +${creditsToAdd} for ${userId}`);

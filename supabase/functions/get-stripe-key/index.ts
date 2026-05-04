@@ -12,9 +12,16 @@ serve(async (req) => {
   const user = await getAuthUser(req);
   if (!user) return unauthorized();
 
-  const publishableKey = Deno.env.get("STRIPE_PUBLISHABLE_KEY");
+  const publishableKey =
+    Deno.env.get("STRIPE_PUBLISHABLE_KEY") ||
+    Deno.env.get("STRIPE_PUBLIC_KEY") ||
+    Deno.env.get("VITE_STRIPE_PUBLISHABLE_KEY") ||
+    Deno.env.get("NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY");
   if (!publishableKey) {
-    return new Response(JSON.stringify({ error: "Stripe not configured" }), {
+    return new Response(JSON.stringify({
+      error: "card_payment_not_configured",
+      message: "Card payment is not configured yet. PromptPay QR can still be created server-side.",
+    }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
