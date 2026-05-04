@@ -1461,14 +1461,6 @@ async function executeVeo(
   const durationSeconds: VeoDuration =
     durationNum <= 4 ? 4 : durationNum <= 6 ? 6 : 8;
 
-  // personGeneration — optional. Default to allow_adult (the safer
-  // permissive setting) when not specified by the schema.
-  const rawPerson = params.person_generation ?? params.personGeneration;
-  const personGeneration: VeoPersonGeneration =
-    String(rawPerson ?? "allow_adult") === "allow_all"
-      ? "allow_all"
-      : "allow_adult";
-
   const startFrameUrl = (params.start_frame ?? params.image_url) as
     | string
     | undefined;
@@ -1477,6 +1469,15 @@ async function executeVeo(
     | undefined;
   const startFrame = startFrameUrl ? await fetchImageAsInline(startFrameUrl) : undefined;
   const endFrame = endFrameUrl ? await fetchImageAsInline(endFrameUrl) : undefined;
+  const hasFrameInput = Boolean(startFrame || endFrame);
+
+  // Veo 3.1 accepts different personGeneration values by mode:
+  // text-to-video only supports allow_all, while image-to-video /
+  // interpolation only supports allow_adult. The shared UI stores a
+  // single default, so enforce the valid API value here.
+  const personGeneration: VeoPersonGeneration = hasFrameInput
+    ? "allow_adult"
+    : "allow_all";
 
   const requestParams = {
     prompt,
@@ -1492,7 +1493,7 @@ async function executeVeo(
   console.log(
     `[veo] submit model=${entry.model} duration=${durationSeconds}s ` +
       `resolution=${resolution} aspect=${aspectRatio} ` +
-      `i2v=${!!startFrameUrl} endFrame=${!!endFrameUrl}`,
+      `i2v=${hasFrameInput} endFrame=${!!endFrameUrl} personGeneration=${personGeneration}`,
   );
 
   let operationName: string;
@@ -4982,6 +4983,7 @@ interface WorkspaceRunBody {
     | "run_workspace_job_worker"
     | "poll_kling"
     | "poll_seedance"
+    | "poll_veo"
     | "poll_hyper3d"
     | "poll_tripo3d"
     | "mirror_tripo_url"
@@ -5199,6 +5201,8 @@ async function pollWorkspaceAsyncResult(args: {
         ? "poll_hyper3d"
       : provider === "seedance"
         ? "poll_seedance"
+      : provider === "veo"
+        ? "poll_veo"
         : "poll_kling";
   const intervalMs = provider === "tripo3d" ? 4_000 : provider === "hyper3d" ? 6_000 : 5_000;
   const successStatuses = new Set([
@@ -5293,6 +5297,8 @@ async function pollWorkspaceAsyncResultOnce(args: {
         ? "poll_hyper3d"
       : provider === "seedance"
         ? "poll_seedance"
+      : provider === "veo"
+        ? "poll_veo"
         : "poll_kling";
 
   const pollResp = await invokeWorkspaceRunOnce({
