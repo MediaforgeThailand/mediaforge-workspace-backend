@@ -25,8 +25,8 @@
  * https://ai.google.dev/gemini-api/docs/video, May 2026):
  *
  *   instances[].prompt            string (required, up to 1024 tokens)
- *   instances[].image             { inlineData: { mimeType, data } } — optional start frame
- *   instances[].lastFrame         { inlineData: { mimeType, data } } — optional end frame
+ *   instances[].image             { bytesBase64Encoded, mimeType } — optional start frame
+ *   instances[].lastFrame         { bytesBase64Encoded, mimeType } — optional end frame
  *   instances[].referenceImages   array — up to 3, NOT compatible with 9:16
  *   parameters.aspectRatio        "16:9" | "9:16"        (default 16:9)
  *   parameters.durationSeconds    "4" | "6" | "8"        (default "8";
@@ -75,7 +75,7 @@ export interface VeoSubmitParams {
   personGeneration?: VeoPersonGeneration;
 }
 
-export type VeoImageEncoding = "inlineData" | "imageBytes";
+export type VeoImageEncoding = "bytesBase64Encoded" | "inlineData";
 
 interface VeoOperationName {
   /** "operations/abc123…" */
@@ -129,15 +129,15 @@ export async function fetchImageAsInline(url: string): Promise<VeoImage> {
  *  silently coerce duration to "8" when the resolution forces it,
  *  because the API otherwise responds with an opaque 400. */
 function veoImagePayload(image: VeoImage, encoding: VeoImageEncoding): Record<string, unknown> {
-  if (encoding === "imageBytes") {
-    return { imageBytes: image.data, mimeType: image.mimeType };
+  if (encoding === "bytesBase64Encoded") {
+    return { bytesBase64Encoded: image.data, mimeType: image.mimeType };
   }
   return { inlineData: image };
 }
 
 export function buildVeoRequest(
   p: VeoSubmitParams,
-  imageEncoding: VeoImageEncoding = "inlineData",
+  imageEncoding: VeoImageEncoding = "bytesBase64Encoded",
 ): Record<string, unknown> {
   let duration = p.durationSeconds ?? "8";
   if ((p.resolution === "1080p") && duration !== "8") {

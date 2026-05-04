@@ -1417,9 +1417,9 @@ async function executeSeedance(
  * the operation reports `done: true`. Audio is always generated
  * (Veo 3.1 spec) — no toggle.
  *
- * Veo's REST API only accepts inline base64 image bytes for
- * start/end frames, so any upstream URL (image gen output, uploaded
- * asset) is fetched here and converted on the fly.
+ * Veo's video endpoint accepts embedded base64 bytes for start/end
+ * frames, so any upstream URL (image gen output, uploaded asset) is
+ * fetched here and converted on the fly.
  */
 async function executeVeo(
   params: Record<string, unknown>,
@@ -1500,12 +1500,12 @@ async function executeVeo(
     operationName = await submitVeoTask(entry.model, body, apiKey);
   } catch (err) {
     const firstMessage = err instanceof Error ? err.message : String(err);
-    if ((startFrame || endFrame) && firstMessage.includes("`inlineData` isn't supported")) {
-      console.warn("[veo] inlineData rejected; retrying imageBytes payload");
+    if ((startFrame || endFrame) && firstMessage.includes("`bytesBase64Encoded` isn't supported")) {
+      console.warn("[veo] bytesBase64Encoded rejected; retrying inlineData payload");
       try {
         operationName = await submitVeoTask(
           entry.model,
-          buildVeoRequest(requestParams, "imageBytes"),
+          buildVeoRequest(requestParams, "inlineData"),
           apiKey,
         );
       } catch (retryErr) {
