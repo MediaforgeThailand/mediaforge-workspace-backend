@@ -1789,7 +1789,8 @@ async function executeBanana(
   const imageUrls: string[] = mentionImageUrls ?? (imageUrl ? [imageUrl] : []);
   let resolvedReferenceCount = 0;
   let failedReferenceCount = 0;
-  if (imageUrls.length > 0) {
+  const hasReferenceImages = imageUrls.length > 0;
+  if (hasReferenceImages) {
     for (const url of imageUrls) {
       try {
         const bytes = await fetchImageBuffer(url);
@@ -1859,7 +1860,11 @@ async function executeBanana(
       .maybeSingle();
     const override = (tierRow?.value as string | undefined) ?? "auto";
     if (override === "force_flex") {
-      useFlex = true;
+      // Flex is cheaper but can sit in Google's queue longer than an Edge
+      // invocation can stay alive. Reference-image jobs are especially prone
+      // to short abort loops because each retry re-submits a fresh request,
+      // so keep those on Standard for user-facing workspace generation.
+      useFlex = !hasReferenceImages;
     } else if (override === "force_standard") {
       useFlex = false;
     } else {
@@ -1895,7 +1900,7 @@ async function executeBanana(
   // Keep this lower than WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS and the Edge runtime
   // gateway ceiling. If Gemini is slow/queued, the durable workspace queue will
   // retry instead of letting the worker get killed and marked as dropped.
-  const ABORT_MS = 105_000;
+  const ABORT_MS = 118_000;
   const aborter = new AbortController();
   const abortTimer = setTimeout(() => aborter.abort(), ABORT_MS);
   const modelLabel = modelId === "nano-banana-pro" ? "Nano Banana Pro" : "Nano Banana 2";
@@ -1907,7 +1912,7 @@ async function executeBanana(
       headers: {
         "Content-Type": "application/json",
         // Ask Gemini to return before our Edge attempt budget expires.
-        "X-Server-Timeout": "110",
+        "X-Server-Timeout": "115",
       },
       body: geminiRequestBody,
       signal: aborter.signal,
@@ -1922,7 +1927,7 @@ async function executeBanana(
           : "no refs";
       throw new Error(
         `${modelLabel} timed out after ${Math.round(ABORT_MS / 1000)}s on this attempt (${refSummary}). ` +
-          "This is provider latency/queue timeout, not a reference-image format error; the background worker will retry automatically.",
+          "This is provider latency/queue timeout, not a reference-image format error; the background worker will keep retrying until the 30 minute job deadline.",
       );
     }
     throw fetchErr;
@@ -5627,6 +5632,8 @@ async function processWorkspaceGenerationJobTick(args: {
       started_at: job.started_at ?? new Date().toISOString(),
       worker_heartbeat_at: new Date().toISOString(),
       error: null,
+      last_error: null,
+      run_after: null,
     })
     .eq("id", job.id);
 
@@ -5843,7 +5850,7 @@ async function processWorkspaceGenerationJob(args: {
     attempt += 1;
     await args.supabase
       .from("workspace_generation_jobs")
-      .update({ status: "running", attempts: attempt })
+      .update({ status: "running", attempts: attempt, last_error: null, run_after: null })
       .eq("id", job.id);
 
     try {
