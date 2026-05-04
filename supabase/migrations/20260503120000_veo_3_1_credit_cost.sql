@@ -17,6 +17,29 @@
 -- (e.g. `veo-3.1-generate-preview:1080p`) when 1080p needs a
 -- distinct rate.
 
+WITH rows(feature, model, cost, label, pricing_type, provider, has_audio, resolution) AS (
+  VALUES
+    (
+      'generate_freepik_video',
+      'veo-3.1-generate-preview',
+      50,
+      'Google Veo 3.1 Standard',
+      'per_second',
+      'veo',
+      false,
+      NULL
+    ),
+    (
+      'generate_freepik_video',
+      'veo-3.1-generate-001',
+      50,
+      'Google Veo 3.1 Standard (alias)',
+      'per_second',
+      'veo',
+      false,
+      NULL
+    )
+)
 INSERT INTO public.credit_costs (
   feature,
   model,
@@ -27,14 +50,6 @@ INSERT INTO public.credit_costs (
   has_audio,
   resolution
 )
-VALUES (
-  'generate_freepik_video',
-  'veo-3.1-generate-preview',
-  50,
-  'Google Veo 3.1 Standard',
-  'per_second',
-  'veo',
-  false,
-  NULL
-)
+SELECT feature, model, cost, label, pricing_type, provider, has_audio, resolution
+FROM rows
 ON CONFLICT DO NOTHING;

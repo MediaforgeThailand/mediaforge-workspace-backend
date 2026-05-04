@@ -47,6 +47,9 @@ export const VEO_OPERATIONS_PREFIX = "operations/";
  *  are intentionally omitted because the user only wants Standard. */
 export const VEO_MODEL_MAP: Record<string, { model: string; tier: "standard" }> = {
   "veo-3.1-generate-preview": { model: "veo-3.1-generate-preview", tier: "standard" },
+  // Backward-compatible alias for saved nodes created while the UI briefly
+  // used a GA-looking slug. Gemini API still exposes Veo 3.1 as preview.
+  "veo-3.1-generate-001": { model: "veo-3.1-generate-preview", tier: "standard" },
 };
 
 export type VeoAspectRatio = "16:9" | "9:16";

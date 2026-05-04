@@ -322,6 +322,10 @@ export async function lookupBaseCost(
 
   /* ── Video (Kling — unified: I2V, Extension, Motion Control, Omni) ── */
   const model = String(params.model_name ?? params.model ?? DEFAULT_VIDEO_MODEL);
+  const modelAliases =
+    model === "veo-3.1-generate-001" || model === "veo-3.1-generate-preview"
+      ? Array.from(new Set([model, "veo-3.1-generate-preview", "veo-3.1-generate-001"]))
+      : [model];
   const isMotion = model.includes("motion");
   const isOmni = model === "kling-v3-omni";
 
@@ -403,10 +407,11 @@ export async function lookupBaseCost(
   }
 
   if (resolution) {
+    const resolutionAliases = modelAliases.map((alias) => `${alias}:${resolution}`);
     const { data: resolutionExact } = await supabase
       .from("credit_costs").select("cost, pricing_type")
       .eq("feature", "generate_freepik_video")
-      .eq("model", `${model}:${resolution}`)
+      .in("model", resolutionAliases)
       .eq("pricing_type", "per_second")
       .eq("has_audio", hasAudio)
       .limit(1).maybeSingle();
@@ -420,7 +425,7 @@ export async function lookupBaseCost(
       const { data: noAudioResolution } = await supabase
         .from("credit_costs").select("cost, pricing_type")
         .eq("feature", "generate_freepik_video")
-        .eq("model", `${model}:${resolution}`)
+        .in("model", resolutionAliases)
         .eq("pricing_type", "per_second")
         .eq("has_audio", false)
         .limit(1).maybeSingle();
@@ -434,7 +439,7 @@ export async function lookupBaseCost(
   const { data: perSecondExact } = await supabase
     .from("credit_costs").select("cost, pricing_type")
     .eq("feature", "generate_freepik_video")
-    .eq("model", model)
+    .in("model", modelAliases)
     .eq("pricing_type", "per_second")
     .eq("has_audio", hasAudio)
     .limit(1).maybeSingle();
@@ -447,7 +452,7 @@ export async function lookupBaseCost(
   const { data: exactMatchLate } = await supabase
     .from("credit_costs").select("cost")
     .eq("feature", "generate_freepik_video")
-    .eq("model", model)
+    .in("model", modelAliases)
     .eq("pricing_type", "fixed")
     .eq("duration_seconds", duration)
     .eq("has_audio", hasAudio)
@@ -458,7 +463,7 @@ export async function lookupBaseCost(
   const { data: durationMatchLate } = await supabase
     .from("credit_costs").select("cost")
     .eq("feature", "generate_freepik_video")
-    .eq("model", model)
+    .in("model", modelAliases)
     .eq("pricing_type", "fixed")
     .eq("duration_seconds", duration)
     .limit(1).maybeSingle();
@@ -468,7 +473,7 @@ export async function lookupBaseCost(
   const { data } = await supabase
     .from("credit_costs").select("cost, pricing_type")
     .eq("feature", "generate_freepik_video")
-    .eq("model", model)
+    .in("model", modelAliases)
     .limit(1).maybeSingle();
 
   if (!data) {
@@ -490,7 +495,7 @@ export async function lookupBaseCost(
   const { data: exactMatch } = await supabase
     .from("credit_costs").select("cost")
     .eq("feature", "generate_freepik_video")
-    .eq("model", model)
+    .in("model", modelAliases)
     .eq("duration_seconds", duration)
     .eq("has_audio", hasAudio)
     .limit(1).maybeSingle();
@@ -501,7 +506,7 @@ export async function lookupBaseCost(
   const { data: durationMatch } = await supabase
     .from("credit_costs").select("cost")
     .eq("feature", "generate_freepik_video")
-    .eq("model", model)
+    .in("model", modelAliases)
     .eq("duration_seconds", duration)
     .limit(1).maybeSingle();
 
