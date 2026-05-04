@@ -4877,8 +4877,13 @@ interface WorkspaceRunBody {
     | "poll_hyper3d"
     | "poll_tripo3d"
     | "mirror_tripo_url"
-    | "refresh_storage_url";
+    | "refresh_storage_url"
+    | "delete_workspace_asset";
   job_id?: string;
+  asset_id?: string;
+  asset_source?: "generation" | "user_asset" | "upload" | string;
+  storage_bucket?: string;
+  storage_path?: string;
   task_id?: string;
   poll_endpoint?: string;
   model?: string;
@@ -5971,6 +5976,47 @@ function parseSupabaseStorageUrl(
   }
 }
 
+function collectUrlStrings(value: unknown, output = new Set<string>(), depth = 0): Set<string> {
+  if (depth > 4 || value == null) return output;
+  if (typeof value === "string") {
+    if (/^https?:\/\//i.test(value) || /^data:/i.test(value)) output.add(value);
+    return output;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectUrlStrings(item, output, depth + 1);
+    return output;
+  }
+  if (typeof value === "object") {
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      collectUrlStrings(item, output, depth + 1);
+    }
+  }
+  return output;
+}
+
+function isOwnWorkspaceStoragePath(bucket: string, path: string, userId: string): boolean {
+  if (!bucket || !path || path.split("/").some((part) => part === "..")) return false;
+  if (bucket === "user_assets") {
+    return path.startsWith(`${userId}/`) || path.startsWith(`tts/${userId}/`);
+  }
+  if (bucket === "ai-media") {
+    return path.startsWith(`${userId}/`) || path.startsWith(`tripo3d-mirror/${userId}/`);
+  }
+  return false;
+}
+
+function addStoragePointer(
+  pointers: Map<string, string>,
+  bucket: unknown,
+  path: unknown,
+  userId: string,
+) {
+  const b = String(bucket ?? "").trim();
+  const p = String(path ?? "").trim().replace(/^\/+/, "");
+  if (!isOwnWorkspaceStoragePath(b, p, userId)) return;
+  pointers.set(`${b}:${p}`, `${b}\n${p}`);
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -6044,6 +6090,122 @@ serve(async (req) => {
     activeUserId = user.id;
 
     /* ─── Parse body ───────────────────────────────────────── */
+    if (body.action === "delete_workspace_asset") {
+      const source = String(body.asset_source ?? "").trim();
+      const assetId = String(body.asset_id ?? body.job_id ?? "")
+        .trim()
+        .replace(/^job-/, "")
+        .replace(/^user-asset-/, "");
+      const storagePointers = new Map<string, string>();
+      addStoragePointer(storagePointers, body.storage_bucket, body.storage_path, user.id);
+      const parsedBodyUrl = body.url ? parseSupabaseStorageUrl(String(body.url), SUPABASE_URL) : null;
+      if (parsedBodyUrl) addStoragePointer(storagePointers, parsedBodyUrl.bucket, parsedBodyUrl.path, user.id);
+
+      let deletedRows = 0;
+      if (source === "generation") {
+        if (!assetId) {
+          return new Response(
+            JSON.stringify({ error: "asset_id required" }),
+            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        const { data: job, error: jobError } = await supabase
+          .from("workspace_generation_jobs")
+          .select("id,user_id,result")
+          .eq("id", assetId)
+          .eq("user_id", user.id)
+          .maybeSingle();
+        if (jobError) {
+          return new Response(
+            JSON.stringify({ error: jobError.message }),
+            { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        if (!job) {
+          return new Response(
+            JSON.stringify({ error: "Asset not found" }),
+            { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        for (const rawUrl of collectUrlStrings((job as { result?: unknown }).result)) {
+          const parsed = parseSupabaseStorageUrl(rawUrl, SUPABASE_URL);
+          if (parsed) addStoragePointer(storagePointers, parsed.bucket, parsed.path, user.id);
+        }
+        const { data: deleted, error: deleteError } = await supabase
+          .from("workspace_generation_jobs")
+          .delete()
+          .eq("id", assetId)
+          .eq("user_id", user.id)
+          .select("id");
+        if (deleteError) {
+          return new Response(
+            JSON.stringify({ error: deleteError.message }),
+            { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        deletedRows = deleted?.length ?? 0;
+      } else if (source === "user_asset") {
+        if (!assetId) {
+          return new Response(
+            JSON.stringify({ error: "asset_id required" }),
+            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        const { data: row, error: rowError } = await supabase
+          .from("user_assets")
+          .select("*")
+          .eq("id", assetId)
+          .eq("user_id", user.id)
+          .maybeSingle();
+        if (rowError) {
+          return new Response(
+            JSON.stringify({ error: rowError.message }),
+            { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        if (!row) {
+          return new Response(
+            JSON.stringify({ error: "Asset not found" }),
+            { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        for (const rawUrl of collectUrlStrings(row)) {
+          const parsed = parseSupabaseStorageUrl(rawUrl, SUPABASE_URL);
+          if (parsed) addStoragePointer(storagePointers, parsed.bucket, parsed.path, user.id);
+        }
+        const { data: deleted, error: deleteError } = await supabase
+          .from("user_assets")
+          .delete()
+          .eq("id", assetId)
+          .eq("user_id", user.id)
+          .select("id");
+        if (deleteError) {
+          return new Response(
+            JSON.stringify({ error: deleteError.message }),
+            { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        deletedRows = deleted?.length ?? 0;
+      } else if (source !== "upload") {
+        return new Response(
+          JSON.stringify({ error: "Unsupported asset source" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const removedStorage: Array<{ bucket: string; path: string }> = [];
+      for (const value of storagePointers.values()) {
+        const [bucket, path] = value.split("\n");
+        const { error: removeError } = await supabase.storage.from(bucket).remove([path]);
+        if (!removeError) removedStorage.push({ bucket, path });
+      }
+
+      return new Response(
+        JSON.stringify({ ok: true, deleted_rows: deletedRows, removed_storage: removedStorage }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
     if (body.action === "refresh_storage_url") {
       const srcUrl = String(body.url ?? "").trim();
       const parsed = parseSupabaseStorageUrl(srcUrl, SUPABASE_URL);
