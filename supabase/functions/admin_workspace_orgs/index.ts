@@ -1218,8 +1218,12 @@ async function addWorkspaceEducationAdmin(client: SupabaseClient, body: Record<s
 async function saveWorkspaceEducationClass(client: SupabaseClient, body: Record<string, unknown>) {
   return saveWorkspaceTeam(client, {
     ...body,
-    credit_policy: asString(body.credit_policy, "monthly_reset"),
-    credit_amount: asInt(body.credit_amount, 200),
+    term: "",
+    year: 0,
+    max_students: 0,
+    initial_credits: 0,
+    credit_policy: "manual",
+    credit_amount: asInt(body.credit_amount, 250),
   });
 }
 
@@ -1286,15 +1290,20 @@ async function addWorkspaceEducationStudent(client: SupabaseClient, body: Record
   if (error) throw new Error(`student add failed: ${error.message}`);
 
   if (initialCredits > 0) {
-    const { data, error: creditError } = await client.rpc("admin_adjust_class_member_credits", {
+    const { data, error: creditError } = await client.rpc("ensure_education_student_space", {
       p_class_id: classId,
       p_user_id: userId,
-      p_delta: initialCredits,
+      p_student_code: studentCode || null,
+      p_credit_amount: initialCredits,
       p_actor_id: null,
-      p_reason: "Initial class credits from ERP education admin",
+      p_reason: "Initial class-space credits from ERP education admin",
     });
-    if (creditError) throw new Error(`student credit grant failed: ${creditError.message}`);
-    if (data === -1) throw new Error("class does not have enough unconsumed credits");
+    if (creditError) throw new Error(`student space credit grant failed: ${creditError.message}`);
+    if ((data as any)?.ok === false) {
+      throw new Error((data as any).error === "institution_budget_exhausted"
+        ? "institution does not have enough available credits"
+        : String((data as any).error ?? "student space create failed"));
+    }
   }
 
   return { data: { ok: true, member } };
@@ -1305,16 +1314,55 @@ async function adjustWorkspaceEducationStudentCredits(client: SupabaseClient, bo
   const userId = asString(body.user_id);
   const delta = asInt(body.delta ?? body.amount);
   if (!classId || !userId || delta === 0) throw new Error("class_id, user_id and non-zero delta are required");
-  const { data, error } = await client.rpc("admin_adjust_class_member_credits", {
-    p_class_id: classId,
-    p_user_id: userId,
+  const { data: space, error: spaceError } = await client
+    .from("education_student_spaces")
+    .select("workspace_id")
+    .eq("class_id", classId)
+    .eq("user_id", userId)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (spaceError) throw new Error(`student space lookup failed: ${spaceError.message}`);
+
+  if (!space && delta > 0) {
+    const { data: member, error: memberError } = await client
+      .from("class_members")
+      .select("student_code")
+      .eq("class_id", classId)
+      .eq("user_id", userId)
+      .eq("role", "student")
+      .maybeSingle();
+    if (memberError) throw new Error(`student lookup failed: ${memberError.message}`);
+    if (!member) throw new Error("student membership not found");
+
+    const { data, error } = await client.rpc("ensure_education_student_space", {
+      p_class_id: classId,
+      p_user_id: userId,
+      p_student_code: (member as any).student_code ?? null,
+      p_credit_amount: delta,
+      p_actor_id: null,
+      p_reason: asString(body.reason) || "ERP education space credit adjustment",
+    });
+    if (error) throw new Error(`student space create failed: ${error.message}`);
+    if ((data as any)?.ok === false) {
+      throw new Error((data as any).error === "institution_budget_exhausted"
+        ? "institution does not have enough available credits"
+        : String((data as any).error ?? "student space create failed"));
+    }
+    return { data: { balance: Number((data as any)?.starting_balance ?? 0), space: data } };
+  }
+
+  if (!space) throw new Error("student does not have a class space yet");
+
+  const { data, error } = await client.rpc("admin_adjust_education_space_credits", {
+    p_workspace_id: (space as any).workspace_id,
     p_delta: delta,
     p_actor_id: null,
-    p_reason: asString(body.reason) || "ERP education credit adjustment",
+    p_reason: asString(body.reason) || "ERP education space credit adjustment",
   });
-  if (error) throw new Error(`student credit adjustment failed: ${error.message}`);
-  if (data === -1) throw new Error("class does not have enough unconsumed credits");
-  return { data: { balance: data } };
+  if (error) throw new Error(`student space credit adjustment failed: ${error.message}`);
+  if (data === -1) throw new Error("institution does not have enough available credits");
+  return { data: { balance: data, workspace_id: (space as any).workspace_id } };
 }
 
 async function saveWorkspaceEducationSession(client: SupabaseClient, body: Record<string, unknown>) {
@@ -1350,13 +1398,14 @@ async function createWorkspaceEducationCode(client: SupabaseClient, body: Record
   if (!classId) throw new Error("class_id is required");
   const { data: klass, error: classError } = await client
     .from("classes")
-    .select("code")
+    .select("code,credit_amount")
     .eq("id", classId)
     .maybeSingle();
   if (classError) throw new Error(`class lookup failed: ${classError.message}`);
   if (!klass) throw new Error("class not found");
 
   const code = `${String((klass as any).code ?? "CLASS").toUpperCase()}-${randomClassCode().replace("-", "")}`;
+  const creditAmount = asInt(body.credit_amount, Number((klass as any).credit_amount ?? 250));
   const { data, error } = await client
     .from("class_enrollment_codes")
     .insert({
@@ -1365,6 +1414,7 @@ async function createWorkspaceEducationCode(client: SupabaseClient, body: Record
       flow: asString(body.flow, "auto_approve"),
       max_uses: asInt(body.max_uses, 0) || null,
       expires_at: asString(body.expires_at) || null,
+      credit_amount: creditAmount > 0 ? creditAmount : 250,
     })
     .select()
     .single();

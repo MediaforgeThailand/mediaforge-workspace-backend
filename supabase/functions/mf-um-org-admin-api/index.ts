@@ -1324,8 +1324,8 @@ Deno.serve(async (req) => {
           .from("organizations")
           .select("default_credit_policy, default_credit_amount").eq("id", orgId).maybeSingle();
 
-        const credit_policy = String(body?.credit_policy ?? orgRow?.default_credit_policy ?? "monthly_reset");
-        const credit_amount = Number(body?.credit_amount ?? orgRow?.default_credit_amount ?? 200);
+        const credit_policy = String(body?.credit_policy ?? orgRow?.default_credit_policy ?? "manual");
+        const credit_amount = Number(body?.credit_amount ?? orgRow?.default_credit_amount ?? 250);
 
         const primaryInstructorId = body?.primary_instructor_id ?? auth.userId;
 
@@ -1666,6 +1666,12 @@ Deno.serve(async (req) => {
             p_reason: String(body?.reason ?? "school_center_initial_student_credit"),
           });
           if (spaceRes.error) return json({ error: spaceRes.error.message }, 400);
+          if ((spaceRes.data as any)?.ok === false) {
+            return json({
+              error: (spaceRes.data as any).error,
+              message: (spaceRes.data as any).error,
+            }, (spaceRes.data as any).error === "institution_budget_exhausted" ? 409 : 400);
+          }
           space = spaceRes.data;
           newBalance = Number(space?.starting_balance ?? 0);
         }
@@ -1714,7 +1720,7 @@ Deno.serve(async (req) => {
           p_reason: reason,
         });
         if (adjusted.error) return json({ error: adjusted.error.message }, 400);
-        if (adjusted.data === -1) return json({ error: "class_budget_exhausted" }, 409);
+        if (adjusted.data === -1) return json({ error: "institution_budget_exhausted" }, 409);
         return json({
           new_balance: adjusted.data,
           granted: amount > 0 ? amount : 0,
@@ -1763,7 +1769,7 @@ Deno.serve(async (req) => {
           p_reason: String(body?.reason ?? "manual_space_adjustment"),
         });
         if (adjusted.error) return json({ error: adjusted.error.message }, 400);
-        if (adjusted.data === -1) return json({ error: "class_budget_exhausted" }, 409);
+        if (adjusted.data === -1) return json({ error: "institution_budget_exhausted" }, 409);
         return json({
           new_balance: adjusted.data,
           granted: amount > 0 ? amount : 0,
@@ -1832,6 +1838,12 @@ Deno.serve(async (req) => {
           p_reason: String(body?.reason ?? "teacher_center_create_student_space"),
         });
         if (spaceRes.error) return json({ error: spaceRes.error.message }, 400);
+        if ((spaceRes.data as any)?.ok === false) {
+          return json({
+            error: (spaceRes.data as any).error,
+            message: (spaceRes.data as any).error,
+          }, (spaceRes.data as any).error === "institution_budget_exhausted" ? 409 : 400);
+        }
         return json({
           space: spaceRes.data,
           new_balance: Number((spaceRes.data as any)?.starting_balance ?? 0),
