@@ -37,7 +37,11 @@ const corsHeaders = {
 };
 
 function elevenApiKey(): string | undefined {
-  return Deno.env.get("ELEVEN_API_KEY") ?? Deno.env.get("ELEVENLABS_API_KEY");
+  for (const name of ["ELEVEN_API_KEY", "ELEVENLABS_API_KEY"]) {
+    const value = Deno.env.get(name)?.trim();
+    if (value) return value;
+  }
+  return undefined;
 }
 
 type ElevenLabsApiVoice = {
@@ -123,7 +127,7 @@ serve(async (req) => {
       return new Response(
         JSON.stringify({
           error:
-            "ElevenLabs not configured — set ELEVEN_API_KEY in Supabase project secrets.",
+            "ElevenLabs not configured — set ELEVEN_API_KEY or ELEVENLABS_API_KEY in Supabase project secrets.",
         }),
         { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );

@@ -6,7 +6,7 @@
 // ------------------
 // Endpoint students hit after scanning a teacher's QR code.
 //
-//   POST { code: "DM-2026-X8K9", student_code?: "6612345" }
+//   POST { code: "DM-2026-X8K9", student_code: "6612345" }
 //
 // Returns:
 //   { ok: true, class_id, class_name, starting_balance, ... }
@@ -61,6 +61,9 @@ Deno.serve(async (req) => {
   const studentCode = typeof body.student_code === "string"
     ? body.student_code.trim()
     : null;
+  if (!studentCode) {
+    return json({ ok: false, error: "student_code_required" }, 400);
+  }
 
   const admin = createClient(SUPABASE_URL, SERVICE_KEY);
   const { data, error } = await admin.rpc("redeem_enrollment_code", {

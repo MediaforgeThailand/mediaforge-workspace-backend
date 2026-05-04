@@ -316,6 +316,7 @@ const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     image_input:   { internal_key: "image_url",      data_type: "image" },
     image:         { internal_key: "image_url",      data_type: "image" },
     ref_image:     { internal_key: "image_url",      data_type: "image" },
+    reference_image: { internal_key: "reference_image_url", data_type: "image" },
     ref_video:     { internal_key: "video_url",      data_type: "video" },
   },
   tripo3d: {
@@ -1329,9 +1330,19 @@ async function executeSeedance(
         : undefined;
   const startFrameUrl = (params.image_url ?? params.start_frame) as string | undefined;
   const endFrameUrl = (params.image_tail_url ?? params.end_frame) as string | undefined;
+  const referenceImageUrl = (
+    params.reference_image_url ??
+    params.reference_image
+  ) as string | undefined;
   const referenceVideoUrl = (params.video_url ?? params.ref_video) as string | undefined;
-  if (!prompt && !startFrameUrl && !referenceVideoUrl) {
-    throw new Error("Seedance requires a prompt, start_frame image, or ref_video.");
+  if (!prompt && !startFrameUrl && !referenceImageUrl && !referenceVideoUrl) {
+    throw new Error("Seedance requires a prompt, start_frame image, reference_image, or ref_video.");
+  }
+  if ((startFrameUrl || endFrameUrl) && (referenceImageUrl || referenceVideoUrl)) {
+    throw new Error("Seedance cannot mix start/end frame mode with reference media mode.");
+  }
+  if (referenceImageUrl && !entry.supportsVideoReference) {
+    throw new Error(`Seedance model ${modelSlug} does not support reference image input.`);
   }
   if (referenceVideoUrl && !entry.supportsVideoReference) {
     throw new Error(`Seedance model ${modelSlug} does not support reference video input.`);
@@ -1354,6 +1365,7 @@ async function executeSeedance(
       watermark: false,
       startFrameUrl,
       endFrameUrl,
+      referenceImageUrl,
       referenceVideoUrl,
       referenceAudioUrl,
     },
@@ -1364,7 +1376,7 @@ async function executeSeedance(
     `[seedance] submit model=${entry.model} v2=${isV2} duration=${duration}s ` +
       `resolution=${resolution ?? "default"} ratio=${ratio ?? "default"} ` +
       `audio=${generateAudio} i2v=${!!startFrameUrl} vref=${!!referenceVideoUrl} ` +
-      `aref=${!!referenceAudioUrl}`,
+      `iref=${!!referenceImageUrl} aref=${!!referenceAudioUrl}`,
   );
 
   const taskId = await submitSeedanceTask(
@@ -1390,6 +1402,7 @@ async function executeSeedance(
       ratio,
       has_audio: generateAudio,
       is_image2video: !!startFrameUrl,
+      has_image_ref: !!referenceImageUrl,
       has_video_ref: !!referenceVideoUrl,
       poll_endpoint: `${SEEDANCE_BASE}${SEEDANCE_TASKS_PATH}`,
     },
@@ -1465,7 +1478,7 @@ async function executeVeo(
   const startFrame = startFrameUrl ? await fetchImageAsInline(startFrameUrl) : undefined;
   const endFrame = endFrameUrl ? await fetchImageAsInline(endFrameUrl) : undefined;
 
-  const body = buildVeoRequest({
+  const requestParams = {
     prompt,
     startFrame,
     endFrame,
@@ -1473,7 +1486,8 @@ async function executeVeo(
     resolution,
     durationSeconds,
     personGeneration,
-  });
+  };
+  const body = buildVeoRequest(requestParams);
 
   console.log(
     `[veo] submit model=${entry.model} duration=${durationSeconds}s ` +
@@ -1481,7 +1495,31 @@ async function executeVeo(
       `i2v=${!!startFrameUrl} endFrame=${!!endFrameUrl}`,
   );
 
-  const operationName = await submitVeoTask(entry.model, body, apiKey);
+  let operationName: string;
+  try {
+    operationName = await submitVeoTask(entry.model, body, apiKey);
+  } catch (err) {
+    const firstMessage = err instanceof Error ? err.message : String(err);
+    if ((startFrame || endFrame) && firstMessage.includes("`inlineData` isn't supported")) {
+      console.warn("[veo] inlineData rejected; retrying imageBytes payload");
+      try {
+        operationName = await submitVeoTask(
+          entry.model,
+          buildVeoRequest(requestParams, "imageBytes"),
+          apiKey,
+        );
+      } catch (retryErr) {
+        const retryMessage = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        throw new Error(
+          "Veo image input was rejected by Gemini API. " +
+            "Try text-to-video without a start/end image while Veo image access is checked. " +
+            retryMessage,
+        );
+      }
+    } else {
+      throw err;
+    }
+  }
 
   return {
     task_id: operationName,
@@ -2177,6 +2215,13 @@ const TRIPO3D_MODEL_VERSIONS: Record<string, string> = {
   "tripo3d-v1.4":   "v1.4-20240625",
 };
 
+const TRIPO3D_MULTIVIEW_MODEL_KEYS = new Set([
+  "tripo3d-v3.1",
+  "tripo3d-v3.0",
+  "tripo3d-v2.5",
+  "tripo3d-v2.0",
+]);
+
 const TRIPO3D_POLL_ENDPOINT = "https://api.tripo3d.ai/v2/openapi/task";
 
 async function executeTripo3D(
@@ -2193,36 +2238,44 @@ async function executeTripo3D(
     );
   }
 
-  // Resolve image: prefer a wired `image` input, else a mention.
-  const imageUrl =
-    (params.image_url as string | undefined) ??
-    (params.image as string | undefined) ??
-    (Array.isArray(params.mention_image_urls)
-      ? (params.mention_image_urls as string[])[0]
-      : undefined);
+  const modelKey = String(params.model_name ?? "tripo3d-v3.1");
+  const modelVersion = TRIPO3D_MODEL_VERSIONS[modelKey] ?? TRIPO3D_MODEL_VERSIONS["tripo3d-v3.1"];
+  const supportsMultiview = TRIPO3D_MULTIVIEW_MODEL_KEYS.has(modelKey);
+  const imageUrls = collectTripoImageUrls(params).slice(0, supportsMultiview ? 4 : 1);
+  const imageUrl = imageUrls[0];
   if (!imageUrl) {
     throw new Error("Image to 3D needs an image input — wire an asset / generation into the `image` port.");
   }
-
-  const modelKey = String(params.model_name ?? "tripo3d-v3.1");
-  const modelVersion = TRIPO3D_MODEL_VERSIONS[modelKey] ?? TRIPO3D_MODEL_VERSIONS["tripo3d-v3.1"];
 
   const texture = String(params.texture ?? "true") === "true";
   const pbr = String(params.pbr ?? "true") === "true";
   const autoSize = String(params.auto_size ?? "true") === "true";
 
-  const submitBody: Record<string, unknown> = {
-    type: "image_to_model",
-    file: { type: "url", url: imageUrl },
-    model_version: modelVersion,
-    texture,
-    pbr,
-    auto_size: autoSize,
-  };
+  const taskType = supportsMultiview && imageUrls.length >= 2
+    ? "multiview_to_model"
+    : "image_to_model";
+  const submitBody: Record<string, unknown> =
+    taskType === "multiview_to_model"
+      ? {
+          type: taskType,
+          files: imageUrls.map((url) => ({ type: "url", url })),
+          model_version: modelVersion,
+          texture,
+          pbr,
+          auto_size: autoSize,
+        }
+      : {
+          type: taskType,
+          file: { type: "url", url: imageUrl },
+          model_version: modelVersion,
+          texture,
+          pbr,
+          auto_size: autoSize,
+        };
 
   console.log(
-    `[tripo3d] Submitting image_to_model task (model=${modelVersion}, ` +
-      `texture=${texture}, pbr=${pbr})`,
+    `[tripo3d] Submitting ${taskType} task (model=${modelVersion}, ` +
+      `images=${imageUrls.length}, texture=${texture}, pbr=${pbr})`,
   );
 
   const submitRes = await fetch(TRIPO3D_POLL_ENDPOINT, {
@@ -2282,10 +2335,33 @@ async function executeTripo3D(
     provider_meta: {
       provider: "tripo3d",
       model_version: modelVersion,
+      task_type: taskType,
+      input_image_count: imageUrls.length,
       poll_endpoint: TRIPO3D_POLL_ENDPOINT,
       task_id: taskId,
     },
   };
+}
+
+function collectTripoImageUrls(params: Record<string, unknown>): string[] {
+  const urls: string[] = [];
+  const push = (value: unknown) => {
+    if (typeof value === "string" && value.trim()) {
+      urls.push(value.trim());
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(push);
+    }
+  };
+
+  push(params.image_urls);
+  push(params.ref_image);
+  push(params.image_url);
+  push(params.image);
+  push(params.mention_image_urls);
+
+  return Array.from(new Set(urls));
 }
 
 /**
@@ -2634,6 +2710,14 @@ async function pickDefaultElevenLabsVoice(apiKey: string): Promise<string> {
   }
 }
 
+function getElevenLabsApiKey(): string | undefined {
+  for (const name of ["ELEVEN_API_KEY", "ELEVENLABS_API_KEY"]) {
+    const value = Deno.env.get(name)?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
 /**
  * executeElevenLabsTts — ElevenLabs Text-to-Speech.
  *
@@ -2642,8 +2726,8 @@ async function pickDefaultElevenLabsVoice(apiKey: string): Promise<string> {
  * three ways:
  *
  *  • Auth — ElevenLabs uses an `xi-api-key` header, not a query
- *    param. The key is stored as `ELEVENLABS_API_KEY` in Supabase
- *    project secrets.
+ *    param. The key can be stored as `ELEVEN_API_KEY` or
+ *    `ELEVENLABS_API_KEY` in Supabase project secrets.
  *  • Voice ids — opaque 20-char tokens (e.g. `21m00Tcm4TlvDq8ikWAM`)
  *    rather than language-coded strings, so we don't try to infer
  *    a `languageCode` field from them.
@@ -2664,15 +2748,11 @@ async function executeElevenLabsTts(
   supabaseClient: ReturnType<typeof createClient>,
   userId: string,
 ): Promise<ProviderResult> {
-  // Accept either env var name — admins set this as either
-  // `ELEVEN_API_KEY` (matches the public form on Freepik / docs)
-  // or `ELEVENLABS_API_KEY` (our earlier draft). Whichever is set
-  // wins.
-  const apiKey =
-    Deno.env.get("ELEVEN_API_KEY") ?? Deno.env.get("ELEVENLABS_API_KEY");
+  // Accept either env var name and trim pasted secret values.
+  const apiKey = getElevenLabsApiKey();
   if (!apiKey) {
     throw new Error(
-      "ElevenLabs not configured — set ELEVEN_API_KEY in Supabase project secrets (workspace dev).",
+      "ElevenLabs not configured — set ELEVEN_API_KEY or ELEVENLABS_API_KEY in Supabase project secrets.",
     );
   }
 
@@ -2780,7 +2860,7 @@ async function executeElevenLabsTts(
       throw new Error(`Validation: ElevenLabs rejected the request — ${errText.slice(0, 200)}`);
     }
     if (ttsRes.status === 401 || ttsRes.status === 403) {
-      throw new Error(`ElevenLabs authentication failed — check ELEVENLABS_API_KEY (HTTP ${ttsRes.status}).`);
+      throw new Error(`ElevenLabs authentication failed — check ELEVEN_API_KEY or ELEVENLABS_API_KEY (HTTP ${ttsRes.status}).`);
     }
     if (ttsRes.status === 402) {
       throw new Error(`ElevenLabs account has insufficient provider credits/quota. Top up ElevenLabs billing or switch voice provider. (${errText.slice(0, 200)})`);
@@ -7458,6 +7538,17 @@ serve(async (req) => {
           // Use the first ref as the primary image_url; the rest live
           // in mention_image_urls (merged below) for multi-image
           // dispatchers (Banana, OpenAI gpt-image-2).
+          if (provider === "tripo3d") {
+            const existing = Array.isArray(params.image_urls)
+              ? (params.image_urls as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
+              : [];
+            const merged = Array.from(new Set([...existing, ...stringVals]));
+            params.image_urls = merged;
+            if (!params[handleDef.internal_key]) {
+              params[handleDef.internal_key] = merged[0];
+            }
+            continue;
+          }
           if (!params[handleDef.internal_key]) {
             params[handleDef.internal_key] = stringVals[0];
           }
@@ -7495,6 +7586,17 @@ serve(async (req) => {
           ...edgeImageUrls,
         ]));
         params.mention_image_urls = merged;
+        if (!params.image_url) params.image_url = merged[0];
+      } else if (provider === "tripo3d") {
+        const existing = Array.isArray(params.image_urls)
+          ? (params.image_urls as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
+          : [];
+        const merged = Array.from(new Set([
+          ...existing,
+          ...mentionImageUrls,
+          ...edgeImageUrls,
+        ]));
+        params.image_urls = merged;
         if (!params.image_url) params.image_url = merged[0];
       } else {
         if (!params.image_url) params.image_url = mentionImageUrls[0];
@@ -7581,8 +7683,8 @@ serve(async (req) => {
       case "elevenlabs_tts":
         // ElevenLabs TTS — direct call into ElevenLabs API,
         // mirrors executeGoogleTts in shape (synth → upload →
-        // user_assets row). Requires ELEVENLABS_API_KEY in
-        // Supabase project secrets.
+        // user_assets row). Requires ELEVEN_API_KEY or
+        // ELEVENLABS_API_KEY in Supabase project secrets.
         result = await executeElevenLabsTts(params, supabase, user.id);
         break;
       case "seedance":

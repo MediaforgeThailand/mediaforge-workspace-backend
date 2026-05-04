@@ -204,9 +204,11 @@ function pcmToWav(
  *  Reading both means we don't have to make admins rename the secret
  *  to match our code; whichever they set wins. */
 function elevenApiKey(): string | undefined {
-  return (
-    Deno.env.get("ELEVEN_API_KEY") ?? Deno.env.get("ELEVENLABS_API_KEY")
-  );
+  for (const name of ["ELEVEN_API_KEY", "ELEVENLABS_API_KEY"]) {
+    const value = Deno.env.get(name)?.trim();
+    if (value) return value;
+  }
+  return undefined;
 }
 
 async function synthesiseElevenLabs(
@@ -216,7 +218,7 @@ async function synthesiseElevenLabs(
   const apiKey = elevenApiKey();
   if (!apiKey) {
     throw new Error(
-      "ElevenLabs not configured — set ELEVEN_API_KEY in Supabase project secrets.",
+      "ElevenLabs not configured — set ELEVEN_API_KEY or ELEVENLABS_API_KEY in Supabase project secrets.",
     );
   }
   const text = sampleTextFor("elevenlabs", voiceId);

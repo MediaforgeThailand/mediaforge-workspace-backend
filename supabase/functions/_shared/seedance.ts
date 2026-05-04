@@ -134,6 +134,8 @@ export interface SeedanceParams {
   startFrameUrl?: string;
   /** Image-to-video end frame URL (optional, models that support it). */
   endFrameUrl?: string;
+  /** Seedance 2.0 multimodal reference image URL. */
+  referenceImageUrl?: string;
   /** Seedance 2.0 multimodal reference video URL. */
   referenceVideoUrl?: string;
   /** Seedance 2.0 multimodal reference audio URL. */
@@ -208,6 +210,13 @@ export function buildSeedanceContent(
         type: "image_url",
         image_url: { url: p.endFrameUrl },
         role: "last_frame",
+      });
+    }
+    if (p.referenceImageUrl) {
+      content.push({
+        type: "image_url",
+        image_url: { url: p.referenceImageUrl },
+        role: "reference_image",
       });
     }
     if (p.referenceVideoUrl) {

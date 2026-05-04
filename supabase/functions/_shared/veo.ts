@@ -75,6 +75,8 @@ export interface VeoSubmitParams {
   personGeneration?: VeoPersonGeneration;
 }
 
+export type VeoImageEncoding = "inlineData" | "imageBytes";
+
 interface VeoOperationName {
   /** "operations/abc123…" */
   name: string;
@@ -126,15 +128,25 @@ export async function fetchImageAsInline(url: string): Promise<VeoImage> {
  *  required for 1080p/refs" constraint is enforced here — we
  *  silently coerce duration to "8" when the resolution forces it,
  *  because the API otherwise responds with an opaque 400. */
-export function buildVeoRequest(p: VeoSubmitParams): Record<string, unknown> {
+function veoImagePayload(image: VeoImage, encoding: VeoImageEncoding): Record<string, unknown> {
+  if (encoding === "imageBytes") {
+    return { imageBytes: image.data, mimeType: image.mimeType };
+  }
+  return { inlineData: image };
+}
+
+export function buildVeoRequest(
+  p: VeoSubmitParams,
+  imageEncoding: VeoImageEncoding = "inlineData",
+): Record<string, unknown> {
   let duration = p.durationSeconds ?? "8";
   if ((p.resolution === "1080p") && duration !== "8") {
     duration = "8";
   }
 
   const instance: Record<string, unknown> = { prompt: p.prompt };
-  if (p.startFrame) instance.image = { inlineData: p.startFrame };
-  if (p.endFrame) instance.lastFrame = { inlineData: p.endFrame };
+  if (p.startFrame) instance.image = veoImagePayload(p.startFrame, imageEncoding);
+  if (p.endFrame) instance.lastFrame = veoImagePayload(p.endFrame, imageEncoding);
 
   const parameters: Record<string, unknown> = {
     aspectRatio: p.aspectRatio ?? "16:9",

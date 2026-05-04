@@ -30,8 +30,13 @@ const CORS_HEADERS = {
 const ORG_TOPUP_RATIO_THB_TO_CREDITS = 50;
 const MIN_ORG_TOPUP_THB = 500;
 const MAX_ORG_TOPUP_THB = 100_000;
-const TEAM_SEAT_PRICE_USD = 10;
-const TEAM_SEAT_PRICE_THB = 290;
+const TEAM_SEAT_PRICE_THB = 1600;
+const TEAM_SEAT_PLATFORM_FEE_THB = 300;
+const TEAM_BASE_CREDITS_PER_SEAT_MONTH =
+  (TEAM_SEAT_PRICE_THB - TEAM_SEAT_PLATFORM_FEE_THB) * ORG_TOPUP_RATIO_THB_TO_CREDITS;
+const TEAM_PROMO_CREDITS_PER_SEAT_MONTH = 25_000;
+const TEAM_CREDITS_PER_SEAT_MONTH =
+  TEAM_BASE_CREDITS_PER_SEAT_MONTH + TEAM_PROMO_CREDITS_PER_SEAT_MONTH;
 const PAYMENT_SELECT = [
   "id",
   "user_id",
@@ -398,7 +403,7 @@ async function getTeamStatus(client: SupabaseClient, user: User) {
   const { data: orgs } = orgIds.length
     ? await client
       .from("organizations")
-      .select("id,name,display_name,slug,type,status,credit_pool,credit_pool_allocated")
+      .select("id,name,display_name,slug,type,status,credit_pool,credit_pool_allocated,settings")
       .in("id", orgIds)
     : { data: [] as any[] };
   const orgById = new Map((orgs ?? []).map((org: any) => [
@@ -573,6 +578,12 @@ async function getOverview(client: SupabaseClient, user: User) {
     const t = Date.parse(generation.created_at ?? "");
     return Number.isFinite(t) && t >= cutoff30d;
   });
+  const orgSettings = ((orgRes.data as any)?.settings && typeof (orgRes.data as any).settings === "object")
+    ? (orgRes.data as any).settings
+    : {};
+  const seatsPurchased = teamSeatLimit(orgSettings);
+  const seatsUsed = members.filter((member: any) => member.status === "active").length;
+  const seatsReserved = (inviteRes.data ?? []).filter((invite: any) => invite.status === "pending").length;
 
   return {
     data: {
@@ -596,8 +607,15 @@ async function getOverview(client: SupabaseClient, user: User) {
         generation_credits_total: generations.reduce((sum: number, generation: any) => sum + Number(generation.credits_spent ?? 0), 0),
         generation_credits_30d: recentGenerations.reduce((sum: number, generation: any) => sum + Number(generation.credits_spent ?? 0), 0),
       },
-      seat_price_usd: TEAM_SEAT_PRICE_USD,
       seat_price_thb: TEAM_SEAT_PRICE_THB,
+      seat_platform_fee_thb: TEAM_SEAT_PLATFORM_FEE_THB,
+      team_base_credits_per_seat_month: TEAM_BASE_CREDITS_PER_SEAT_MONTH,
+      team_promo_credits_per_seat_month: TEAM_PROMO_CREDITS_PER_SEAT_MONTH,
+      team_credits_per_seat_month: TEAM_CREDITS_PER_SEAT_MONTH,
+      team_seats_purchased: seatsPurchased,
+      team_seats_used: seatsUsed,
+      team_seats_reserved: seatsReserved,
+      team_seats_available: Math.max(0, seatsPurchased - seatsUsed - seatsReserved),
       org_topup_ratio_thb_to_credits: ORG_TOPUP_RATIO_THB_TO_CREDITS,
     },
   };
@@ -630,6 +648,63 @@ async function activeOrgAdminCount(client: SupabaseClient, orgId: string): Promi
   return count ?? 0;
 }
 
+function teamSeatLimit(settings: unknown): number {
+  const raw = (settings && typeof settings === "object")
+    ? Number((settings as Record<string, unknown>).team_seats_purchased)
+    : 0;
+  return Number.isFinite(raw) ? Math.max(0, Math.trunc(raw)) : 0;
+}
+
+async function organizationForSeatPolicy(client: SupabaseClient, orgId: string) {
+  const { data, error } = await client
+    .from("organizations")
+    .select("id,type,settings")
+    .eq("id", orgId)
+    .single();
+  if (error || !data) throw new Error(`organization lookup failed: ${error?.message ?? "not found"}`);
+  return data as { id: string; type: string | null; settings?: Record<string, unknown> | null };
+}
+
+async function activeSeatCount(client: SupabaseClient, orgId: string): Promise<number> {
+  const { count, error } = await client
+    .from("organization_memberships")
+    .select("id", { count: "exact", head: true })
+    .eq("organization_id", orgId)
+    .eq("status", "active");
+  if (error) throw new Error(`seat count failed: ${error.message}`);
+  return count ?? 0;
+}
+
+async function reservedSeatCount(client: SupabaseClient, orgId: string): Promise<number> {
+  const { count, error } = await client
+    .from("organization_member_invites")
+    .select("id", { count: "exact", head: true })
+    .eq("organization_id", orgId)
+    .eq("status", "pending");
+  if (error) throw new Error(`reserved seat count failed: ${error.message}`);
+  return count ?? 0;
+}
+
+async function ensureTeamSeatCapacity(
+  client: SupabaseClient,
+  orgId: string,
+  additionalSeats: number,
+) {
+  if (additionalSeats <= 0) return;
+  const org = await organizationForSeatPolicy(client, orgId);
+  if (org.type !== "team") return;
+
+  const limit = teamSeatLimit(org.settings);
+  const [activeSeats, reservedSeats] = await Promise.all([
+    activeSeatCount(client, orgId),
+    reservedSeatCount(client, orgId),
+  ]);
+  const used = activeSeats + reservedSeats;
+  if (limit <= 0 || used + additionalSeats > limit) {
+    throw new Error(`team seat limit reached (${used}/${limit}). Buy more seats before inviting members.`);
+  }
+}
+
 async function inviteMember(client: SupabaseClient, user: User, body: Record<string, unknown>) {
   const ctx = await orgAdminContext(client, user);
   if (!ctx) throw new Error("org_admin_required");
@@ -640,6 +715,17 @@ async function inviteMember(client: SupabaseClient, user: User, body: Record<str
 
   const existingUser = await findUserByEmail(client, email);
   if (existingUser) {
+    const { data: existingMembership, error: existingMembershipError } = await client
+      .from("organization_memberships")
+      .select("id,status")
+      .eq("organization_id", ctx.organization_id)
+      .eq("user_id", existingUser.id)
+      .maybeSingle();
+    if (existingMembershipError) throw new Error(`member lookup failed: ${existingMembershipError.message}`);
+    if (!existingMembership || (existingMembership as any).status !== "active") {
+      await ensureTeamSeatCapacity(client, ctx.organization_id, 1);
+    }
+
     const { error } = await client.from("organization_memberships").upsert(
       {
         organization_id: ctx.organization_id,
@@ -665,6 +751,8 @@ async function inviteMember(client: SupabaseClient, user: User, body: Record<str
 
     return { data: { mode: "activated", user_id: existingUser.id } };
   }
+
+  await ensureTeamSeatCapacity(client, ctx.organization_id, 1);
 
   const { data, error } = await client.from("organization_member_invites").upsert(
     {
@@ -749,6 +837,9 @@ async function updateMemberStatus(client: SupabaseClient, user: User, body: Reco
     const adminCount = await activeOrgAdminCount(client, ctx.organization_id);
     if (adminCount <= 1) throw new Error("organization must keep at least one active admin");
   }
+  if (status === "active" && (existing as any).status !== "active") {
+    await ensureTeamSeatCapacity(client, ctx.organization_id, 1);
+  }
 
   const updates: Record<string, unknown> = {
     status,
@@ -799,7 +890,7 @@ async function createTeam(client: SupabaseClient, user: User, body: Record<strin
     primary_instructor_id: user.id,
     credit_policy: asString(body.credit_policy, "manual"),
     credit_amount: creditAmount,
-    settings: { kind: "enterprise_team" },
+    settings: { kind: "team_subgroup" },
   }).select().single();
   if (error) throw new Error(`team create failed: ${error.message}`);
   return { data: { team: data } };
