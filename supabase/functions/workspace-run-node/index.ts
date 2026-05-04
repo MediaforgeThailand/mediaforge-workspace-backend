@@ -5579,7 +5579,7 @@ async function failWorkspaceJob(args: {
   error: string;
   refundReason: string;
 }): Promise<WorkspaceJobRow | null> {
-  const msg = args.error.substring(0, 1000);
+  const msg = args.error;
   await refundWorkspaceJobCharge({
     supabase: args.supabase,
     job: args.job,
@@ -5629,7 +5629,7 @@ async function scheduleWorkspaceJobRetry(args: {
       status: "running",
       ...(args.result ? { result: args.result } : {}),
       error: null,
-      last_error: args.message.substring(0, 1000),
+      last_error: args.message,
       worker_heartbeat_at: new Date().toISOString(),
     })
     .eq("id", args.job.id);
@@ -5806,7 +5806,7 @@ async function processWorkspaceGenerationJobTick(args: {
       .update({
         status: "running",
         attempts: attempt,
-        last_error: msg.substring(0, 1000),
+        last_error: msg,
         worker_heartbeat_at: new Date().toISOString(),
       })
       .eq("id", job.id);
@@ -6020,10 +6020,10 @@ async function processWorkspaceGenerationJob(args: {
         .from("workspace_generation_jobs")
         .update({
           status: permanent ? "permanent_failed" : "running",
-          last_error: lastError.substring(0, 1000),
+          last_error: lastError,
           ...(permanent
             ? {
-                error: lastError.substring(0, 1000),
+                error: lastError,
                 completed_at: new Date().toISOString(),
               }
             : {}),
@@ -6053,9 +6053,9 @@ async function processWorkspaceGenerationJob(args: {
     .update({
       status: "failed",
       error:
-        lastError.substring(0, 1000) ||
+        lastError ||
         `Generation timed out after ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes`,
-      last_error: lastError.substring(0, 1000) || null,
+      last_error: lastError || null,
       completed_at: new Date().toISOString(),
     })
     .eq("id", job.id);
@@ -6486,7 +6486,7 @@ serve(async (req) => {
             },
           });
         } else if (outcome.state === "failed") {
-          const msg = outcome.message.substring(0, 1000);
+          const msg = outcome.message;
           await failWorkspaceJob({
             supabase,
             job,
@@ -6517,7 +6517,7 @@ serve(async (req) => {
           .from("workspace_generation_jobs")
           .update({
             status: "running",
-            last_error: msg.substring(0, 1000),
+            last_error: msg,
           })
           .eq("id", job.id);
         job = await loadJob();
@@ -6683,8 +6683,8 @@ serve(async (req) => {
           .from("workspace_generation_jobs")
           .update({
             status: "failed",
-            error: msg.substring(0, 1000),
-            last_error: msg.substring(0, 1000),
+            error: msg,
+            last_error: msg,
             completed_at: new Date().toISOString(),
           })
           .eq("id", jobId);

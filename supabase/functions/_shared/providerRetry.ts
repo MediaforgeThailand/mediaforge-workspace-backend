@@ -351,7 +351,7 @@ export async function enqueueRetryJob(p: EnqueueRetryParams): Promise<string | n
     p_initial_attempt: p.initial_attempt ?? INLINE_BUDGET_ATTEMPTS,
     p_max_attempts: p.max_attempts ?? 14,
     p_first_delay_sec: p.first_delay_sec ?? 30,
-    p_last_error: p.last_error.substring(0, 1000),
+    p_last_error: p.last_error,
     p_classification: "transient",
   });
   if (error) {
