@@ -270,7 +270,7 @@ async function listEducationSpacesForClass(classId: string): Promise<any[]> {
   const a = admin();
   const spaces = await safeData<any[]>("class_spaces.education_student_spaces", () =>
     a.from("education_student_spaces")
-      .select("id, organization_id, class_id, user_id, project_id, workspace_id, student_code, status, credits_balance, credits_lifetime_received, credits_lifetime_used, last_activity_at, completed_at, completed_by, settings, created_at, updated_at")
+      .select("*")
       .eq("class_id", classId)
       .order("updated_at", { ascending: false })
       .limit(500),
@@ -454,7 +454,7 @@ async function buildSchoolOverview(req: Request, requestedOrgId?: string | null)
     classIds.length > 0
       ? safeData<any[]>("school_overview.education_spaces", () =>
           a.from("education_student_spaces")
-            .select("id, organization_id, class_id, user_id, project_id, workspace_id, student_code, status, credits_balance, credits_lifetime_received, credits_lifetime_used, last_activity_at, completed_at, completed_by, settings, created_at, updated_at")
+            .select("*")
             .in("class_id", classIds)
             .order("updated_at", { ascending: false })
             .limit(500),
