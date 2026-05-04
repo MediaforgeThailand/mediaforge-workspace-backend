@@ -21,6 +21,73 @@ const TEAM_MAX_SEATS = 500;
 const TEAM_ANNUAL_DISCOUNT = 0.2;
 
 type CheckoutPaymentMethod = "promptpay" | "card" | "auto";
+type SupportedCurrency = "thb" | "usd" | "eur" | "gbp" | "jpy" | "cad" | "cny" | "hkd" | "aud" | "sgd";
+
+type CurrencyConfig = {
+  currency: SupportedCurrency;
+  label: string;
+  thbPerUnit: number;
+  bufferPercent: number;
+  zeroDecimal: boolean;
+  countryHint: string;
+};
+
+// Seed rates are based on the latest audited ECB cross-rate snapshot we use
+// for defaults. Keep them server-side authoritative; the frontend only mirrors
+// these values for display.
+const CURRENCY_CONFIGS: Record<SupportedCurrency, CurrencyConfig> = {
+  thb: { currency: "thb", label: "Thai baht", thbPerUnit: 1, bufferPercent: 0, zeroDecimal: false, countryHint: "TH" },
+  usd: { currency: "usd", label: "United States dollar", thbPerUnit: 32.4, bufferPercent: 25, zeroDecimal: false, countryHint: "US" },
+  eur: { currency: "eur", label: "Euro", thbPerUnit: 37.55, bufferPercent: 23, zeroDecimal: false, countryHint: "EU" },
+  gbp: { currency: "gbp", label: "Pound sterling", thbPerUnit: 42.79, bufferPercent: 22, zeroDecimal: false, countryHint: "GB" },
+  jpy: { currency: "jpy", label: "Japanese yen", thbPerUnit: 0.213, bufferPercent: 30, zeroDecimal: true, countryHint: "JP" },
+  cad: { currency: "cad", label: "Canadian dollar", thbPerUnit: 23.15, bufferPercent: 25, zeroDecimal: false, countryHint: "CA" },
+  cny: { currency: "cny", label: "Chinese renminbi", thbPerUnit: 4.55, bufferPercent: 30, zeroDecimal: false, countryHint: "CN" },
+  hkd: { currency: "hkd", label: "Hong Kong dollar", thbPerUnit: 4.17, bufferPercent: 28, zeroDecimal: false, countryHint: "HK" },
+  aud: { currency: "aud", label: "Australian dollar", thbPerUnit: 20.98, bufferPercent: 25, zeroDecimal: false, countryHint: "AU" },
+  sgd: { currency: "sgd", label: "Singapore dollar", thbPerUnit: 24.99, bufferPercent: 25, zeroDecimal: false, countryHint: "SG" },
+};
+
+function normalizeCurrency(value: unknown): SupportedCurrency {
+  const next = String(value ?? "thb").trim().toLowerCase() as SupportedCurrency;
+  return next in CURRENCY_CONFIGS ? next : "thb";
+}
+
+function currencyAmountFromThb(thb: number, currency: SupportedCurrency, overrideConfig?: CurrencyConfig) {
+  const config = overrideConfig ?? CURRENCY_CONFIGS[currency];
+  const bufferedMajor = currency === "thb"
+    ? thb
+    : (thb / config.thbPerUnit) * (1 + config.bufferPercent / 100);
+  const amountMinor = config.zeroDecimal
+    ? Math.max(1, Math.round(bufferedMajor))
+    : Math.max(100, Math.round(bufferedMajor * 100));
+  const amountMajor = config.zeroDecimal ? amountMinor : amountMinor / 100;
+  return { config, amountMinor, amountMajor };
+}
+
+async function loadCurrencyConfig(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  currency: SupportedCurrency,
+): Promise<CurrencyConfig> {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("workspace_payment_currencies")
+      .select("currency, display_name, country_hint, thb_per_unit, buffer_percent, zero_decimal")
+      .eq("currency", currency)
+      .maybeSingle();
+    if (error || !data) return CURRENCY_CONFIGS[currency];
+    return {
+      currency,
+      label: String(data.display_name ?? CURRENCY_CONFIGS[currency].label),
+      countryHint: String(data.country_hint ?? CURRENCY_CONFIGS[currency].countryHint),
+      thbPerUnit: Number(data.thb_per_unit ?? CURRENCY_CONFIGS[currency].thbPerUnit),
+      bufferPercent: Number(data.buffer_percent ?? CURRENCY_CONFIGS[currency].bufferPercent),
+      zeroDecimal: Boolean(data.zero_decimal),
+    };
+  } catch {
+    return CURRENCY_CONFIGS[currency];
+  }
+}
 
 function normalizePaymentMethod(value: unknown): CheckoutPaymentMethod {
   return value === "promptpay" || value === "card" ? value : "auto";
@@ -97,8 +164,11 @@ serve(async (req) => {
       intent?: unknown;
     };
     const paymentMethod = normalizePaymentMethod((body as { paymentMethod?: unknown }).paymentMethod);
+    const currency = normalizeCurrency((body as { currency?: unknown }).currency);
+    const isThaiCurrency = currency === "thb";
+    const currencyConfig = await loadCurrencyConfig(supabaseAdmin, currency);
     const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") || "", {
-      apiVersion: "2025-08-27.basil",
+      apiVersion: "2026-02-25.clover" as any,
     });
 
     if (checkoutType === "team_seats") {
@@ -191,6 +261,57 @@ serve(async (req) => {
         total_credits: String(totalCredits),
       };
 
+      if (!isThaiCurrency) {
+        const origin = req.headers.get("origin") || "https://workspace.mediaforge.co";
+        const localized = currencyAmountFromThb(amountThb, currency, currencyConfig);
+        const subscriptionMetadata = {
+          ...teamMetadata,
+          type: "team_seat_subscription",
+          currency,
+          amount_original: String(localized.amountMajor),
+          amount_minor: String(localized.amountMinor),
+          thb_per_currency_unit: String(localized.config.thbPerUnit),
+          price_buffer_percent: String(localized.config.bufferPercent),
+          country_hint: localized.config.countryHint,
+        };
+
+        const session = await stripe.checkout.sessions.create({
+          customer: customerId,
+          client_reference_id: user.id,
+          line_items: [
+            {
+              price_data: {
+                currency,
+                product_data: {
+                  name: `MediaForge Team - ${requestedSeats} seats`,
+                  description: `${totalCredits.toLocaleString()} shared credits (${billingCycle})`,
+                },
+                recurring: { interval: billingCycle === "annual" ? "year" : "month" },
+                unit_amount: localized.amountMinor,
+              },
+              quantity: 1,
+            },
+          ],
+          mode: "subscription",
+          metadata: subscriptionMetadata,
+          subscription_data: { metadata: subscriptionMetadata },
+          success_url: `${origin}/app/pricing?payment=success`,
+          cancel_url: `${origin}/app/pricing?payment=cancelled`,
+        });
+
+        return new Response(JSON.stringify({
+          url: session.url,
+          sessionId: session.id,
+          amount: localized.amountMinor,
+          amountOriginal: localized.amountMajor,
+          currency,
+          mode: "subscription",
+          paymentMethod: "card",
+        }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
       if (intent !== true) {
         const origin = req.headers.get("origin") || "https://workspace.mediaforge.co";
         const session = await stripe.checkout.sessions.create({
@@ -217,7 +338,15 @@ serve(async (req) => {
           cancel_url: `${origin}/app/pricing?payment=cancelled`,
         });
 
-        return new Response(JSON.stringify({ url: session.url }), {
+        return new Response(JSON.stringify({
+          url: session.url,
+          sessionId: session.id,
+          amount: amountSatang,
+          currency: "thb",
+          seats: requestedSeats,
+          creditsTotal: totalCredits,
+          mode: "payment",
+        }), {
           headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
       }
@@ -296,10 +425,7 @@ serve(async (req) => {
         : (plan.stripe_price_id_monthly ?? plan.stripe_price_id ?? null);
 
     if (!priceId) {
-      return new Response(
-        JSON.stringify({ error: `No Stripe price configured for this plan (${planBillingInterval})` }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      console.warn(`[CREATE-CHECKOUT] No legacy Stripe price configured for ${plan.id}/${planBillingInterval}; using dynamic price_data checkout`);
     }
 
     // CRITICAL: validate credits BEFORE creating session — prevents zero-credit grant downstream
@@ -408,6 +534,73 @@ serve(async (req) => {
     };
 
     // ── In-app PaymentIntent flow (Stripe Elements, PromptPay + Card) ──
+    if (!isThaiCurrency) {
+      const origin = req.headers.get("origin") || "https://workspace.mediaforge.co";
+      const baseThb =
+        planBillingInterval === "annual" && plan.annual_price_thb != null
+          ? Number(plan.annual_price_thb)
+          : Number(plan.price_thb);
+      const discountedThb = applyFirstTimeDiscount
+        ? baseThb * (1 - FIRST_TIME_DISCOUNT_PCT / 100)
+        : baseThb;
+      const localized = currencyAmountFromThb(discountedThb, currency, currencyConfig);
+      const recurringMetadata: Record<string, string> = {
+        ...metadata,
+        type: "subscription_recurring",
+        currency,
+        amount_original: String(localized.amountMajor),
+        amount_minor: String(localized.amountMinor),
+        amount_thb: String(baseThb),
+        thb_per_currency_unit: String(localized.config.thbPerUnit),
+        price_buffer_percent: String(localized.config.bufferPercent),
+        country_hint: localized.config.countryHint,
+        ...(applyFirstTimeDiscount
+          ? { first_time_discount_pct: String(FIRST_TIME_DISCOUNT_PCT), original_amount_thb: String(baseThb) }
+          : {}),
+      };
+
+      if (!Number.isFinite(localized.amountMinor) || localized.amountMinor <= 0) {
+        return new Response(JSON.stringify({ error: "Plan misconfigured (invalid localized price)" }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+      }
+
+      const session = await stripe.checkout.sessions.create({
+        customer: customerId,
+        client_reference_id: user.id,
+        line_items: [
+          {
+            price_data: {
+              currency,
+              product_data: {
+                name: `MediaForge ${plan.name}`,
+                description: `${upfrontCredits.toLocaleString()} credits (${planBillingInterval})`,
+              },
+              recurring: { interval: planBillingInterval === "annual" ? "year" : "month" },
+              unit_amount: localized.amountMinor,
+            },
+            quantity: 1,
+          },
+        ],
+        mode: "subscription",
+        metadata: recurringMetadata,
+        subscription_data: { metadata: recurringMetadata },
+        success_url: `${origin}/app/pricing?payment=success`,
+        cancel_url: `${origin}/app/pricing?payment=cancelled`,
+      });
+
+      return new Response(JSON.stringify({
+        url: session.url,
+        sessionId: session.id,
+        amount: localized.amountMinor,
+        amountOriginal: localized.amountMajor,
+        currency,
+        mode: "subscription",
+        paymentMethod: "card",
+      }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
     if (intent) {
       // Annual support (from team's pricing redesign): use annual_price_thb
       // when the user picked annual billing, else fall back to monthly.
@@ -525,8 +718,8 @@ serve(async (req) => {
     const session = await stripe.checkout.sessions.create(sessionParams);
 
     const responseBody = embedded
-      ? { clientSecret: session.client_secret }
-      : { url: session.url };
+      ? { clientSecret: session.client_secret, amount: sessionAmountSatang, currency: "thb", sessionId: session.id }
+      : { url: session.url, amount: sessionAmountSatang, currency: "thb", sessionId: session.id, mode: "payment" };
 
     return new Response(JSON.stringify(responseBody), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },

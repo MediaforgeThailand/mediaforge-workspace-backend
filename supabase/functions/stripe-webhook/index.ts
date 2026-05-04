@@ -97,6 +97,15 @@ function fmtNum(n: number): string {
   return new Intl.NumberFormat("en-US").format(n);
 }
 
+const ZERO_DECIMAL_CURRENCIES = new Set(["jpy"]);
+
+function majorFromStripeAmount(amount: number | null | undefined, currency: string | null | undefined): number {
+  const safeAmount = Number(amount ?? 0);
+  return ZERO_DECIMAL_CURRENCIES.has(String(currency ?? "").toLowerCase())
+    ? safeAmount
+    : safeAmount / 100;
+}
+
 function fmtDateTH(d: Date): string {
   return new Intl.DateTimeFormat("th-TH", { day: "numeric", month: "short", year: "numeric" }).format(d);
 }
@@ -289,6 +298,7 @@ serve(async (req) => {
       const sessionType = session.metadata?.type;
       const isTopup = sessionType === "topup";
       const isSubscriptionOneoff = sessionType === "subscription_oneoff";
+      const isTeamSeatSubscription = sessionType === "team_seat_subscription";
 
       if (!userId) {
         console.error("[STRIPE-WEBHOOK] No user_id in metadata");
@@ -310,6 +320,96 @@ serve(async (req) => {
       if (isSubscriptionOneoff) {
         console.log(`[STRIPE-WEBHOOK] subscription_oneoff session paid — grant handled by payment_intent.succeeded (PI: ${session.payment_intent})`);
         return new Response(JSON.stringify({ received: true, handled_by: "payment_intent" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (isTeamSeatSubscription) {
+        const seatCount = parseInt(session.metadata?.seat_count ?? "", 10);
+        const billingCycle = session.metadata?.billing_cycle === "annual" ? "annual" : "monthly";
+        const cycleMonths = billingCycle === "annual" ? 12 : 1;
+        const amountThb = Number(session.metadata?.amount_thb ?? 0);
+        const baseCredits = parseInt(session.metadata?.base_credits ?? "", 10);
+        const promoCredits = parseInt(session.metadata?.promo_credits ?? "", 10);
+        const totalCredits = parseInt(session.metadata?.total_credits ?? "", 10);
+        const subscriptionId = typeof session.subscription === "string" ? session.subscription : session.subscription?.id ?? null;
+
+        if (
+          !Number.isFinite(seatCount) ||
+          seatCount < TEAM_MIN_SEATS ||
+          seatCount > TEAM_MAX_SEATS ||
+          !Number.isFinite(amountThb) ||
+          amountThb <= 0 ||
+          !Number.isFinite(baseCredits) ||
+          !Number.isFinite(promoCredits) ||
+          !Number.isFinite(totalCredits) ||
+          totalCredits <= 0
+        ) {
+          console.error("[STRIPE-WEBHOOK] team_seat_subscription invalid metadata", {
+            session: session.id,
+            metadata: session.metadata,
+          });
+          throw new Error("Invalid team subscription metadata");
+        }
+
+        const { data: activation, error: activationError } = await supabase.rpc("activate_team_seat_purchase", {
+          p_user_id: userId,
+          p_buyer_email: session.metadata?.buyer_email ?? null,
+          p_buyer_name: session.metadata?.buyer_name ?? null,
+          p_payment_intent_id: session.id,
+          p_seat_count: seatCount,
+          p_billing_cycle: billingCycle,
+          p_amount_thb: amountThb,
+          p_base_credits: baseCredits,
+          p_promo_credits: promoCredits,
+          p_total_credits: totalCredits,
+        });
+
+        if (activationError) {
+          console.error("[STRIPE-WEBHOOK] team_seat_subscription activation failed:", activationError);
+          throw new Error(`Team subscription activation failed: ${activationError.message}`);
+        }
+
+        const organizationId = (activation as any)?.organization_id ?? null;
+        if (organizationId) {
+          const { data: orgRow } = await supabase
+            .from("organizations")
+            .select("settings")
+            .eq("id", organizationId)
+            .maybeSingle();
+          await supabase
+            .from("organizations")
+            .update({
+              settings: {
+                ...((orgRow?.settings as Record<string, unknown> | null) ?? {}),
+                team_stripe_subscription_id: subscriptionId,
+                team_subscription_status: "active",
+                team_subscription_currency: session.metadata?.currency ?? session.currency ?? "usd",
+                team_subscription_seats: seatCount,
+                team_subscription_cycle: billingCycle,
+                team_subscription_cycle_months: cycleMonths,
+              },
+            })
+            .eq("id", organizationId);
+
+          await supabase
+            .from("payment_transactions")
+            .update({
+              stripe_session_id: session.id,
+              stripe_subscription_id: subscriptionId,
+              currency: session.metadata?.currency ?? session.currency ?? "usd",
+              amount_original: Number(session.metadata?.amount_original ?? 0),
+              exchange_rate_thb: Number(session.metadata?.thb_per_currency_unit ?? 0),
+              price_buffer_percent: Number(session.metadata?.price_buffer_percent ?? 0),
+              checkout_metadata: session.metadata ?? {},
+              payment_method: "card",
+            })
+            .eq("stripe_payment_intent_id", session.id)
+            .eq("organization_id", organizationId);
+        }
+
+        console.log(`[STRIPE-WEBHOOK] team_seat_subscription success: org=${organizationId}, seats=${seatCount}, credits=${totalCredits}`);
+        return new Response(JSON.stringify({ received: true, team: activation }), {
           headers: { "Content-Type": "application/json" },
         });
       }
@@ -498,7 +598,13 @@ serve(async (req) => {
           package_id: null,
           stripe_session_id: session.id,
           stripe_payment_intent_id: (session.payment_intent as string) || null,
+          stripe_subscription_id: subscriptionId || null,
           amount_thb: amountThb,
+          currency: session.metadata?.currency ?? session.currency ?? "thb",
+          amount_original: Number(session.metadata?.amount_original ?? amountThb),
+          exchange_rate_thb: Number(session.metadata?.thb_per_currency_unit ?? 1),
+          price_buffer_percent: Number(session.metadata?.price_buffer_percent ?? 0),
+          checkout_metadata: session.metadata ?? {},
           credits_added: creditsToAdd,
           status: "completed",
           payment_method: session.payment_method_types?.[0] || "card",
@@ -715,9 +821,117 @@ serve(async (req) => {
         });
       }
 
+      let subscriptionMeta: Record<string, string> = {};
+      if (subscriptionId) {
+        try {
+          const sub = await stripe.subscriptions.retrieve(subscriptionId);
+          subscriptionMeta = (sub.metadata ?? {}) as Record<string, string>;
+        } catch (e) {
+          console.warn("[STRIPE-WEBHOOK] Could not retrieve subscription metadata:", e);
+        }
+      }
+
+      if (subscriptionMeta.type === "team_seat_subscription") {
+        const teamUserId = subscriptionMeta.user_id;
+        const seatCount = parseInt(subscriptionMeta.seat_count ?? "", 10);
+        const billingCycle = subscriptionMeta.billing_cycle === "annual" ? "annual" : "monthly";
+        const cycleMonths = billingCycle === "annual" ? 12 : 1;
+        const baseCredits = seatCount * TEAM_BASE_CREDITS_PER_SEAT_MONTH * cycleMonths;
+        const promoCredits = seatCount * TEAM_PROMO_CREDITS_PER_SEAT_MONTH * cycleMonths;
+        const totalCredits = baseCredits + promoCredits;
+
+        if (!teamUserId || !Number.isFinite(seatCount) || seatCount < TEAM_MIN_SEATS || seatCount > TEAM_MAX_SEATS) {
+          console.error("[STRIPE-WEBHOOK] team renewal invalid subscription metadata", {
+            subscriptionId,
+            metadata: subscriptionMeta,
+          });
+          throw new Error("Invalid team renewal metadata");
+        }
+
+        const { data: existingTeamTx } = await supabase
+          .from("payment_transactions")
+          .select("id")
+          .eq("stripe_invoice_id", invoice.id)
+          .eq("status", "completed")
+          .maybeSingle();
+        if (existingTeamTx) {
+          console.log(`[STRIPE-WEBHOOK] team renewal already processed invoice ${invoice.id}`);
+          return new Response(JSON.stringify({ received: true, deduped: true }), {
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+
+        const { data: orgRow, error: orgLookupError } = await supabase
+          .from("organizations")
+          .select("id, settings")
+          .eq("type", "team")
+          .eq("status", "active")
+          .filter("settings->>team_stripe_subscription_id", "eq", subscriptionId)
+          .maybeSingle();
+
+        if (orgLookupError || !orgRow?.id) {
+          console.error("[STRIPE-WEBHOOK] team renewal org lookup failed", orgLookupError);
+          throw new Error(`Team subscription org not found for ${subscriptionId}`);
+        }
+
+        const amountThb = Number(subscriptionMeta.amount_thb ?? 0);
+        const currency = String(invoice.currency ?? subscriptionMeta.currency ?? "usd").toLowerCase();
+        const amountOriginal = majorFromStripeAmount(invoice.amount_paid, currency);
+
+        const { data: newPool, error: poolError } = await supabase.rpc("admin_adjust_org_credit_pool", {
+          p_org_id: orgRow.id,
+          p_delta: totalCredits,
+          p_actor_id: teamUserId,
+          p_description: `Team subscription renewal: +${totalCredits} credits (${seatCount} seats, ${billingCycle})`,
+        });
+
+        if (poolError || newPool === -1) {
+          console.error("[STRIPE-WEBHOOK] team renewal credit pool error:", poolError);
+          throw new Error("Team renewal credit grant failed");
+        }
+
+        await supabase.from("payment_transactions").insert({
+          user_id: teamUserId,
+          organization_id: orgRow.id,
+          payment_scope: "team",
+          package_id: null,
+          stripe_session_id: null,
+          stripe_payment_intent_id: null,
+          stripe_subscription_id: subscriptionId,
+          stripe_invoice_id: invoice.id,
+          invoice_url: invoice.hosted_invoice_url ?? null,
+          amount_thb: Number.isFinite(amountThb) && amountThb > 0 ? amountThb : majorFromStripeAmount(invoice.amount_paid, "thb"),
+          currency,
+          amount_original: amountOriginal,
+          exchange_rate_thb: Number(subscriptionMeta.thb_per_currency_unit ?? 0),
+          price_buffer_percent: Number(subscriptionMeta.price_buffer_percent ?? 0),
+          checkout_metadata: subscriptionMeta,
+          credits_added: totalCredits,
+          status: "completed",
+          payment_method: "card",
+        });
+
+        await supabase
+          .from("organizations")
+          .update({
+            settings: {
+              ...((orgRow.settings as Record<string, unknown> | null) ?? {}),
+              team_subscription_status: "active",
+              team_last_renewal_invoice_id: invoice.id,
+              team_last_renewal_at: new Date().toISOString(),
+            },
+          })
+          .eq("id", orgRow.id);
+
+        console.log(`[STRIPE-WEBHOOK] team renewal success: org=${orgRow.id}, credits=${totalCredits}, invoice=${invoice.id}`);
+        return new Response(JSON.stringify({ received: true, team_renewal: true, credits: totalCredits }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
       const { data: profile } = await supabase
         .from("profiles")
-        .select("user_id, current_plan_id, subscription_plan_id")
+        .select("user_id, current_plan_id, subscription_plan_id, subscription_billing_cycle, billing_interval")
         .eq("stripe_customer_id", customerId)
         .single();
 
@@ -727,21 +941,34 @@ serve(async (req) => {
         // Look up the plan from subscription_plans
         const { data: plan } = await supabase
           .from("subscription_plans")
-          .select("name, upfront_credits, billing_cycle")
+          .select("name, upfront_credits, annual_credits, price_thb, annual_price_thb, billing_cycle")
           .eq("id", planId)
           .single();
 
         if (plan && plan.upfront_credits > 0) {
-          // For monthly renewal, use the monthly equivalent credits
-          // The plan stored might be annual, so find the monthly counterpart
-          let creditsToAdd = plan.upfront_credits;
+          const { data: existingRenewalTx } = await supabase
+            .from("payment_transactions")
+            .select("id")
+            .eq("stripe_invoice_id", invoice.id)
+            .eq("status", "completed")
+            .maybeSingle();
+          if (existingRenewalTx) {
+            console.log(`[STRIPE-WEBHOOK] Renewal already processed invoice ${invoice.id}`);
+            return new Response(JSON.stringify({ received: true, deduped: true }), {
+              headers: { "Content-Type": "application/json" },
+            });
+          }
 
-          // If plan is annual, find the monthly equivalent for renewal credits
-          // (Annual plans grant all credits upfront, monthly renewals grant monthly amount)
-          if (plan.billing_cycle === "annual") {
-            // Annual plans already got all credits upfront, skip renewal
-            console.log(`[STRIPE-WEBHOOK] Annual plan renewal - credits already granted upfront`);
-          } else {
+          const profileCycle = profile.subscription_billing_cycle || profile.billing_interval || plan.billing_cycle || "monthly";
+          const isAnnualRenewal = profileCycle === "annual";
+          const creditsToAdd = isAnnualRenewal && plan.annual_credits != null
+            ? Number(plan.annual_credits)
+            : Number(plan.upfront_credits);
+          const renewalAmountThb = isAnnualRenewal && plan.annual_price_thb != null
+            ? Number(plan.annual_price_thb)
+            : Number(plan.price_thb ?? 0);
+
+          if (Number.isFinite(creditsToAdd) && creditsToAdd > 0) {
             const { data: userCredits } = await supabase
               .from("user_credits")
               .select("balance, total_purchased")
@@ -756,7 +983,8 @@ serve(async (req) => {
             }).eq("user_id", profile.user_id);
 
             const renewalExpiresAt = new Date();
-            renewalExpiresAt.setMonth(renewalExpiresAt.getMonth() + 1);
+            if (isAnnualRenewal) renewalExpiresAt.setFullYear(renewalExpiresAt.getFullYear() + 1);
+            else renewalExpiresAt.setMonth(renewalExpiresAt.getMonth() + 1);
 
             await supabase.from("credit_batches").insert({
               user_id: profile.user_id,
@@ -778,6 +1006,27 @@ serve(async (req) => {
 
             console.log(`[STRIPE-WEBHOOK] Renewal: +${creditsToAdd} credits for user ${profile.user_id}`);
           }
+
+          await supabase.from("payment_transactions").insert({
+            user_id: profile.user_id,
+            package_id: null,
+            stripe_session_id: null,
+            stripe_payment_intent_id: null,
+            stripe_subscription_id: subscriptionId || null,
+            stripe_invoice_id: invoice.id,
+            invoice_url: invoice.hosted_invoice_url ?? null,
+            amount_thb: Number.isFinite(renewalAmountThb) && renewalAmountThb > 0
+              ? renewalAmountThb
+              : majorFromStripeAmount(invoice.amount_paid, "thb"),
+            currency: String(invoice.currency ?? "thb").toLowerCase(),
+            amount_original: majorFromStripeAmount(invoice.amount_paid, invoice.currency),
+            exchange_rate_thb: Number(subscriptionMeta.thb_per_currency_unit ?? 1),
+            price_buffer_percent: Number(subscriptionMeta.price_buffer_percent ?? 0),
+            checkout_metadata: subscriptionMeta,
+            credits_added: Number.isFinite(creditsToAdd) ? creditsToAdd : 0,
+            status: "completed",
+            payment_method: "card",
+          });
 
           // Update period end
           if (subscriptionId) {
@@ -900,7 +1149,14 @@ serve(async (req) => {
 
         const organizationId = (activation as any)?.organization_id ?? null;
         if (organizationId) {
-          const receiptFields = receiptFieldsFromIntent(intent);
+          const receiptFields = {
+            ...receiptFieldsFromIntent(intent),
+            currency: intent.metadata?.currency ?? intent.currency ?? "thb",
+            amount_original: Number(intent.metadata?.amount_original ?? Math.round((intent.amount ?? 0) / 100)),
+            exchange_rate_thb: Number(intent.metadata?.thb_per_currency_unit ?? 1),
+            price_buffer_percent: Number(intent.metadata?.price_buffer_percent ?? 0),
+            checkout_metadata: intent.metadata ?? {},
+          };
           if (Object.keys(receiptFields).length > 0) {
             await supabase
               .from("payment_transactions")
@@ -1058,6 +1314,11 @@ serve(async (req) => {
           stripe_payment_intent_id: intent.id,
           ...receiptFieldsFromIntent(intent),
           amount_thb: amountThb,
+          currency: intent.metadata?.currency ?? intent.currency ?? "thb",
+          amount_original: Number(intent.metadata?.amount_original ?? amountThb),
+          exchange_rate_thb: Number(intent.metadata?.thb_per_currency_unit ?? 1),
+          price_buffer_percent: Number(intent.metadata?.price_buffer_percent ?? 0),
+          checkout_metadata: intent.metadata ?? {},
           credits_added: finalCredits,
           status: "completed",
           payment_method: intent.payment_method_types?.[0] || "card",
