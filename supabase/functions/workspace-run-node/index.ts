@@ -1945,22 +1945,45 @@ async function executeBanana(
   }
 
   const aiResult = await aiResponse.json();
-  const candidate = aiResult.candidates?.[0]?.content;
-  const responseParts = candidate?.parts || [];
+  const firstCandidate = Array.isArray(aiResult.candidates) ? aiResult.candidates[0] : null;
+  const responseParts = firstCandidate?.content?.parts || [];
 
   // Extract image from response
   let imageBase64: string | null = null;
   let imageMime = "image/png";
+  const textParts: string[] = [];
 
   for (const part of responseParts) {
-    if (part.inlineData) {
-      imageBase64 = part.inlineData.data;
-      imageMime = part.inlineData.mimeType || "image/png";
+    const inlineData = part.inlineData ?? part.inline_data;
+    if (inlineData?.data) {
+      imageBase64 = inlineData.data;
+      imageMime = inlineData.mimeType ?? inlineData.mime_type ?? "image/png";
+    }
+    if (typeof part.text === "string" && part.text.trim()) {
+      textParts.push(part.text.trim());
     }
   }
 
   if (!imageBase64) {
-    throw new Error("No image was generated. Try a different prompt.");
+    const finishReason = String(firstCandidate?.finishReason ?? firstCandidate?.finish_reason ?? "").toUpperCase();
+    const finishMessage = String(firstCandidate?.finishMessage ?? firstCandidate?.finish_message ?? "");
+    const promptBlockReason = String(aiResult.promptFeedback?.blockReason ?? aiResult.prompt_feedback?.block_reason ?? "");
+    const providerText = textParts.join(" ").slice(0, 220);
+    const safetyHint = `${finishReason} ${finishMessage} ${promptBlockReason} ${providerText}`;
+    console.warn(
+      `[banana-direct] Gemini returned no image. finish=${finishReason || "empty"} ` +
+        `block=${promptBlockReason || "none"} text=${providerText || "none"} ` +
+        `parts=${responseParts.length}`,
+    );
+    if (/SAFETY|BLOCK|PROHIBITED|RECITATION|SPII/i.test(safetyHint)) {
+      throw new Error(
+        `${modelLabel} blocked this prompt by content policy. Please adjust the prompt or references.`,
+      );
+    }
+    throw new Error(
+      `${modelLabel} provider returned an empty image response on this attempt. ` +
+        "This can happen during provider pressure; the background worker will retry automatically.",
+    );
   }
 
   // Upload to storage

@@ -59,7 +59,7 @@ export interface RetryOutcome<T> {
  */
 export function classifyError(errMsg: string): "permanent" | "transient" | "unknown" {
   if (errMsg === "PROVIDER_BILLING_ERROR") return "permanent";
-  if (/safety|invalid input|invalid_argument|prompt blocked|No image was generated/i.test(errMsg)) {
+  if (/safety|invalid input|invalid_argument|prompt blocked/i.test(errMsg)) {
     return "permanent";
   }
   // Programming errors — retrying never helps. Refund immediately.
