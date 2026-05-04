@@ -1451,7 +1451,7 @@ async function executeVeo(
   const rawRes = String(params.resolution ?? "720p");
   const resolution: VeoResolution = rawRes === "1080p" ? "1080p" : "720p";
 
-  // Duration — discrete "4" | "6" | "8". The slider used for other
+  // Duration — discrete 4 | 6 | 8. The slider used for other
   // providers may hand us numbers — coerce + snap to nearest valid.
   const rawDuration = params.duration;
   const durationNum =
@@ -1459,7 +1459,7 @@ async function executeVeo(
       ? rawDuration
       : parseInt(String(rawDuration ?? "8"), 10) || 8;
   const durationSeconds: VeoDuration =
-    durationNum <= 4 ? "4" : durationNum <= 6 ? "6" : "8";
+    durationNum <= 4 ? 4 : durationNum <= 6 ? 6 : 8;
 
   // personGeneration — optional. Default to allow_adult (the safer
   // permissive setting) when not specified by the schema.

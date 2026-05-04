@@ -29,8 +29,8 @@
  *   instances[].lastFrame         { bytesBase64Encoded, mimeType } — optional end frame
  *   instances[].referenceImages   array — up to 3, NOT compatible with 9:16
  *   parameters.aspectRatio        "16:9" | "9:16"        (default 16:9)
- *   parameters.durationSeconds    "4" | "6" | "8"        (default "8";
- *                                                         must be "8"
+ *   parameters.durationSeconds    4 | 6 | 8              (default 8;
+ *                                                         must be 8
  *                                                         for 1080p/4k
  *                                                         or refs)
  *   parameters.resolution         "720p" | "1080p" | "4k" (default 720p)
@@ -54,7 +54,7 @@ export const VEO_MODEL_MAP: Record<string, { model: string; tier: "standard" }> 
 
 export type VeoAspectRatio = "16:9" | "9:16";
 export type VeoResolution = "720p" | "1080p";
-export type VeoDuration = "4" | "6" | "8";
+export type VeoDuration = 4 | 6 | 8;
 export type VeoPersonGeneration = "allow_all" | "allow_adult";
 
 export interface VeoImage {
@@ -139,9 +139,9 @@ export function buildVeoRequest(
   p: VeoSubmitParams,
   imageEncoding: VeoImageEncoding = "bytesBase64Encoded",
 ): Record<string, unknown> {
-  let duration = p.durationSeconds ?? "8";
-  if ((p.resolution === "1080p") && duration !== "8") {
-    duration = "8";
+  let duration = p.durationSeconds ?? 8;
+  if ((p.resolution === "1080p") && duration !== 8) {
+    duration = 8;
   }
 
   const instance: Record<string, unknown> = { prompt: p.prompt };
