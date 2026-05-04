@@ -51,6 +51,7 @@ import {
   extractVeoVideoUri,
   fetchImageAsInline,
   loadVeoApiKey,
+  normalizeVeoOperationName,
   pollVeoOnce,
   submitVeoTask,
   type VeoAspectRatio,
@@ -7013,16 +7014,19 @@ serve(async (req) => {
 
     /* ─── Async poll path (Google Veo 3.1 video tasks) ─────────
      * Veo's REST API is a long-running operation: we POSTed a task
-     * and got back `operations/<id>` (returned to the frontend in
-     * `task_id`). Each poll is a GET against generativelanguage with
-     * the API key. The frontend uses the same polling hook as Kling
-     * /Seedance — we normalise statuses and surface the video URL
+     * and got back a Gemini operation name (returned to the frontend
+     * in `task_id`). Each poll is a GET against generativelanguage
+     * with the API key. The frontend uses the same polling hook as
+     * Kling/Seedance — we normalise statuses and surface the video URL
      * once the operation reports `done: true`. */
     if (body.action === "poll_veo") {
-      const taskId = String(body.task_id ?? "").trim();
-      if (!taskId.startsWith("operations/")) {
+      const taskId = normalizeVeoOperationName(String(body.task_id ?? ""));
+      if (!taskId) {
         return new Response(
-          JSON.stringify({ error: "task_id must be a Veo operation name (operations/...)" }),
+          JSON.stringify({
+            error:
+              "task_id must be a Veo operation name (operations/... or models/.../operations/...)",
+          }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       }

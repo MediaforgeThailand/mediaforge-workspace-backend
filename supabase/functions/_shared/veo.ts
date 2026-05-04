@@ -78,7 +78,7 @@ export interface VeoSubmitParams {
 export type VeoImageEncoding = "bytesBase64Encoded" | "inlineData";
 
 interface VeoOperationName {
-  /** "operations/abc123…" */
+  /** "operations/abc123…" or "models/<model>/operations/abc123…" */
   name: string;
   error?: { code?: number; message?: string };
 }
@@ -196,14 +196,50 @@ export async function submitVeoTask(
   return parsed.name;
 }
 
+export function normalizeVeoOperationName(raw: string): string {
+  const value = raw.trim();
+  if (!value) return "";
+
+  if (/^https?:\/\//i.test(value)) {
+    try {
+      const url = new URL(value);
+      if (
+        url.protocol !== "https:" ||
+        url.hostname !== "generativelanguage.googleapis.com"
+      ) {
+        return "";
+      }
+      return url.pathname
+        .replace(/^\/+/, "")
+        .replace(/^v1beta\/+/, "")
+        .trim();
+    } catch {
+      return "";
+    }
+  }
+
+  const withoutSlash = value.replace(/^\/+/, "");
+  if (
+    withoutSlash.startsWith("operations/") ||
+    /^models\/[^/]+\/operations\/[^/]+/.test(withoutSlash)
+  ) {
+    return withoutSlash;
+  }
+
+  return "";
+}
+
 /** Poll the operation once. Returns the raw status object — caller
  *  interprets `done` + `error` + `response.generateVideoResponse`. */
 export async function pollVeoOnce(
   operationName: string,
   apiKey: string,
 ): Promise<VeoOperationStatus> {
-  // The operation name comes back as "operations/<id>" — preserve as-is.
-  const url = `${VEO_BASE}/${operationName}`;
+  const normalizedOperationName = normalizeVeoOperationName(operationName);
+  if (!normalizedOperationName) {
+    throw new Error("Veo poll requires a Gemini operation name.");
+  }
+  const url = `${VEO_BASE}/${normalizedOperationName}`;
   const res = await fetch(url, {
     headers: { "x-goog-api-key": apiKey },
   });
