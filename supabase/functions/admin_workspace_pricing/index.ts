@@ -298,6 +298,7 @@ const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   { feature: "chat_ai", model: "google/gemini-3-pro-preview", label: "Gemini 3 Pro Preview", cost: 100, pricing_type: "per_operation", provider: "google", price_key: "gemini-3-pro-preview", source: "official_docs", source_url: "https://ai.google.dev/gemini-api/docs/gemini-3", provider_unit: "per operation", notes: "Official Gemini 3 Pro Preview model code. Master Pricing Sheet fixed-operation placeholder: 100 credits/op." },
   { feature: "chat_ai", model: "google/gemini-3.1-pro-preview", label: "Gemini 3 Pro Preview (legacy 3.1 alias)", cost: 100, pricing_type: "per_operation", provider: "google", price_key: "gemini-3-pro-preview:legacy-3.1-alias", source: "legacy_alias", source_url: "https://ai.google.dev/gemini-api/docs/gemini-3", provider_unit: "per operation", notes: "Legacy Workspace alias retained so saved canvases using google/gemini-3.1-pro-preview still price and route to official gemini-3-pro-preview." },
   { feature: "chat_ai", model: "google/gemini-3-flash-preview", label: "Gemini 3 Flash Preview", cost: 20, pricing_type: "per_operation", provider: "google", price_key: "gemini-3-flash-preview", source: "master_pricing_sheet", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per operation", notes: "Master Pricing Sheet fixed-operation placeholder: 20 credits/op. Token-price reference: input about 0.50 USD / 1M tokens, output about 3 USD / 1M tokens." },
+  { feature: "text_to_speech", model: "gemini-3.1-flash-tts-preview", label: "Gemini 3.1 Flash Preview TTS / 1K chars", cost: 50, pricing_type: "per_1k_chars", provider: "google", price_key: "gemini-3.1-flash-tts-preview", source: "official_docs_estimate", source_url: "https://ai.google.dev/gemini-api/docs/speech-generation", provider_unit: "per 1K chars", notes: "Official Gemini TTS preview model. Runtime bills by text length until audio-token metering is implemented; retry is required because preview TTS can occasionally return text tokens instead of audio." },
   { feature: "text_to_speech", model: "gemini-2.5-flash-preview-tts", label: "Gemini 2.5 Flash Preview TTS / 1K chars", cost: 50, pricing_type: "per_1k_chars", provider: "google", price_key: "gemini-2.5-flash-preview-tts", source: "official_docs_estimate", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per 1K chars", notes: "Emergency estimate. Gemini lists Flash Preview TTS at $0.50/1M text input tokens and $10/1M audio output tokens; runtime bills by text length, so use a conservative per-1K-character floor until audio-token metering is implemented." },
   { feature: "text_to_speech", model: "gemini-2.5-pro-preview-tts", label: "Gemini 2.5 Pro Preview TTS / 1K chars", cost: 100, pricing_type: "per_1k_chars", provider: "google", price_key: "gemini-2.5-pro-preview-tts", source: "official_docs_estimate", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per 1K chars", notes: "Emergency estimate. Gemini Pro Preview TTS output audio is more expensive than Flash; runtime bills by text length, so use a conservative per-1K-character floor until audio-token metering is implemented." },
   ...ELEVENLABS_TTS_ROWS,
@@ -840,11 +841,6 @@ async function cleanupLegacyPricingRows(client: SupabaseClient): Promise<number>
       .from("credit_costs")
       .delete()
       .like("label", "[STUB]%"),
-    client
-      .from("credit_costs")
-      .delete()
-      .eq("feature", "text_to_speech")
-      .eq("model", "gemini-3.1-flash-tts-preview"),
     client
       .from("credit_costs")
       .delete()

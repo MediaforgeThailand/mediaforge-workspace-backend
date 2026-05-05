@@ -131,6 +131,9 @@ function textToSpeechModelPriceKeys(rawModel: unknown): string[] {
     "eleven_multilingual_v2": ["eleven_multilingual_v2", "elevenlabs-multilingual-v2"],
     "elevenlabs-turbo-v2-5": ["elevenlabs-turbo-v2-5", "eleven_turbo_v2_5"],
     "eleven_turbo_v2_5": ["eleven_turbo_v2_5", "elevenlabs-turbo-v2-5"],
+    "gemini-3.1-flash-tts-preview": ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"],
+    "gemini-3.1-preview-flash-tts": ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"],
+    "gemini-3.1-flash-preview-tts": ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"],
   };
   return Array.from(new Set(aliases[model] ?? [model]));
 }

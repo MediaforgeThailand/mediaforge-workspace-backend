@@ -7,13 +7,16 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-const DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts";
+const DEFAULT_GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview";
 const GEMINI_TTS_MODELS = new Set([
+  "gemini-3.1-flash-tts-preview",
   "gemini-2.5-flash-preview-tts",
   "gemini-2.5-pro-preview-tts",
 ]);
 const GEMINI_TTS_MODEL_ALIASES: Record<string, string> = {
-  "gemini-3.1-flash-tts-preview": "gemini-2.5-flash-preview-tts",
+  "gemini-3.1-preview-flash-tts": "gemini-3.1-flash-tts-preview",
+  "gemini-3.1-flash-preview-tts": "gemini-3.1-flash-tts-preview",
+  "gemini-3-flash-tts-preview": "gemini-3.1-flash-tts-preview",
 };
 
 const GEMINI_TTS_VOICES = new Set([
@@ -90,8 +93,8 @@ serve(async (req) => {
   let loggedModelName = DEFAULT_GEMINI_TTS_MODEL;
   try {
     const GEMINI_API_KEY =
-      Deno.env.get("GOOGLE_AI_STUDIO_KEY") ??
-      Deno.env.get("GEMINI_API_KEY");
+      Deno.env.get("GOOGLE_AI_STUDIO_KEY")?.trim() ||
+      Deno.env.get("GEMINI_API_KEY")?.trim();
     if (!GEMINI_API_KEY) {
       throw new Error("Gemini API key is not configured");
     }
@@ -329,31 +332,42 @@ serve(async (req) => {
 
   } catch (e) {
     console.error("TTS error:", e);
-    // Refund credits on failure (create a refund batch)
+    // Refund the exact amount charged in this request. Older code re-read the
+    // first TTS price row here, which could refund the wrong model amount.
     try {
       const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
       const adminClient = createClient(supabaseUrl, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
-      const authHeader = req.headers.get("authorization");
-      if (authHeader) {
-        const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY") || Deno.env.get("SUPABASE_PUBLISHABLE_KEY");
-        const userClient = createClient(supabaseUrl, supabaseAnonKey!, { global: { headers: { Authorization: authHeader } } });
-        const { data: { user } } = await userClient.auth.getUser(authHeader.replace("Bearer ", ""));
-        if (user) {
-          const { data: costRows } = await adminClient.from("credit_costs").select("cost").eq("feature", "text_to_speech").limit(1);
-          const ttsCost = costRows?.[0]?.cost || 5;
-          const expiresAt = new Date();
-          expiresAt.setDate(expiresAt.getDate() + 30);
-          await adminClient.from("credit_batches").insert({
-            user_id: user.id, amount: ttsCost, remaining: ttsCost, source_type: "topup",
-            expires_at: expiresAt.toISOString(), reference_id: `refund_tts_${Date.now()}`,
-          });
-          await adminClient.from("user_credits").update({ balance: (await adminClient.from("user_credits").select("balance").eq("user_id", user.id).single()).data!.balance + ttsCost }).eq("user_id", user.id);
-          await adminClient.from("credit_transactions").insert({
-            user_id: user.id, amount: ttsCost, type: "refund", feature: "text_to_speech",
-            description: `Refund: TTS failed (+${ttsCost} credits)`, balance_after: 0,
-          });
-          console.log(`[REFUND] Refunded ${ttsCost} for TTS failure. User ${user.id}`);
+      if (loggedUserId && loggedTtsCost > 0) {
+        const expiresAt = new Date();
+        expiresAt.setDate(expiresAt.getDate() + 30);
+        await adminClient.from("credit_batches").insert({
+          user_id: loggedUserId,
+          amount: loggedTtsCost,
+          remaining: loggedTtsCost,
+          source_type: "topup",
+          expires_at: expiresAt.toISOString(),
+          reference_id: `refund_tts_${Date.now()}`,
+        });
+        const { data: currentCredits } = await adminClient
+          .from("user_credits")
+          .select("balance")
+          .eq("user_id", loggedUserId)
+          .maybeSingle();
+        const balanceAfter = Math.max(0, Number(currentCredits?.balance ?? 0)) + loggedTtsCost;
+        if (currentCredits) {
+          await adminClient.from("user_credits").update({ balance: balanceAfter }).eq("user_id", loggedUserId);
+        } else {
+          await adminClient.from("user_credits").insert({ user_id: loggedUserId, balance: balanceAfter });
         }
+        await adminClient.from("credit_transactions").insert({
+          user_id: loggedUserId,
+          amount: loggedTtsCost,
+          type: "refund",
+          feature: "text_to_speech",
+          description: `Refund: TTS failed (+${loggedTtsCost} credits)`,
+          balance_after: balanceAfter,
+        });
+        console.log(`[REFUND] Refunded ${loggedTtsCost} for TTS failure. User ${loggedUserId}`);
       }
     } catch (refundErr) {
       console.error("[REFUND] TTS refund failed:", refundErr);

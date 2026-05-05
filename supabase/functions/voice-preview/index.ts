@@ -89,7 +89,10 @@ function sampleTextFor(provider: Provider, voiceId: string): string {
 }
 
 async function synthesiseGoogle(voiceId: string): Promise<Uint8Array> {
-  const apiKey = Deno.env.get("GOOGLE_TTS_API_KEY");
+  const apiKey =
+    Deno.env.get("GOOGLE_TTS_API_KEY")?.trim() ||
+    Deno.env.get("GOOGLE_CLOUD_TTS_API_KEY")?.trim() ||
+    Deno.env.get("GOOGLE_API_KEY")?.trim();
   if (!apiKey) throw new Error("GOOGLE_TTS_API_KEY not configured");
   const langMatch = voiceId.match(/^([a-z]{2}-[A-Z]{2})-/);
   const languageCode = langMatch?.[1] ?? "en-US";
@@ -124,7 +127,8 @@ async function synthesiseGemini(
   modelId: string,
 ): Promise<Uint8Array> {
   const apiKey =
-    Deno.env.get("GOOGLE_AI_STUDIO_KEY") ?? Deno.env.get("GEMINI_API_KEY");
+    Deno.env.get("GOOGLE_AI_STUDIO_KEY")?.trim() ||
+    Deno.env.get("GEMINI_API_KEY")?.trim();
   if (!apiKey) throw new Error("GEMINI_API_KEY not configured");
   const text = sampleTextFor("gemini", voiceId);
   // Use the user-selected Gemini model so Pro and Flash each preview
@@ -132,10 +136,17 @@ async function synthesiseGemini(
   // differently). Hard-coding flash made every preview sound like
   // flash even when the user picked Pro.
   const allowed = new Set([
+    "gemini-3.1-flash-tts-preview",
     "gemini-2.5-pro-preview-tts",
     "gemini-2.5-flash-preview-tts",
   ]);
-  const model = allowed.has(modelId) ? modelId : "gemini-2.5-pro-preview-tts";
+  const aliases: Record<string, string> = {
+    "gemini-3.1-preview-flash-tts": "gemini-3.1-flash-tts-preview",
+    "gemini-3.1-flash-preview-tts": "gemini-3.1-flash-tts-preview",
+    "gemini-3-flash-tts-preview": "gemini-3.1-flash-tts-preview",
+  };
+  const normalizedModel = aliases[modelId] ?? modelId;
+  const model = allowed.has(normalizedModel) ? normalizedModel : "gemini-3.1-flash-tts-preview";
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const res = await fetch(url, {
