@@ -1967,7 +1967,7 @@ async function executeBanana(
           : "no refs";
       throw new Error(
         `${modelLabel} timed out after ${Math.round(ABORT_MS / 1000)}s on this attempt (${refSummary}). ` +
-          "This is provider latency/queue timeout, not a reference-image format error; the background worker will keep retrying until the 30 minute job deadline.",
+          "This is provider latency/queue timeout, not a reference-image format error; the background worker will keep retrying until the 60 minute job deadline.",
       );
     }
     throw fetchErr;
@@ -5020,10 +5020,10 @@ interface WorkspaceRunBody {
   credit_class_id?: string | null;
 }
 
-const WORKSPACE_JOB_MAX_MS = 30 * 60_000;
+const WORKSPACE_JOB_MAX_MS = 60 * 60_000;
 // Supabase Edge requests can be terminated by the platform well before
 // long image providers return. Keep each synchronous provider attempt under
-// that ceiling, then let the durable queue retry until the 30 minute deadline.
+// that ceiling, then let the durable queue retry until the 60 minute deadline.
 const WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS = 125_000;
 const WORKSPACE_JOB_BACKOFF_MS = [3_000, 5_000, 10_000, 15_000, 30_000, 60_000];
 const WORKSPACE_JOB_WORKER_BATCH_SIZE = 2;
