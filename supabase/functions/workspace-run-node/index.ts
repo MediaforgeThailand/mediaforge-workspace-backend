@@ -5194,7 +5194,7 @@ async function pollWorkspaceAsyncResult(args: {
   const pollEndpoint = String(providerMeta.poll_endpoint ?? "").trim();
   if (!taskId || args.response.url || !pollEndpoint) return args.response;
 
-  const provider = String(providerMeta.provider ?? "kling").toLowerCase();
+  const provider = inferAsyncPollProvider(providerMeta, taskId, pollEndpoint);
   const pollAction =
     provider === "tripo3d"
       ? "poll_tripo3d"
@@ -5290,7 +5290,7 @@ async function pollWorkspaceAsyncResultOnce(args: {
     return { state: "not_async", result: args.response };
   }
 
-  const provider = String(providerMeta.provider ?? "kling").toLowerCase();
+  const provider = inferAsyncPollProvider(providerMeta, taskId, pollEndpoint);
   const pollAction =
     provider === "tripo3d"
       ? "poll_tripo3d"
@@ -5380,12 +5380,46 @@ async function pollWorkspaceAsyncResultOnce(args: {
   return { state: "pending", status: status || "submitted", message };
 }
 
+function inferAsyncPollProvider(
+  providerMeta: Record<string, unknown>,
+  taskId: string,
+  pollEndpoint: string,
+): string {
+  const explicit = String(providerMeta.provider ?? "").toLowerCase();
+  if (explicit) return explicit;
+  const endpoint = pollEndpoint.toLowerCase();
+  const task = taskId.toLowerCase();
+  if (
+    endpoint.includes("generativelanguage.googleapis.com") ||
+    task.startsWith("operations/") ||
+    task.startsWith("models/")
+  ) {
+    return "veo";
+  }
+  if (
+    endpoint.includes("byteplus") ||
+    endpoint.includes("volces.com") ||
+    endpoint.includes("/contents/generations/tasks")
+  ) {
+    return "seedance";
+  }
+  if (endpoint.includes("hyper3d")) return "hyper3d";
+  if (endpoint.includes("tripo3d")) return "tripo3d";
+  return "kling";
+}
+
 function workspaceJobDeadlineMs(job: WorkspaceJobRow): number {
-  const raw = job.deadline_at ?? job.started_at ?? job.created_at ?? "";
-  const parsed = raw ? Date.parse(raw) : Number.NaN;
-  if (Number.isFinite(parsed)) return parsed;
-  const base = job.created_at ? Date.parse(job.created_at) : Date.now();
-  return (Number.isFinite(base) ? base : Date.now()) + WORKSPACE_JOB_MAX_MS;
+  const explicitDeadline = Date.parse(String(job.deadline_at ?? ""));
+  if (Number.isFinite(explicitDeadline)) return explicitDeadline;
+
+  const started = Date.parse(String(job.started_at ?? ""));
+  const created = Date.parse(String(job.created_at ?? ""));
+  const base = Number.isFinite(started)
+    ? started
+    : Number.isFinite(created)
+      ? created
+      : Date.now();
+  return base + WORKSPACE_JOB_MAX_MS;
 }
 
 function workspaceJobLink(job: WorkspaceJobRow): string {
@@ -5415,7 +5449,11 @@ function workspaceJobPollDelaySeconds(result: Record<string, unknown>): number {
     result.provider_meta && typeof result.provider_meta === "object"
       ? (result.provider_meta as Record<string, unknown>)
       : {};
-  const provider = String(providerMeta.provider ?? "").toLowerCase();
+  const provider = inferAsyncPollProvider(
+    providerMeta,
+    String(result.task_id ?? ""),
+    String(providerMeta.poll_endpoint ?? ""),
+  );
   if (provider === "tripo3d") return 8;
   if (provider === "hyper3d") return 10;
   return 5;
@@ -5942,8 +5980,7 @@ async function processWorkspaceGenerationJob(args: {
 
   const job = jobRaw as WorkspaceJobRow;
   const request = job.request ?? {};
-  const startedAt = Date.now();
-  const budgetEndsAt = startedAt + WORKSPACE_JOB_MAX_MS;
+  const budgetEndsAt = workspaceJobDeadlineMs(job);
   let attempt = Number(job.attempts ?? 0);
   let lastError = "";
 
