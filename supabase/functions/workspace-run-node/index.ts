@@ -239,7 +239,7 @@ const BANANA_MODEL_MAP: Record<string, string> = {
    Adding a new provider? Just add a new entry here.
    ═══════════════════════════════════════════════════════════ */
 
-type DataType = "image" | "video" | "text";
+type DataType = "image" | "video" | "audio" | "text";
 
 interface HandleDef {
   internal_key: string;   // The standardized key the executor reads
@@ -319,6 +319,7 @@ const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     ref_image:     { internal_key: "image_url",      data_type: "image" },
     reference_image: { internal_key: "reference_image_url", data_type: "image" },
     ref_video:     { internal_key: "video_url",      data_type: "video" },
+    ref_audio:     { internal_key: "reference_audio_url", data_type: "audio" },
   },
   tripo3d: {
     image:         { internal_key: "image_url",      data_type: "image" },
@@ -342,6 +343,13 @@ function normalizeHandleForModel(
   const model = String(modelName ?? "").toLowerCase();
   if (provider === "kling" && targetHandle === "ref_image" && model.includes("motion")) {
     return HANDLE_SCHEMA.motion_control.ref_image;
+  }
+  if (
+    provider === "seedance" &&
+    targetHandle === "ref_image" &&
+    (model.startsWith("seedance-2-0") || model.startsWith("dreamina-seedance-2-0"))
+  ) {
+    return HANDLE_SCHEMA.seedance.reference_image;
   }
   return normalizeHandle(provider, targetHandle);
 }
@@ -1276,7 +1284,7 @@ async function executeSeedance(
   // Coerce string-y param values (the frontend serialises everything
   // through select dropdowns that hand us strings).
   const ratio = (params.ratio ?? params.aspect_ratio) as string | undefined;
-  const resolution = params.resolution as string | undefined;
+  let resolution = params.resolution as string | undefined;
   const durationRaw = params.duration as string | number | undefined;
   let duration =
     typeof durationRaw === "number"
@@ -1313,10 +1321,13 @@ async function executeSeedance(
     if (!Number.isFinite(duration) || duration < 2) duration = 2;
     else if (duration > 12) duration = 12;
   }
+  if (mapped.startsWith("dreamina-seedance-2-0") && resolution === "1080p") {
+    resolution = "720p";
+  }
   const generateAudioRaw = params.generate_audio ?? params.has_audio;
   const generateAudio = entry.supportsAudio
     ? generateAudioRaw === true || generateAudioRaw === "true"
-    : false;
+    : undefined;
   const cameraFixedRaw = params.camera_fixed;
   const cameraFixed =
     cameraFixedRaw === undefined
@@ -1336,10 +1347,14 @@ async function executeSeedance(
     params.reference_image
   ) as string | undefined;
   const referenceVideoUrl = (params.video_url ?? params.ref_video) as string | undefined;
-  if (!prompt && !startFrameUrl && !referenceImageUrl && !referenceVideoUrl) {
-    throw new Error("Seedance requires a prompt, start_frame image, reference_image, or ref_video.");
+  // Optional Seedance 2.0 multimodal reference audio (the v2 spec
+  // accepts an audio_url with role="reference_audio" alongside
+  // ref images / video).
+  const referenceAudioUrl = (params.reference_audio_url ?? params.audio_url) as string | undefined;
+  if (!prompt && !startFrameUrl && !referenceImageUrl && !referenceVideoUrl && !referenceAudioUrl) {
+    throw new Error("Seedance requires a prompt, start_frame image, reference_image, ref_video, or ref_audio.");
   }
-  if ((startFrameUrl || endFrameUrl) && (referenceImageUrl || referenceVideoUrl)) {
+  if ((startFrameUrl || endFrameUrl) && (referenceImageUrl || referenceVideoUrl || referenceAudioUrl)) {
     throw new Error("Seedance cannot mix start/end frame mode with reference media mode.");
   }
   if (referenceImageUrl && !entry.supportsVideoReference) {
@@ -1348,11 +1363,9 @@ async function executeSeedance(
   if (referenceVideoUrl && !entry.supportsVideoReference) {
     throw new Error(`Seedance model ${modelSlug} does not support reference video input.`);
   }
-
-  // Optional Seedance 2.0 multimodal reference audio (the v2 spec
-  // accepts an audio_url with role="reference_audio" alongside
-  // ref images / video).
-  const referenceAudioUrl = (params.reference_audio_url ?? params.audio_url) as string | undefined;
+  if (referenceAudioUrl && !entry.supportsVideoReference) {
+    throw new Error(`Seedance model ${modelSlug} does not support reference audio input.`);
+  }
 
   const built = buildSeedanceContent(
     {
@@ -1376,7 +1389,7 @@ async function executeSeedance(
   console.log(
     `[seedance] submit model=${entry.model} v2=${isV2} duration=${duration}s ` +
       `resolution=${resolution ?? "default"} ratio=${ratio ?? "default"} ` +
-      `audio=${generateAudio} i2v=${!!startFrameUrl} vref=${!!referenceVideoUrl} ` +
+      `audio=${!!generateAudio} i2v=${!!startFrameUrl} vref=${!!referenceVideoUrl} ` +
       `iref=${!!referenceImageUrl} aref=${!!referenceAudioUrl}`,
   );
 
@@ -1401,7 +1414,7 @@ async function executeSeedance(
       duration_seconds: duration,
       resolution,
       ratio,
-      has_audio: generateAudio,
+      has_audio: !!generateAudio,
       is_image2video: !!startFrameUrl,
       has_image_ref: !!referenceImageUrl,
       has_video_ref: !!referenceVideoUrl,
@@ -7645,6 +7658,24 @@ serve(async (req) => {
         ]));
         params.image_urls = merged;
         if (!params.image_url) params.image_url = merged[0];
+      } else if (provider === "seedance") {
+        const model = String(params.model_name ?? params.model ?? "").toLowerCase();
+        const isSeedanceV2 =
+          model.startsWith("seedance-2-0") ||
+          model.startsWith("dreamina-seedance-2-0");
+        if (isSeedanceV2) {
+          const hasKeyframeInput = Boolean(
+            params.image_url ||
+              params.start_frame ||
+              params.image_tail_url ||
+              params.end_frame,
+          );
+          if (!hasKeyframeInput && !params.reference_image_url) {
+            params.reference_image_url = mentionImageUrls[0];
+          }
+        } else if (!params.image_url) {
+          params.image_url = mentionImageUrls[0] ?? edgeImageUrls[0];
+        }
       } else {
         if (!params.image_url) params.image_url = mentionImageUrls[0];
       }
