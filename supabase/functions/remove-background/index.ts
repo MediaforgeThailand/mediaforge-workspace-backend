@@ -140,7 +140,7 @@ serve(async (req) => {
 
     // 4) Upload to ai-media bucket
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-    const fileName = `pipeline/nobg-${Date.now()}.png`;
+    const fileName = `pipeline/mediaforge_nobg_${Date.now()}.png`;
     const { error: uploadError } = await supabase.storage
       .from("ai-media")
       .upload(fileName, pngBytes, { contentType: "image/png", upsert: true });

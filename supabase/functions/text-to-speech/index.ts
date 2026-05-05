@@ -280,7 +280,7 @@ serve(async (req) => {
     const wavData = pcmToWav(pcmBytes, 24000, 1, 16);
 
     // Upload to Supabase storage (reuse supabaseAdmin from above)
-    const fileName = `${user.id}/tts/${Date.now()}.wav`;
+    const fileName = `${user.id}/tts/mediaforge_${Date.now()}.wav`;
     const { error: uploadError } = await supabaseAdmin.storage
       .from("user_assets")
       .upload(fileName, wavData, { contentType: "audio/wav", upsert: true });

@@ -2296,7 +2296,7 @@ async function executeBanana(
 
   // Upload to storage
   const ext = imageMime.split("/")[1] || "png";
-  const fileName = `pipeline/${Date.now()}.${ext}`;
+  const fileName = `pipeline/mediaforge_${Date.now()}.${ext}`;
   const binaryData = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
 
   let publicUrl = `data:${imageMime};base64,${imageBase64}`;
@@ -2884,7 +2884,7 @@ async function executeGoogleTts(
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
-  const fileName = `${userId}/tts/${Date.now()}_${voiceId}.mp3`;
+  const fileName = `${userId}/tts/mediaforge_${Date.now()}_${voiceId}.mp3`;
   const { error: uploadErr } = await supabaseClient.storage
     .from("user_assets")
     .upload(fileName, bytes, { contentType: "audio/mpeg", upsert: true });
@@ -3153,7 +3153,7 @@ async function executeElevenLabsTts(
     throw new Error("ElevenLabs returned no audio content.");
   }
 
-  const fileName = `${userId}/tts/${Date.now()}_eleven_${voiceId.slice(0, 8)}.mp3`;
+  const fileName = `${userId}/tts/mediaforge_${Date.now()}_eleven_${voiceId.slice(0, 8)}.mp3`;
   const { error: uploadErr } = await supabaseClient.storage
     .from("user_assets")
     .upload(fileName, bytes, { contentType: "audio/mpeg", upsert: true });
@@ -3448,7 +3448,7 @@ async function executeGeminiTts(
   }
 
   const wavData = pcmToWav(base64ToBytes(audioBase64), 24000, 1, 16);
-  const fileName = `${userId}/tts/${Date.now()}_gemini_${model.replace(/[^a-z0-9_-]/gi, "_")}.wav`;
+  const fileName = `${userId}/tts/mediaforge_${Date.now()}_gemini_${model.replace(/[^a-z0-9_-]/gi, "_")}.wav`;
   const { error: uploadErr } = await supabaseClient.storage
     .from("user_assets")
     .upload(fileName, wavData, { contentType: "audio/wav", upsert: true });
@@ -5449,7 +5449,7 @@ async function executeOpenAIImage2(
 
   const ext = outputFormat === "jpeg" ? "jpg" : outputFormat;
   const mime = `image/${outputFormat === "jpg" ? "jpeg" : outputFormat}`;
-  const fileName = `pipeline/${Date.now()}-openai.${ext}`;
+  const fileName = `pipeline/mediaforge_${Date.now()}.${ext}`;
   const binaryData = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 
   let publicUrl = `data:${mime};base64,${b64}`;
@@ -7354,7 +7354,7 @@ serve(async (req) => {
           .map((b) => b.toString(16).padStart(2, "0"))
           .join("")
           .slice(0, 16);
-        const fileName = `tripo3d-mirror/${user.id}/${hashHex}.${ext}`;
+        const fileName = `tripo3d-mirror/${user.id}/mediaforge_${hashHex}.${ext}`;
 
         const { error: upErr } = await supabase.storage
           .from("ai-media")
@@ -7650,7 +7650,7 @@ serve(async (req) => {
           }
           const bytes = new Uint8Array(await videoRes.arrayBuffer());
           const opId = taskId.replace(/^operations\//, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-          const path = `veo-renders/${opId}.mp4`;
+          const path = `veo-renders/mediaforge_${opId}.mp4`;
           const upload = await supabase.storage
             .from("user_assets")
             .upload(path, bytes, { contentType: "video/mp4", upsert: true });
@@ -7936,7 +7936,7 @@ serve(async (req) => {
               return null;
             }
             const buf = new Uint8Array(await r.arrayBuffer());
-            const fileName = `tripo3d/${taskId}/${Date.now()}.${ext}`;
+            const fileName = `tripo3d/${taskId}/mediaforge_${Date.now()}.${ext}`;
             const { error: upErr } = await supabase.storage
               .from("ai-media")
               .upload(fileName, buf, { contentType, upsert: true });

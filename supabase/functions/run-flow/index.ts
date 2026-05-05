@@ -416,7 +416,7 @@ async function executeNode(
     const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const storageClient = createClient(SUPABASE_URL_ENV, SUPABASE_SERVICE_ROLE_KEY);
     const ext = imageMime.split("/")[1] || "png";
-    const fileName = `pipeline/${Date.now()}.${ext}`;
+    const fileName = `pipeline/mediaforge_${Date.now()}.${ext}`;
     const binaryData = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
     let publicUrl = `data:${imageMime};base64,${imageBase64}`;
 
