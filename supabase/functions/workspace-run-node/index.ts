@@ -318,8 +318,8 @@ const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     image:         { internal_key: "image_url",      data_type: "image" },
     ref_image:     { internal_key: "image_url",      data_type: "image" },
     reference_image: { internal_key: "reference_image_urls", data_type: "image" },
-    ref_video:     { internal_key: "video_url",      data_type: "video" },
-    ref_audio:     { internal_key: "reference_audio_url", data_type: "audio" },
+    ref_video:     { internal_key: "reference_video_urls", data_type: "video" },
+    ref_audio:     { internal_key: "reference_audio_urls", data_type: "audio" },
   },
   tripo3d: {
     image:         { internal_key: "image_url",      data_type: "image" },
@@ -341,6 +341,9 @@ function normalizeHandleForModel(
   modelName?: string,
 ): HandleDef | null {
   const model = String(modelName ?? "").toLowerCase();
+  if (provider === "kling" && targetHandle === "ref_image" && model === "kling-v3-omni") {
+    return { internal_key: "ref_image_urls", data_type: "image" };
+  }
   if (provider === "kling" && targetHandle === "ref_image" && model.includes("motion")) {
     return HANDLE_SCHEMA.motion_control.ref_image;
   }
@@ -370,6 +373,20 @@ function validateEdgeValue(value: string, expectedType: DataType, targetHandle: 
       `Value starts with: "${value.substring(0, 50)}..."`
     );
   }
+}
+
+function appendUniqueStringParam(
+  params: Record<string, unknown>,
+  key: string,
+  values: string[],
+  max: number,
+): void {
+  const existing = Array.isArray(params[key])
+    ? (params[key] as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
+    : typeof params[key] === "string"
+      ? [params[key] as string]
+      : [];
+  params[key] = Array.from(new Set([...existing, ...values])).slice(0, max);
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -452,7 +469,13 @@ async function executeKling(
   //    safely skip its generic rewrite for the entire kling family.
   for (const [key, val] of Object.entries(params)) {
     if (typeof val !== "string" || !val.includes("@")) continue;
-    let out = val.replace(/@\[([^\]]+)\]\(([^)]+)\)/g, (_full, label) => label);
+    let out = val.replace(/@\[([^\]]+)\]\(([^)]+)\)/g, (full, label, nodeId) => {
+      if (modelSlug === "kling-v3-pro") {
+        const hit = mentioned.find((m) => m.nodeId === nodeId);
+        if (hit?.kind === "element") return full;
+      }
+      return label;
+    });
     out = out.replace(/@([^\s@[]+)/g, (full, name) => {
       const hit = mentioned.find(
         (m) => m.label === name && m.kind !== "element",
@@ -468,7 +491,7 @@ async function executeKling(
   }
 
   // ── Standard Image-to-Video / Text-to-Video ──
-  return await executeKlingStandard(params, mapping, modelSlug, jwtToken);
+  return await executeKlingStandard(params, mapping, modelSlug, jwtToken, mentioned);
 }
 
 /**
@@ -594,7 +617,7 @@ async function executeKlingMotionControl(
   }
 
   const keepOriginalSound = String(params.keep_original_sound ?? "no");
-  const characterOrientation = String(params.character_orientation ?? "image");
+  const characterOrientation = String(params.character_orientation ?? "video");
 
   const body: Record<string, unknown> = {
     model_name: mapping.model,
@@ -608,6 +631,46 @@ async function executeKlingMotionControl(
   // Prompt is optional for motion control
   const prompt = String(params.prompt ?? "").trim();
   if (prompt) body.prompt = prompt;
+
+  if (modelSlug === "kling-v3-motion-pro" && Array.isArray(params.elements)) {
+    const elementList: Array<Record<string, unknown>> = [];
+    for (const rawElement of params.elements) {
+      if (!rawElement || typeof rawElement !== "object") continue;
+      const e = rawElement as Record<string, unknown>;
+      const name = String(e.name ?? "element");
+      const refs = Array.isArray(e.reference_image_urls)
+        ? (e.reference_image_urls as unknown[]).filter(
+            (u): u is string => typeof u === "string" && u.length > 0,
+          )
+        : [];
+      const frontal = typeof e.frontal_image_url === "string" ? e.frontal_image_url : undefined;
+      const refsB64: string[] = [];
+      for (const u of refs.slice(0, 4)) {
+        try {
+          const bytes = await fetchImageBuffer(u);
+          refsB64.push(bytesToBase64(bytes));
+        } catch {
+          refsB64.push(u);
+        }
+      }
+      let frontalB64: string | undefined;
+      if (frontal) {
+        try {
+          const bytes = await fetchImageBuffer(frontal);
+          frontalB64 = bytesToBase64(bytes);
+        } catch {
+          frontalB64 = frontal;
+        }
+      }
+      if (refsB64.length === 0 && !frontalB64) continue;
+      const entry: Record<string, unknown> = { name };
+      if (refsB64.length > 0) entry.reference_image_urls = refsB64;
+      if (frontalB64) entry.frontal_image_url = frontalB64;
+      elementList.push(entry);
+      if (elementList.length >= 1) break;
+    }
+    if (elementList.length > 0) body.elements = elementList;
+  }
 
   console.log(`[kling-motion] POST ${ENDPOINT} model=${mapping.model} mode=${mapping.mode} orientation=${characterOrientation}`);
 
@@ -674,6 +737,7 @@ async function executeKlingStandard(
   mapping: { model: string; mode: string },
   modelSlug: string,
   jwtToken: string,
+  mentioned: MentionedAssetSrv[] = [],
 ): Promise<ProviderResult> {
   const finalPrompt = String(params.prompt ?? "");
 
@@ -728,12 +792,15 @@ async function executeKlingStandard(
   }
 
   const initialMode = String((params.mode as string) ?? mapping.mode).toLowerCase() === "std" ? "std" : "pro";
+  let durationValue = parseInt(String(params.duration ?? 5), 10) || 5;
+  if (mapping.model === "kling-v3") {
+    durationValue = Math.max(3, Math.min(durationValue, 15));
+  }
 
   const body: Record<string, unknown> = {
     model_name: mapping.model,
     mode: initialMode,
-    prompt: finalPrompt,
-    duration: String(params.duration ?? 5),
+    duration: String(durationValue),
     aspect_ratio: resolvedAspect,
   };
 
@@ -753,6 +820,133 @@ async function executeKlingStandard(
   // Omni keeps using `sound: "on"|"off"` in executeKlingOmni below.
   if (params.has_audio === "true" || params.has_audio === true) {
     body.enable_audio = true;
+  }
+
+  type StandardElementEntry = {
+    name: string;
+    reference_image_urls: string[];
+    frontal_image_url?: string;
+    brand_element_id?: string;
+  };
+  const standardElements: StandardElementEntry[] = [];
+  const pushElement = (entry: StandardElementEntry) => {
+    if (entry.reference_image_urls.length === 0 && !entry.frontal_image_url) return;
+    const existing = standardElements.findIndex(
+      (e) =>
+        (entry.brand_element_id && e.brand_element_id === entry.brand_element_id) ||
+        e.name === entry.name,
+    );
+    if (existing >= 0) return;
+    standardElements.push(entry);
+  };
+  if (modelSlug === "kling-v3-pro" && Array.isArray(params.elements)) {
+    for (const rawElement of params.elements) {
+      if (!rawElement || typeof rawElement !== "object") continue;
+      const e = rawElement as Record<string, unknown>;
+      const refs = Array.isArray(e.reference_image_urls)
+        ? (e.reference_image_urls as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
+        : [];
+      pushElement({
+        name: String(e.name ?? "element"),
+        reference_image_urls: refs.slice(0, 4),
+        frontal_image_url: typeof e.frontal_image_url === "string" ? e.frontal_image_url : undefined,
+        brand_element_id: typeof e.brand_element_id === "string" ? e.brand_element_id : undefined,
+      });
+      if (standardElements.length >= 4) break;
+    }
+  }
+  if (modelSlug === "kling-v3-pro") {
+    for (const m of mentioned) {
+      if (m.kind !== "element") continue;
+      pushElement({
+        name: m.name ?? m.label ?? "element",
+        reference_image_urls: (m.reference_image_urls ?? []).slice(0, 4),
+        frontal_image_url: m.frontal_image_url,
+        brand_element_id: m.brand_element_id,
+      });
+      if (standardElements.length >= 4) break;
+    }
+  }
+
+  const mentionByNodeId = new Map<string, number>();
+  const mentionByLabel = new Map<string, number>();
+  for (const m of mentioned) {
+    if (m.kind !== "element") continue;
+    const name = m.name ?? m.label ?? "element";
+    const idx = standardElements.findIndex(
+      (e) =>
+        (m.brand_element_id && e.brand_element_id === m.brand_element_id) ||
+        e.name === name,
+    );
+    if (idx < 0) continue;
+    if (m.nodeId) mentionByNodeId.set(m.nodeId, idx);
+    if (m.label) mentionByLabel.set(m.label, idx);
+    if (m.name) mentionByLabel.set(m.name, idx);
+  }
+  const rewriteStandardKlingTokens = (s: string): string => {
+    if (!s || !s.includes("@")) return s;
+    let out = s.replace(/@\[([^\]]+)\]\(([^)]+)\)/g, (_full, label: string, nodeId: string) => {
+      const idx = mentionByNodeId.get(nodeId);
+      return typeof idx === "number" ? `@Element${idx + 1}` : label;
+    });
+    out = out.replace(/@([^\s@[]+)/g, (full: string, name: string) => {
+      const idx = mentionByLabel.get(name);
+      return typeof idx === "number" ? `@Element${idx + 1}` : full;
+    });
+    return out;
+  };
+
+  const isMultiShot = (params.multi_shot === "true" || params.multi_shot === true) && modelSlug === "kling-v3-pro";
+  if (isMultiShot && params.multi_prompt) {
+    body.multi_shot = true;
+    body.shot_type = "customize";
+    let shots: Array<{ prompt: string; duration: number }>;
+    if (typeof params.multi_prompt === "string") {
+      try {
+        shots = JSON.parse(params.multi_prompt);
+      } catch {
+        throw new Error("multi_prompt must be a valid JSON array of {prompt, duration} objects");
+      }
+    } else {
+      shots = params.multi_prompt as Array<{ prompt: string; duration: number }>;
+    }
+    body.multi_prompt = shots.map((shot, index) => ({
+      index: index + 1,
+      prompt: rewriteStandardKlingTokens(String(shot.prompt ?? "")),
+      duration: String(Number(shot.duration) || 0),
+    }));
+  } else {
+    const prompt = rewriteStandardKlingTokens(finalPrompt);
+    if (prompt) body.prompt = prompt;
+  }
+
+  if (standardElements.length > 0) {
+    const elementList: Array<Record<string, unknown>> = [];
+    for (const e of standardElements) {
+      const refsB64: string[] = [];
+      for (const u of e.reference_image_urls.slice(0, 4)) {
+        try {
+          const bytes = await fetchImageBuffer(u);
+          refsB64.push(bytesToBase64(bytes));
+        } catch {
+          refsB64.push(u);
+        }
+      }
+      let frontalB64: string | undefined;
+      if (e.frontal_image_url) {
+        try {
+          const bytes = await fetchImageBuffer(e.frontal_image_url);
+          frontalB64 = bytesToBase64(bytes);
+        } catch {
+          frontalB64 = e.frontal_image_url;
+        }
+      }
+      const entry: Record<string, unknown> = { name: e.name };
+      if (refsB64.length > 0) entry.reference_image_urls = refsB64;
+      if (frontalB64) entry.frontal_image_url = frontalB64;
+      elementList.push(entry);
+    }
+    if (elementList.length > 0) body.elements = elementList;
   }
 
   const res = await fetch(endpoint, {
@@ -880,8 +1074,15 @@ async function executeKlingOmni(
   }
 
   // Additional ref_image (no type constraint — general reference)
-  const refImageUrl = params.ref_image_url as string | undefined;
-  if (refImageUrl) {
+  const refImageUrls = [
+    ...(Array.isArray(params.ref_image_urls)
+      ? (params.ref_image_urls as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
+      : []),
+    ...(typeof params.ref_image_url === "string" && params.ref_image_url.length > 0
+      ? [params.ref_image_url]
+      : []),
+  ];
+  for (const refImageUrl of Array.from(new Set(refImageUrls)).slice(0, 7)) {
     let refPayload = refImageUrl;
     try {
       const refBytes = await fetchImageBuffer(refImageUrl);
@@ -936,7 +1137,7 @@ async function executeKlingOmni(
   const imageSourceUrls: Array<string | undefined> = [];
   if (rawImageUrl) imageSourceUrls.push(rawImageUrl);
   if (rawTailUrl) imageSourceUrls.push(rawTailUrl);
-  if (refImageUrl) imageSourceUrls.push(refImageUrl);
+  for (const refImageUrl of refImageUrls) imageSourceUrls.push(refImageUrl);
 
   type ElementEntry = {
     name: string;
@@ -1364,24 +1565,56 @@ async function executeSeedance(
     return out.slice(0, 9);
   };
   const referenceImageUrls = collectReferenceImageUrls();
-  const referenceVideoUrl = (params.video_url ?? params.ref_video) as string | undefined;
+  const collectReferenceVideoUrls = (): string[] => {
+    const acc: string[] = [];
+    const push = (v: unknown) => {
+      if (typeof v === "string" && v.length > 0) acc.push(v);
+    };
+    const pushMany = (v: unknown) => {
+      if (Array.isArray(v)) v.forEach(push);
+      else push(v);
+    };
+    pushMany(params.reference_video_urls);
+    pushMany(params.reference_video_url);
+    pushMany(params.video_urls);
+    pushMany(params.video_url);
+    pushMany(params.ref_video);
+    return Array.from(new Set(acc)).slice(0, 3);
+  };
+  const referenceVideoUrls = collectReferenceVideoUrls();
   // Optional Seedance 2.0 multimodal reference audio (the v2 spec
   // accepts an audio_url with role="reference_audio" alongside
   // ref images / video).
-  const referenceAudioUrl = (params.reference_audio_url ?? params.audio_url) as string | undefined;
-  if (!prompt && !startFrameUrl && referenceImageUrls.length === 0 && !referenceVideoUrl && !referenceAudioUrl) {
+  const collectReferenceAudioUrls = (): string[] => {
+    const acc: string[] = [];
+    const push = (v: unknown) => {
+      if (typeof v === "string" && v.length > 0) acc.push(v);
+    };
+    const pushMany = (v: unknown) => {
+      if (Array.isArray(v)) v.forEach(push);
+      else push(v);
+    };
+    pushMany(params.reference_audio_urls);
+    pushMany(params.reference_audio_url);
+    pushMany(params.audio_urls);
+    pushMany(params.audio_url);
+    pushMany(params.ref_audio);
+    return Array.from(new Set(acc)).slice(0, 3);
+  };
+  const referenceAudioUrls = collectReferenceAudioUrls();
+  if (!prompt && !startFrameUrl && referenceImageUrls.length === 0 && referenceVideoUrls.length === 0 && referenceAudioUrls.length === 0) {
     throw new Error("Seedance requires a prompt, start_frame image, reference_image, ref_video, or ref_audio.");
   }
-  if ((startFrameUrl || endFrameUrl) && (referenceImageUrls.length > 0 || referenceVideoUrl || referenceAudioUrl)) {
+  if ((startFrameUrl || endFrameUrl) && (referenceImageUrls.length > 0 || referenceVideoUrls.length > 0 || referenceAudioUrls.length > 0)) {
     throw new Error("Seedance cannot mix start/end frame mode with reference media mode.");
   }
   if (referenceImageUrls.length > 0 && !entry.supportsVideoReference) {
     throw new Error(`Seedance model ${modelSlug} does not support reference image input.`);
   }
-  if (referenceVideoUrl && !entry.supportsVideoReference) {
+  if (referenceVideoUrls.length > 0 && !entry.supportsVideoReference) {
     throw new Error(`Seedance model ${modelSlug} does not support reference video input.`);
   }
-  if (referenceAudioUrl && !entry.supportsVideoReference) {
+  if (referenceAudioUrls.length > 0 && !entry.supportsVideoReference) {
     throw new Error(`Seedance model ${modelSlug} does not support reference audio input.`);
   }
 
@@ -1398,8 +1631,8 @@ async function executeSeedance(
       startFrameUrl,
       endFrameUrl,
       referenceImageUrls,
-      referenceVideoUrl,
-      referenceAudioUrl,
+      referenceVideoUrls,
+      referenceAudioUrls,
     },
     { v2: isV2 },
   );
@@ -1407,8 +1640,8 @@ async function executeSeedance(
   console.log(
     `[seedance] submit model=${entry.model} v2=${isV2} duration=${duration}s ` +
       `resolution=${resolution ?? "default"} ratio=${ratio ?? "default"} ` +
-      `audio=${!!generateAudio} i2v=${!!startFrameUrl} vref=${!!referenceVideoUrl} ` +
-      `irefs=${referenceImageUrls.length} aref=${!!referenceAudioUrl}`,
+      `audio=${!!generateAudio} i2v=${!!startFrameUrl} vrefs=${referenceVideoUrls.length} ` +
+      `irefs=${referenceImageUrls.length} arefs=${referenceAudioUrls.length}`,
   );
 
   const taskId = await submitSeedanceTask(
@@ -1436,7 +1669,10 @@ async function executeSeedance(
       is_image2video: !!startFrameUrl,
       has_image_ref: referenceImageUrls.length > 0,
       reference_image_count: referenceImageUrls.length,
-      has_video_ref: !!referenceVideoUrl,
+      has_video_ref: referenceVideoUrls.length > 0,
+      reference_video_count: referenceVideoUrls.length,
+      has_audio_ref: referenceAudioUrls.length > 0,
+      reference_audio_count: referenceAudioUrls.length,
       poll_endpoint: `${SEEDANCE_BASE}${SEEDANCE_TASKS_PATH}`,
     },
   };
@@ -3611,12 +3847,13 @@ async function executeOneStep(
           edgeImageUrls.push(rawValue);
           if (!stepParams[handleDef.internal_key]) stepParams[handleDef.internal_key] = rawValue;
         } else if (handleDef.internal_key === "reference_image_urls" && handleDef.data_type === "image") {
-          const existing = Array.isArray(stepParams.reference_image_urls)
-            ? (stepParams.reference_image_urls as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
-            : typeof stepParams.reference_image_urls === "string"
-              ? [stepParams.reference_image_urls]
-              : [];
-          stepParams.reference_image_urls = Array.from(new Set([...existing, rawValue])).slice(0, 9);
+          appendUniqueStringParam(stepParams, "reference_image_urls", [rawValue], 9);
+        } else if (handleDef.internal_key === "ref_image_urls" && handleDef.data_type === "image") {
+          appendUniqueStringParam(stepParams, "ref_image_urls", [rawValue], 7);
+        } else if (handleDef.internal_key === "reference_video_urls" && handleDef.data_type === "video") {
+          appendUniqueStringParam(stepParams, "reference_video_urls", [rawValue], 3);
+        } else if (handleDef.internal_key === "reference_audio_urls" && handleDef.data_type === "audio") {
+          appendUniqueStringParam(stepParams, "reference_audio_urls", [rawValue], 3);
         } else {
           stepParams[handleDef.internal_key] = rawValue;
         }
@@ -7893,12 +8130,13 @@ serve(async (req) => {
             params[handleDef.internal_key] = stringVals[0];
           }
         } else if (handleDef.internal_key === "reference_image_urls" && handleDef.data_type === "image") {
-          const existing = Array.isArray(params.reference_image_urls)
-            ? (params.reference_image_urls as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
-            : typeof params.reference_image_urls === "string"
-              ? [params.reference_image_urls]
-              : [];
-          params.reference_image_urls = Array.from(new Set([...existing, ...stringVals])).slice(0, 9);
+          appendUniqueStringParam(params, "reference_image_urls", stringVals, 9);
+        } else if (handleDef.internal_key === "ref_image_urls" && handleDef.data_type === "image") {
+          appendUniqueStringParam(params, "ref_image_urls", stringVals, 7);
+        } else if (handleDef.internal_key === "reference_video_urls" && handleDef.data_type === "video") {
+          appendUniqueStringParam(params, "reference_video_urls", stringVals, 3);
+        } else if (handleDef.internal_key === "reference_audio_urls" && handleDef.data_type === "audio") {
+          appendUniqueStringParam(params, "reference_audio_urls", stringVals, 3);
         } else {
           // Non-image keys: last value wins (uncommon for them to
           // duplicate; keep behaviour simple).

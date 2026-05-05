@@ -136,9 +136,13 @@ export interface SeedanceParams {
   endFrameUrl?: string;
   /** Seedance 2.0 multimodal reference image URLs. */
   referenceImageUrls?: string[];
-  /** Seedance 2.0 multimodal reference video URL. */
+  /** Seedance 2.0 multimodal reference video URLs. */
+  referenceVideoUrls?: string[];
+  /** Back-compat scalar reference video URL. */
   referenceVideoUrl?: string;
-  /** Seedance 2.0 multimodal reference audio URL. */
+  /** Seedance 2.0 multimodal reference audio URLs. */
+  referenceAudioUrls?: string[];
+  /** Back-compat scalar reference audio URL. */
   referenceAudioUrl?: string;
 }
 
@@ -220,17 +224,25 @@ export function buildSeedanceContent(
         role: "reference_image",
       });
     }
-    if (p.referenceVideoUrl) {
+    const referenceVideoUrls = [
+      ...(p.referenceVideoUrls ?? []),
+      ...(p.referenceVideoUrl ? [p.referenceVideoUrl] : []),
+    ];
+    for (const url of Array.from(new Set(referenceVideoUrls)).slice(0, 3)) {
       content.push({
         type: "video_url",
-        video_url: { url: p.referenceVideoUrl },
+        video_url: { url },
         role: "reference_video",
       });
     }
-    if (p.referenceAudioUrl) {
+    const referenceAudioUrls = [
+      ...(p.referenceAudioUrls ?? []),
+      ...(p.referenceAudioUrl ? [p.referenceAudioUrl] : []),
+    ];
+    for (const url of Array.from(new Set(referenceAudioUrls)).slice(0, 3)) {
       content.push({
         type: "audio_url",
-        audio_url: { url: p.referenceAudioUrl },
+        audio_url: { url },
         role: "reference_audio",
       });
     }
