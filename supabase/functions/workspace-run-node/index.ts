@@ -317,7 +317,7 @@ const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     image_input:   { internal_key: "image_url",      data_type: "image" },
     image:         { internal_key: "image_url",      data_type: "image" },
     ref_image:     { internal_key: "image_url",      data_type: "image" },
-    reference_image: { internal_key: "reference_image_url", data_type: "image" },
+    reference_image: { internal_key: "reference_image_urls", data_type: "image" },
     ref_video:     { internal_key: "video_url",      data_type: "video" },
     ref_audio:     { internal_key: "reference_audio_url", data_type: "audio" },
   },
@@ -1342,22 +1342,40 @@ async function executeSeedance(
         : undefined;
   const startFrameUrl = (params.image_url ?? params.start_frame) as string | undefined;
   const endFrameUrl = (params.image_tail_url ?? params.end_frame) as string | undefined;
-  const referenceImageUrl = (
-    params.reference_image_url ??
-    params.reference_image
-  ) as string | undefined;
+  const collectReferenceImageUrls = (): string[] => {
+    const acc: string[] = [];
+    const push = (v: unknown) => {
+      if (typeof v === "string" && v.length > 0) acc.push(v);
+    };
+    const pushMany = (v: unknown) => {
+      if (Array.isArray(v)) v.forEach(push);
+      else push(v);
+    };
+    pushMany(params.reference_image_urls);
+    pushMany(params.reference_image_url);
+    pushMany(params.reference_image);
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const url of acc) {
+      if (seen.has(url)) continue;
+      seen.add(url);
+      out.push(url);
+    }
+    return out.slice(0, 9);
+  };
+  const referenceImageUrls = collectReferenceImageUrls();
   const referenceVideoUrl = (params.video_url ?? params.ref_video) as string | undefined;
   // Optional Seedance 2.0 multimodal reference audio (the v2 spec
   // accepts an audio_url with role="reference_audio" alongside
   // ref images / video).
   const referenceAudioUrl = (params.reference_audio_url ?? params.audio_url) as string | undefined;
-  if (!prompt && !startFrameUrl && !referenceImageUrl && !referenceVideoUrl && !referenceAudioUrl) {
+  if (!prompt && !startFrameUrl && referenceImageUrls.length === 0 && !referenceVideoUrl && !referenceAudioUrl) {
     throw new Error("Seedance requires a prompt, start_frame image, reference_image, ref_video, or ref_audio.");
   }
-  if ((startFrameUrl || endFrameUrl) && (referenceImageUrl || referenceVideoUrl || referenceAudioUrl)) {
+  if ((startFrameUrl || endFrameUrl) && (referenceImageUrls.length > 0 || referenceVideoUrl || referenceAudioUrl)) {
     throw new Error("Seedance cannot mix start/end frame mode with reference media mode.");
   }
-  if (referenceImageUrl && !entry.supportsVideoReference) {
+  if (referenceImageUrls.length > 0 && !entry.supportsVideoReference) {
     throw new Error(`Seedance model ${modelSlug} does not support reference image input.`);
   }
   if (referenceVideoUrl && !entry.supportsVideoReference) {
@@ -1379,7 +1397,7 @@ async function executeSeedance(
       watermark: false,
       startFrameUrl,
       endFrameUrl,
-      referenceImageUrl,
+      referenceImageUrls,
       referenceVideoUrl,
       referenceAudioUrl,
     },
@@ -1390,7 +1408,7 @@ async function executeSeedance(
     `[seedance] submit model=${entry.model} v2=${isV2} duration=${duration}s ` +
       `resolution=${resolution ?? "default"} ratio=${ratio ?? "default"} ` +
       `audio=${!!generateAudio} i2v=${!!startFrameUrl} vref=${!!referenceVideoUrl} ` +
-      `iref=${!!referenceImageUrl} aref=${!!referenceAudioUrl}`,
+      `irefs=${referenceImageUrls.length} aref=${!!referenceAudioUrl}`,
   );
 
   const taskId = await submitSeedanceTask(
@@ -1416,7 +1434,8 @@ async function executeSeedance(
       ratio,
       has_audio: !!generateAudio,
       is_image2video: !!startFrameUrl,
-      has_image_ref: !!referenceImageUrl,
+      has_image_ref: referenceImageUrls.length > 0,
+      reference_image_count: referenceImageUrls.length,
       has_video_ref: !!referenceVideoUrl,
       poll_endpoint: `${SEEDANCE_BASE}${SEEDANCE_TASKS_PATH}`,
     },
@@ -3546,6 +3565,17 @@ async function executeOneStep(
     } else if (p === "banana") {
       stepParams.mention_image_urls = allMentionedImageUrls;
       if (!stepParams.image_url) stepParams.image_url = allMentionedImageUrls[0];
+    } else if (
+      p === "seedance" &&
+      (String(stepParams.model_name ?? stepParams.model ?? "").startsWith("seedance-2-0") ||
+        String(stepParams.model_name ?? stepParams.model ?? "").startsWith("dreamina-seedance-2-0"))
+    ) {
+      const existing = Array.isArray(stepParams.reference_image_urls)
+        ? (stepParams.reference_image_urls as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
+        : typeof stepParams.reference_image_urls === "string"
+          ? [stepParams.reference_image_urls]
+          : [];
+      stepParams.reference_image_urls = Array.from(new Set([...existing, ...allMentionedImageUrls])).slice(0, 9);
     } else {
       if (!stepParams.image_url) stepParams.image_url = allMentionedImageUrls[0];
     }
@@ -3580,6 +3610,13 @@ async function executeOneStep(
         if (handleDef.internal_key === "image_url" && handleDef.data_type === "image") {
           edgeImageUrls.push(rawValue);
           if (!stepParams[handleDef.internal_key]) stepParams[handleDef.internal_key] = rawValue;
+        } else if (handleDef.internal_key === "reference_image_urls" && handleDef.data_type === "image") {
+          const existing = Array.isArray(stepParams.reference_image_urls)
+            ? (stepParams.reference_image_urls as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
+            : typeof stepParams.reference_image_urls === "string"
+              ? [stepParams.reference_image_urls]
+              : [];
+          stepParams.reference_image_urls = Array.from(new Set([...existing, rawValue])).slice(0, 9);
         } else {
           stepParams[handleDef.internal_key] = rawValue;
         }
@@ -3592,8 +3629,30 @@ async function executeOneStep(
   const existingMentionUrls = (stepParams.mention_image_urls as string[] | undefined) ?? [];
   const allAggregatedImages = [...new Set([...allMentionedImageUrls, ...edgeImageUrls, ...existingMentionUrls])];
   if (allAggregatedImages.length > 0) {
-    stepParams.mention_image_urls = allAggregatedImages;
-    if (!stepParams.image_url) stepParams.image_url = allAggregatedImages[0];
+    const p = stepDef.provider.toLowerCase();
+    const isSeedanceV2 =
+      p === "seedance" &&
+      (String(stepParams.model_name ?? stepParams.model ?? "").startsWith("seedance-2-0") ||
+        String(stepParams.model_name ?? stepParams.model ?? "").startsWith("dreamina-seedance-2-0"));
+    if (isSeedanceV2) {
+      const hasKeyframeInput = Boolean(
+        stepParams.image_url ||
+          stepParams.start_frame ||
+          stepParams.image_tail_url ||
+          stepParams.end_frame,
+      );
+      if (!hasKeyframeInput) {
+        const existing = Array.isArray(stepParams.reference_image_urls)
+          ? (stepParams.reference_image_urls as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
+          : typeof stepParams.reference_image_urls === "string"
+            ? [stepParams.reference_image_urls]
+            : [];
+        stepParams.reference_image_urls = Array.from(new Set([...existing, ...allAggregatedImages])).slice(0, 9);
+      }
+    } else {
+      stepParams.mention_image_urls = allAggregatedImages;
+      if (!stepParams.image_url) stepParams.image_url = allAggregatedImages[0];
+    }
   }
 
   console.log(
@@ -7833,6 +7892,13 @@ serve(async (req) => {
           if (!params[handleDef.internal_key]) {
             params[handleDef.internal_key] = stringVals[0];
           }
+        } else if (handleDef.internal_key === "reference_image_urls" && handleDef.data_type === "image") {
+          const existing = Array.isArray(params.reference_image_urls)
+            ? (params.reference_image_urls as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
+            : typeof params.reference_image_urls === "string"
+              ? [params.reference_image_urls]
+              : [];
+          params.reference_image_urls = Array.from(new Set([...existing, ...stringVals])).slice(0, 9);
         } else {
           // Non-image keys: last value wins (uncommon for them to
           // duplicate; keep behaviour simple).
@@ -7891,8 +7957,14 @@ serve(async (req) => {
               params.image_tail_url ||
               params.end_frame,
           );
-          if (!hasKeyframeInput && !params.reference_image_url) {
-            params.reference_image_url = mentionImageUrls[0];
+          if (!hasKeyframeInput) {
+            const existing = Array.isArray(params.reference_image_urls)
+              ? (params.reference_image_urls as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
+              : typeof params.reference_image_urls === "string"
+                ? [params.reference_image_urls]
+                : [];
+            const merged = Array.from(new Set([...existing, ...mentionImageUrls, ...edgeImageUrls])).slice(0, 9);
+            if (merged.length > 0) params.reference_image_urls = merged;
           }
         } else if (!params.image_url) {
           params.image_url = mentionImageUrls[0] ?? edgeImageUrls[0];

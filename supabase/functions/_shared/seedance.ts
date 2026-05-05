@@ -134,8 +134,8 @@ export interface SeedanceParams {
   startFrameUrl?: string;
   /** Image-to-video end frame URL (optional, models that support it). */
   endFrameUrl?: string;
-  /** Seedance 2.0 multimodal reference image URL. */
-  referenceImageUrl?: string;
+  /** Seedance 2.0 multimodal reference image URLs. */
+  referenceImageUrls?: string[];
   /** Seedance 2.0 multimodal reference video URL. */
   referenceVideoUrl?: string;
   /** Seedance 2.0 multimodal reference audio URL. */
@@ -169,7 +169,8 @@ export interface BuiltSeedanceBody {
  *               (used for start-frame and end-frame inputs)
  *             • Multimodal-ref mode → `reference_image` /
  *               `reference_video` / `reference_audio`
- *               (used for character / style / clip references)
+ *               (used for character / style / clip references;
+ *                Seedance 2.0 accepts 1-9 reference images)
  *           Mixing the two modes in a single request → 400. Verified
  *           against the official BytePlus ModelArk API reference
  *           docs (Apr 2026, page 1520757):
@@ -212,10 +213,10 @@ export function buildSeedanceContent(
         role: "last_frame",
       });
     }
-    if (p.referenceImageUrl) {
+    for (const url of p.referenceImageUrls ?? []) {
       content.push({
         type: "image_url",
-        image_url: { url: p.referenceImageUrl },
+        image_url: { url },
         role: "reference_image",
       });
     }
