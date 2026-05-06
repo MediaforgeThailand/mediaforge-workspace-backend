@@ -111,6 +111,41 @@ function isProviderBillingLike(status: number, text: string): boolean {
   return /account balance not enough|insufficient balance|insufficient_quota|billing|payment required|prepaid|top[ -]?up|quota exceeded/i.test(text);
 }
 
+const MAGNIFIC_BASE =
+  Deno.env.get("MAGNIFIC_API_BASE")?.trim().replace(/\/+$/, "") ||
+  "https://api.magnific.com/v1";
+
+function loadMagnificApiKey(): string {
+  const key =
+    Deno.env.get("MAGNIFIC_API_KEY") ??
+    Deno.env.get("FREEPIK_API_KEY") ??
+    Deno.env.get("MAGNIFIC_KEY");
+  if (!key) {
+    throw new Error(
+      "Freepik/Magnific Veo fallback is not configured. Set MAGNIFIC_API_KEY or FREEPIK_API_KEY.",
+    );
+  }
+  return key;
+}
+
+function shouldPreferMagnificVeo(): boolean {
+  const value = String(
+    Deno.env.get("VEO_PROVIDER") ??
+      Deno.env.get("VEO_BACKEND") ??
+      Deno.env.get("VEO_FALLBACK_PROVIDER") ??
+      "",
+  ).trim().toLowerCase();
+  return value === "freepik" || value === "magnific" || value === "freepik_veo";
+}
+
+function canUseMagnificVeo(): boolean {
+  return Boolean(
+    Deno.env.get("MAGNIFIC_API_KEY") ??
+      Deno.env.get("FREEPIK_API_KEY") ??
+      Deno.env.get("MAGNIFIC_KEY"),
+  );
+}
+
 async function fetchWithAttemptTimeout(
   input: string | URL | Request,
   init: RequestInit,
@@ -1734,7 +1769,6 @@ async function executeVeo(
       `Unknown Veo model: ${modelSlug}. Available: ${Object.keys(VEO_MODEL_MAP).join(", ")}`,
     );
   }
-  const apiKey = loadVeoApiKey();
 
   const prompt = String(params.prompt ?? "").trim();
   if (!prompt) {
@@ -1775,6 +1809,21 @@ async function executeVeo(
   const endFrameUrl = (params.end_frame ?? params.image_tail_url) as
     | string
     | undefined;
+
+  if (shouldPreferMagnificVeo()) {
+    return await submitMagnificVeoTask({
+      prompt,
+      negativePrompt: String(params.negative_prompt ?? "").trim(),
+      startFrameUrl,
+      endFrameUrl,
+      aspectRatio,
+      resolution,
+      durationSeconds,
+      modelSlug,
+      providerModelId: entry.model,
+    });
+  }
+
   const startFrame = startFrameUrl ? await fetchVeoFrameAsInline(startFrameUrl, supabaseClient) : undefined;
   const endFrame = endFrameUrl ? await fetchVeoFrameAsInline(endFrameUrl, supabaseClient) : undefined;
   const hasFrameInput = Boolean(startFrame || endFrame);
@@ -1796,6 +1845,7 @@ async function executeVeo(
     durationSeconds,
     personGeneration,
   };
+
   const body = buildVeoRequest(requestParams);
 
   console.log(
@@ -1806,12 +1856,28 @@ async function executeVeo(
 
   let operationName: string;
   try {
+    const apiKey = loadVeoApiKey();
     operationName = await submitVeoTask(entry.model, body, apiKey);
   } catch (err) {
     const firstMessage = err instanceof Error ? err.message : String(err);
+    if (isNonRetryableQuotaError(firstMessage) && canUseMagnificVeo()) {
+      console.warn("[veo] Google quota exhausted; falling back to Freepik/Magnific Veo 3.1");
+      return await submitMagnificVeoTask({
+        prompt,
+        negativePrompt: String(params.negative_prompt ?? "").trim(),
+        startFrameUrl,
+        endFrameUrl,
+        aspectRatio,
+        resolution,
+        durationSeconds,
+        modelSlug,
+        providerModelId: entry.model,
+      });
+    }
     if ((startFrame || endFrame) && firstMessage.includes("`bytesBase64Encoded` isn't supported")) {
       console.warn("[veo] bytesBase64Encoded rejected; retrying inlineData payload");
       try {
+        const apiKey = loadVeoApiKey();
         operationName = await submitVeoTask(
           entry.model,
           buildVeoRequest(requestParams, "inlineData"),
@@ -3529,6 +3595,94 @@ async function executeGeminiTts(
       voice,
       model,
       style_prompt: stylePrompt || null,
+    },
+  };
+}
+
+async function submitMagnificVeoTask(args: {
+  prompt: string;
+  negativePrompt?: string;
+  startFrameUrl?: string;
+  endFrameUrl?: string;
+  aspectRatio: VeoAspectRatio;
+  resolution: VeoResolution;
+  durationSeconds: VeoDuration;
+  modelSlug: string;
+  providerModelId: string;
+}): Promise<ProviderResult> {
+  const apiKey = loadMagnificApiKey();
+  const hasImageInput = Boolean(args.startFrameUrl);
+  if (args.endFrameUrl) {
+    console.warn("[veo-magnific] end frame is not supported by the fallback API; submitting start frame only");
+  }
+  const endpoint = hasImageInput
+    ? `${MAGNIFIC_BASE}/ai/image-to-video/veo-3-1`
+    : `${MAGNIFIC_BASE}/ai/text-to-video/veo-3-1`;
+  const payload: Record<string, unknown> = {
+    prompt: args.prompt,
+    duration: args.durationSeconds,
+    resolution: args.resolution,
+    aspect_ratio: args.aspectRatio,
+    generate_audio: true,
+  };
+  if (args.negativePrompt) payload.negative_prompt = args.negativePrompt;
+  if (hasImageInput) payload.image = args.startFrameUrl;
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-magnific-api-key": apiKey,
+      "x-freepik-api-key": apiKey,
+    },
+    body: JSON.stringify(payload),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Freepik/Magnific Veo submit failed (HTTP ${res.status}): ${text.slice(0, 500)}`);
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw new Error(`Freepik/Magnific Veo submit returned non-JSON: ${text.slice(0, 200)}`);
+  }
+  const data = parsed.data && typeof parsed.data === "object"
+    ? (parsed.data as Record<string, unknown>)
+    : parsed;
+  const taskId = String(data.task_id ?? data.id ?? "").trim();
+  if (!taskId) {
+    throw new Error("Freepik/Magnific Veo submit succeeded but no task_id returned");
+  }
+
+  console.log(
+    `[veo-magnific] submit task=${taskId} mode=${hasImageInput ? "i2v" : "t2v"} ` +
+      `duration=${args.durationSeconds}s resolution=${args.resolution} aspect=${args.aspectRatio}`,
+  );
+
+  return {
+    task_id: taskId,
+    outputs: {
+      output_video: "",
+      output_start_frame: args.startFrameUrl ?? "",
+      output_end_frame: "",
+    },
+    output_type: "video_url",
+    provider_meta: {
+      provider: "freepik_veo",
+      source_provider: "magnific",
+      fallback_for: "veo",
+      model: args.modelSlug,
+      provider_model_id: args.providerModelId,
+      provider_endpoint: endpoint,
+      tier: "standard",
+      duration_seconds: args.durationSeconds,
+      resolution: args.resolution,
+      aspect_ratio: args.aspectRatio,
+      has_audio: true,
+      is_image2video: hasImageInput,
+      unsupported_end_frame: Boolean(args.endFrameUrl),
+      poll_endpoint: endpoint,
     },
   };
 }
@@ -5565,6 +5719,7 @@ interface WorkspaceRunBody {
     | "poll_kling"
     | "poll_seedance"
     | "poll_veo"
+    | "poll_freepik_veo"
     | "poll_hyper3d"
     | "poll_tripo3d"
     | "mirror_tripo_url"
@@ -5818,6 +5973,8 @@ async function pollWorkspaceAsyncResult(args: {
         ? "poll_seedance"
       : provider === "veo"
         ? "poll_veo"
+      : provider === "freepik_veo"
+        ? "poll_freepik_veo"
         : "poll_kling";
   const intervalMs = provider === "tripo3d" ? 4_000 : provider === "hyper3d" ? 6_000 : 5_000;
   const successStatuses = new Set([
@@ -5914,6 +6071,8 @@ async function pollWorkspaceAsyncResultOnce(args: {
         ? "poll_seedance"
       : provider === "veo"
         ? "poll_veo"
+      : provider === "freepik_veo"
+        ? "poll_freepik_veo"
         : "poll_kling";
 
   const pollResp = await invokeWorkspaceRunOnce({
@@ -5966,11 +6125,11 @@ async function pollWorkspaceAsyncResultOnce(args: {
       args.response.outputs && typeof args.response.outputs === "object"
         ? (args.response.outputs as Record<string, string>)
         : {};
-    const responseType = String(args.response.type ?? "");
+    const responseType = String(args.response.type ?? args.response.output_type ?? "");
     const outputKey =
-      responseType === "video"
+      responseType === "video" || responseType === "video_url"
         ? "output_video"
-        : responseType === "audio"
+        : responseType === "audio" || responseType === "audio_url"
           ? "output_audio"
           : "output_image";
     return {
@@ -6003,6 +6162,12 @@ function inferAsyncPollProvider(
   if (explicit) return explicit;
   const endpoint = pollEndpoint.toLowerCase();
   const task = taskId.toLowerCase();
+  if (
+    endpoint.includes("api.magnific.com") ||
+    endpoint.includes("api.freepik.com")
+  ) {
+    return "freepik_veo";
+  }
   if (
     endpoint.includes("generativelanguage.googleapis.com") ||
     task.startsWith("operations/") ||
@@ -7696,6 +7861,163 @@ serve(async (req) => {
           task_id: taskId,
           url: videoUrl,
           message,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    /* ─── Async poll path (Freepik/Magnific Veo 3.1 tasks) ───
+     * Used as a capacity fallback when direct Google Gemini Veo quota is
+     * exhausted. Magnific returns { data: { status, generated[] } }; on
+     * terminal success we mirror the provider URL into Supabase storage so
+     * the browser sees the same signed-URL shape as direct Veo. */
+    if (body.action === "poll_freepik_veo") {
+      const taskId = String(body.task_id ?? "").trim();
+      const pollEndpoint = String(body.poll_endpoint ?? "").trim();
+      if (!taskId || !pollEndpoint) {
+        return new Response(
+          JSON.stringify({ error: "task_id and poll_endpoint required for poll_freepik_veo" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let pollUrlOk = false;
+      try {
+        const u = new URL(pollEndpoint);
+        pollUrlOk =
+          u.protocol === "https:" &&
+          (u.hostname === "api.magnific.com" || u.hostname === "api.freepik.com") &&
+          /^\/v1\/ai\/(?:text-to-video|image-to-video|reference-to-video)\/veo-3-1(?:-fast)?\/?$/.test(
+            u.pathname,
+          );
+      } catch {
+        pollUrlOk = false;
+      }
+      if (!pollUrlOk) {
+        return new Response(
+          JSON.stringify({ error: "poll_endpoint must be a Magnific/Freepik Veo endpoint" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let apiKey: string;
+      try {
+        apiKey = loadMagnificApiKey();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({ error: msg }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const pollUrl = `${pollEndpoint.replace(/\/+$/, "")}/${encodeURIComponent(taskId)}`;
+      let payload: Record<string, unknown>;
+      try {
+        const r = await fetch(pollUrl, {
+          method: "GET",
+          headers: {
+            "x-magnific-api-key": apiKey,
+            "x-freepik-api-key": apiKey,
+          },
+        });
+        const text = await r.text();
+        if (!r.ok) {
+          return new Response(
+            JSON.stringify({
+              status: "polling_error",
+              message: `Freepik/Magnific Veo poll failed (HTTP ${r.status}): ${text.slice(0, 300)}`,
+            }),
+            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({
+            status: "polling_error",
+            message: msg.substring(0, 300),
+          }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const data = payload.data && typeof payload.data === "object"
+        ? (payload.data as Record<string, unknown>)
+        : payload;
+      const rawStatus = String(data.status ?? payload.status ?? "").toUpperCase();
+      const generated = Array.isArray(data.generated)
+        ? data.generated
+        : Array.isArray(payload.generated)
+          ? payload.generated
+          : [];
+      const providerVideoUrl = generated
+        .map((item) => {
+          if (typeof item === "string") return item;
+          if (item && typeof item === "object") {
+            const row = item as Record<string, unknown>;
+            return String(row.url ?? row.video_url ?? row.download_url ?? "").trim();
+          }
+          return "";
+        })
+        .find((url) => /^https:\/\//i.test(url)) ?? "";
+      const errorMessage = String(
+        data.error ??
+          data.message ??
+          payload.error ??
+          payload.message ??
+          "",
+      );
+      const normalised =
+        rawStatus === "COMPLETED" || rawStatus === "DONE" || rawStatus === "SUCCEEDED" || providerVideoUrl
+          ? "succeed"
+          : rawStatus === "FAILED" || rawStatus === "ERROR" || rawStatus === "CANCELLED" || rawStatus === "CANCELED"
+            ? "failed"
+            : "processing";
+
+      let publicUrl = "";
+      if (normalised === "succeed" && providerVideoUrl) {
+        try {
+          const videoRes = await fetch(providerVideoUrl);
+          if (!videoRes.ok) {
+            throw new Error(`download HTTP ${videoRes.status}`);
+          }
+          const bytes = new Uint8Array(await videoRes.arrayBuffer());
+          const contentType = videoRes.headers.get("content-type")?.split(";")[0]?.trim() || "video/mp4";
+          const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
+          const path = `${user.id}/veo-renders/freepik_${safeTaskId}.mp4`;
+          const upload = await supabase.storage
+            .from("user_assets")
+            .upload(path, bytes, { contentType, upsert: true });
+          if (upload.error) throw upload.error;
+          const signed = await supabase.storage
+            .from("user_assets")
+            .createSignedUrl(path, 60 * 60 * 24 * 365);
+          if (signed.error || !signed.data?.signedUrl) {
+            throw signed.error ?? new Error("no signed URL");
+          }
+          publicUrl = signed.data.signedUrl;
+        } catch (err) {
+          console.error("[poll_freepik_veo] rehost failed:", err);
+          return new Response(
+            JSON.stringify({
+              status: "failed",
+              task_id: taskId,
+              url: "",
+              message: `Freepik/Magnific Veo finished but the video couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
+            }),
+            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          status: normalised,
+          task_id: taskId,
+          url: publicUrl,
+          message: normalised === "failed" ? errorMessage || "Freepik/Magnific Veo task failed" : rawStatus,
         }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
