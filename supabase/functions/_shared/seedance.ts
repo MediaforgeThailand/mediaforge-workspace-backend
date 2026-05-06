@@ -374,7 +374,7 @@ export async function submitSeedanceTask(
     }
     if (/SensitiveContentDetected|PrivacyInformation|real person|privacy-sensitive|input image may contain real person/i.test(providerError)) {
       throw new Error(
-        "Seedance rejected the reference media because its safety filter detected a real person or privacy-sensitive content in the input. Use consented non-sensitive reference media, anonymize the person, or try another model.",
+        "Seedance rejected the reference media because its safety filter detected a real person or privacy-sensitive content in the input. The direct BytePlus Seedance 2.0 API requires verified real-human assets for real people; use a verified asset:// reference, a virtual/generated character, or another provider/model.",
       );
     }
     if (/content\[\d+\].*video duration|reference videos?.*duration|total duration of all videos/i.test(text)) {

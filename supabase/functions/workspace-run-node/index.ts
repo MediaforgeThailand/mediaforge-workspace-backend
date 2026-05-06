@@ -125,7 +125,7 @@ function loadMagnificApiKey(): string {
   const key = rawKey?.trim().replace(/[\u0000-\u001F\u007F-\uFFFF]/g, "");
   if (!key) {
     throw new Error(
-      "Freepik/Magnific Veo fallback is not configured. Set MAGNIFIC_API_KEY or FREEPIK_API_KEY.",
+      "Freepik/Magnific video fallback is not configured. Set MAGNIFIC_API_KEY or FREEPIK_API_KEY.",
     );
   }
   return key;
@@ -160,6 +160,10 @@ function canUseMagnificVeo(): boolean {
 }
 
 function canUseMagnificImage(): boolean {
+  return canUseMagnificVeo();
+}
+
+function canUseMagnificVideo(): boolean {
   return canUseMagnificVeo();
 }
 
@@ -1572,6 +1576,179 @@ async function executeKlingOmni(
    polling hook in the frontend video node picker works without
    model-aware branching.
    ═══════════════════════════════════════════════════════════ */
+function isSeedanceRealPersonPolicyError(message: string): boolean {
+  return /Seedance rejected the reference media|SensitiveContentDetected|PrivacyInformation|real person|privacy-sensitive|input image may contain real person/i.test(
+    message,
+  );
+}
+
+function normalizeMagnificVideoAspectRatio(value: unknown): string {
+  const raw = String(value ?? "").trim().toLowerCase();
+  switch (raw) {
+    case "21:9":
+    case "film_horizontal_21_9":
+      return "film_horizontal_21_9";
+    case "16:9":
+    case "widescreen_16_9":
+      return "widescreen_16_9";
+    case "4:3":
+    case "classic_4_3":
+      return "classic_4_3";
+    case "1:1":
+    case "square_1_1":
+      return "square_1_1";
+    case "3:4":
+    case "traditional_3_4":
+      return "traditional_3_4";
+    case "9:16":
+    case "social_story_9_16":
+      return "social_story_9_16";
+    case "9:21":
+    case "film_vertical_9_21":
+      return "film_vertical_9_21";
+    default:
+      return "widescreen_16_9";
+  }
+}
+
+function magnificSeedanceEndpointSlug(modelSlug: string, resolution?: string): string {
+  const model = modelSlug.toLowerCase();
+  const res =
+    resolution === "480p"
+      ? "480p"
+      : resolution === "1080p"
+        ? "1080p"
+        : "720p";
+  const tier = model.includes("lite") || model.includes("fast") ? "lite" : "pro";
+  return `seedance-${tier}-${res}`;
+}
+
+function normalizeMagnificSeedanceDuration(value: number): "5" | "10" {
+  return value <= 7 ? "5" : "10";
+}
+
+async function submitMagnificSeedanceTask(args: {
+  modelSlug: string;
+  providerModelId: string;
+  prompt: string;
+  imageUrl: string;
+  duration: number;
+  resolution?: string;
+  ratio?: string;
+  cameraFixed?: boolean;
+  seed?: number;
+  fallbackReason: string;
+  sourceInputMode: "start_frame" | "end_frame" | "reference_image";
+  referenceImageCount: number;
+  hadEndFrame: boolean;
+}): Promise<ProviderResult> {
+  if (!/^https?:\/\//i.test(args.imageUrl) && !/^data:image\//i.test(args.imageUrl)) {
+    throw new Error("Freepik/Magnific Seedance fallback requires an image URL or data image.");
+  }
+  const apiKey = loadMagnificApiKey();
+  const endpointSlug = magnificSeedanceEndpointSlug(args.modelSlug, args.resolution);
+  const endpoint = `${MAGNIFIC_BASE}/ai/image-to-video/${endpointSlug}`;
+  const endpointHost = new URL(endpoint).hostname;
+  const authHeaderName = endpointHost.includes("magnific.com")
+    ? "x-magnific-api-key"
+    : "x-freepik-api-key";
+
+  let imagePayload = args.imageUrl;
+  if (/^https?:\/\//i.test(args.imageUrl)) {
+    try {
+      imagePayload = bytesToBase64(await fetchImageBuffer(args.imageUrl));
+      console.log(`[seedance-magnific] converted fallback image to base64 (${Math.round(imagePayload.length / 1024)}KB)`);
+    } catch (err) {
+      console.warn("[seedance-magnific] image base64 conversion failed, using URL:", err);
+    }
+  }
+
+  const payload: Record<string, unknown> = {
+    prompt: args.prompt || "Animate the reference image naturally.",
+    image: imagePayload,
+    duration: normalizeMagnificSeedanceDuration(args.duration),
+    camera_fixed: Boolean(args.cameraFixed),
+    frames_per_second: 24,
+  };
+  if (args.ratio && args.ratio !== "Auto") {
+    payload.aspect_ratio = normalizeMagnificVideoAspectRatio(args.ratio);
+  }
+  if (typeof args.seed === "number" && Number.isFinite(args.seed)) {
+    payload.seed = Math.max(-1, Math.min(4_294_967_295, Math.trunc(args.seed)));
+  }
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      [authHeaderName]: apiKey,
+    },
+    body: JSON.stringify(payload),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Freepik/Magnific Seedance submit failed (HTTP ${res.status}): ${text.slice(0, 500)}`);
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  } catch {
+    throw new Error(`Freepik/Magnific Seedance submit returned non-JSON: ${text.slice(0, 200)}`);
+  }
+  const data = parsed.data && typeof parsed.data === "object"
+    ? (parsed.data as Record<string, unknown>)
+    : parsed;
+  const generated = Array.isArray(data.generated)
+    ? data.generated
+    : Array.isArray(parsed.generated)
+      ? parsed.generated
+      : [];
+  const immediateUrl = extractProviderMediaUrl(generated);
+  const providerMeta = {
+    provider: "freepik_seedance",
+    source_provider: "magnific",
+    fallback_for: "seedance",
+    fallback_reason: args.fallbackReason,
+    model: args.modelSlug,
+    provider_model_id: args.providerModelId,
+    provider_endpoint: endpoint,
+    endpoint_slug: endpointSlug,
+    duration_seconds: Number(payload.duration),
+    requested_duration_seconds: args.duration,
+    resolution: args.resolution,
+    aspect_ratio: payload.aspect_ratio ?? "auto",
+    source_input_mode: args.sourceInputMode,
+    reference_image_count: args.referenceImageCount,
+    unsupported_end_frame: args.hadEndFrame,
+    poll_endpoint: endpoint,
+  };
+  if (immediateUrl) {
+    return {
+      result_url: immediateUrl,
+      outputs: { output_video: immediateUrl },
+      output_type: "video_url",
+      provider_meta: { ...providerMeta, immediate_result: true },
+    };
+  }
+  const taskId = String(data.task_id ?? data.id ?? "").trim();
+  if (!taskId) {
+    throw new Error("Freepik/Magnific Seedance submit succeeded but no task_id returned");
+  }
+  console.warn(
+    `[seedance-magnific] submitted fallback task=${taskId} endpoint=${endpointSlug} reason=${args.fallbackReason}`,
+  );
+  return {
+    task_id: taskId,
+    outputs: {
+      output_video: "",
+      output_start_frame: args.imageUrl,
+      output_last_frame: "",
+    },
+    output_type: "video_url",
+    provider_meta: providerMeta,
+  };
+}
+
 async function executeSeedance(
   params: Record<string, unknown>,
 ): Promise<ProviderResult> {
@@ -1750,10 +1927,49 @@ async function executeSeedance(
       `irefs=${referenceImageUrls.length} arefs=${referenceAudioUrls.length}`,
   );
 
-  const taskId = await submitSeedanceTask(
-    { model: entry.model, ...built },
-    apiKey,
-  );
+  let taskId: string;
+  try {
+    taskId = await submitSeedanceTask(
+      { model: entry.model, ...built },
+      apiKey,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const fallbackImageUrl =
+      startFrameUrl
+        ? { url: startFrameUrl, mode: "start_frame" as const }
+        : referenceImageUrls[0]
+          ? { url: referenceImageUrls[0], mode: "reference_image" as const }
+          : endFrameUrl
+            ? { url: endFrameUrl, mode: "end_frame" as const }
+            : null;
+    if (
+      isV2 &&
+      isSeedanceRealPersonPolicyError(message) &&
+      fallbackImageUrl &&
+      canUseMagnificVideo()
+    ) {
+      console.warn(
+        "[seedance] BytePlus real-person policy rejected image input; trying Freepik/Magnific Seedance fallback",
+      );
+      return await submitMagnificSeedanceTask({
+        modelSlug,
+        providerModelId: entry.model,
+        prompt,
+        imageUrl: fallbackImageUrl.url,
+        duration,
+        resolution,
+        ratio,
+        cameraFixed,
+        seed,
+        fallbackReason: "byteplus_real_person_policy",
+        sourceInputMode: fallbackImageUrl.mode,
+        referenceImageCount: referenceImageUrls.length,
+        hadEndFrame: Boolean(endFrameUrl),
+      });
+    }
+    throw err;
+  }
 
   return {
     task_id: taskId,
@@ -6280,6 +6496,7 @@ interface WorkspaceRunBody {
     | "poll_veo"
     | "poll_replicate_veo"
     | "poll_freepik_veo"
+    | "poll_freepik_video"
     | "poll_freepik_image"
     | "poll_hyper3d"
     | "poll_tripo3d"
@@ -6537,8 +6754,8 @@ async function pollWorkspaceAsyncResult(args: {
         ? "poll_veo"
       : provider === "replicate_veo"
         ? "poll_replicate_veo"
-      : provider === "freepik_veo"
-        ? "poll_freepik_veo"
+      : provider === "freepik_veo" || provider === "freepik_seedance"
+        ? "poll_freepik_video"
       : provider === "freepik_image"
         ? "poll_freepik_image"
         : "poll_kling";
@@ -6640,8 +6857,8 @@ async function pollWorkspaceAsyncResultOnce(args: {
         ? "poll_veo"
       : provider === "replicate_veo"
         ? "poll_replicate_veo"
-      : provider === "freepik_veo"
-        ? "poll_freepik_veo"
+      : provider === "freepik_veo" || provider === "freepik_seedance"
+        ? "poll_freepik_video"
       : provider === "freepik_image"
         ? "poll_freepik_image"
         : "poll_kling";
@@ -6739,6 +6956,7 @@ function inferAsyncPollProvider(
     endpoint.includes("api.freepik.com")
   ) {
     if (endpoint.includes("/text-to-image/")) return "freepik_image";
+    if (endpoint.includes("/seedance-")) return "freepik_seedance";
     return "freepik_veo";
   }
   if (endpoint.includes("api.replicate.com")) return "replicate_veo";
@@ -8565,12 +8783,12 @@ serve(async (req) => {
       );
     }
 
-    if (body.action === "poll_freepik_veo") {
+    if (body.action === "poll_freepik_veo" || body.action === "poll_freepik_video") {
       const taskId = String(body.task_id ?? "").trim();
       const pollEndpoint = String(body.poll_endpoint ?? "").trim();
       if (!taskId || !pollEndpoint) {
         return new Response(
-          JSON.stringify({ error: "task_id and poll_endpoint required for poll_freepik_veo" }),
+          JSON.stringify({ error: "task_id and poll_endpoint required for poll_freepik_video" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       }
@@ -8581,7 +8799,7 @@ serve(async (req) => {
         pollUrlOk =
           u.protocol === "https:" &&
           (u.hostname === "api.magnific.com" || u.hostname === "api.freepik.com") &&
-          /^\/v1\/ai\/(?:text-to-video|image-to-video|reference-to-video)\/veo-3-1(?:-fast)?\/?$/.test(
+          /^\/v1\/ai\/(?:text-to-video|image-to-video|reference-to-video)\/(?:veo-3-1(?:-fast)?|seedance-(?:pro|lite)-(?:480p|720p|1080p)|seedance-1-5-pro-(?:480p|720p|1080p))\/?$/.test(
             u.pathname,
           );
       } catch {
@@ -8589,7 +8807,7 @@ serve(async (req) => {
       }
       if (!pollUrlOk) {
         return new Response(
-          JSON.stringify({ error: "poll_endpoint must be a Magnific/Freepik Veo endpoint" }),
+          JSON.stringify({ error: "poll_endpoint must be a Magnific/Freepik video endpoint" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       }
@@ -8623,7 +8841,7 @@ serve(async (req) => {
           return new Response(
             JSON.stringify({
               status: "polling_error",
-              message: `Freepik/Magnific Veo poll failed (HTTP ${r.status}): ${text.slice(0, 300)}`,
+              message: `Freepik/Magnific video poll failed (HTTP ${r.status}): ${text.slice(0, 300)}`,
             }),
             { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
           );
@@ -8683,7 +8901,7 @@ serve(async (req) => {
           const bytes = new Uint8Array(await videoRes.arrayBuffer());
           const contentType = videoRes.headers.get("content-type")?.split(";")[0]?.trim() || "video/mp4";
           const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
-          const path = `${user.id}/veo-renders/freepik_${safeTaskId}.mp4`;
+          const path = `${user.id}/video-renders/freepik_${safeTaskId}.mp4`;
           const upload = await supabase.storage
             .from("user_assets")
             .upload(path, bytes, { contentType, upsert: true });
@@ -8696,13 +8914,13 @@ serve(async (req) => {
           }
           publicUrl = signed.data.signedUrl;
         } catch (err) {
-          console.error("[poll_freepik_veo] rehost failed:", err);
+          console.error("[poll_freepik_video] rehost failed:", err);
           return new Response(
             JSON.stringify({
               status: "failed",
               task_id: taskId,
               url: "",
-              message: `Freepik/Magnific Veo finished but the video couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
+              message: `Freepik/Magnific video finished but the video couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
             }),
             { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
           );
