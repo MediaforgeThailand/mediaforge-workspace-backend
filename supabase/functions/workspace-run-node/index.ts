@@ -2672,7 +2672,7 @@ async function executeBanana(
             : "no refs";
         return new Response(
           `${modelLabel} timed out after ${Math.round(ABORT_MS / 1000)}s on this attempt (${refSummary}). ` +
-            "This is provider latency/queue timeout, not a reference-image format error; the background worker will keep retrying until the 60 minute job deadline.",
+            "This is provider latency/queue timeout, not a reference-image format error; the sync path will stop early to protect Gemini quota.",
           { status: 504 },
         );
       }
@@ -6159,6 +6159,12 @@ const WORKSPACE_JOB_LOCK_SEC = 360;
 const WORKSPACE_JOB_HEARTBEAT_MS = 45_000;
 const WORKSPACE_JOB_EXPIRE_SWEEP_LIMIT = 25;
 
+function workspaceJobMaxAttempts(provider: string): number {
+  // Gemini image sync calls consume request quota on every retry because there
+  // is no task id to resume. Keep Banana conservative until it moves to Batch.
+  return provider === "banana" ? 2 : 18;
+}
+
 type WorkspaceJobStatus =
   | "queued"
   | "running"
@@ -6223,6 +6229,7 @@ function isPermanentWorkspaceJobError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return (
     classifyError(msg) === "permanent" ||
+    /Nano Banana .*failed \(HTTP (?:503|504), key=primary\).*?(?:DEADLINE_EXCEEDED|UNAVAILABLE|high demand|timed out|Please try again)/i.test(msg) ||
     /authentication|unauthor(ized|ised)|invalid.*api.?key/i.test(msg) ||
     /content[\s_-]*polic|moderation|blocked|safety (?:system|filter)|privacy-sensitive|Seedance rejected the reference media/i.test(msg) ||
     /unsupported node type|No executor for provider/i.test(msg) ||
@@ -7895,7 +7902,7 @@ serve(async (req) => {
           status: "queued",
           run_after: new Date().toISOString(),
           deadline_at: new Date(Date.now() + WORKSPACE_JOB_MAX_MS).toISOString(),
-          max_attempts: 18,
+          max_attempts: workspaceJobMaxAttempts(provider),
           credits_charged: jobCharge?.amount ?? 0,
           credit_team_id: jobCharge?.teamId ?? null,
           credit_organization_id: jobCharge?.organizationId ?? null,
