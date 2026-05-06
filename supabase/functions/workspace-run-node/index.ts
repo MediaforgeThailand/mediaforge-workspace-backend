@@ -2672,7 +2672,7 @@ async function executeBanana(
             : "no refs";
         return new Response(
           `${modelLabel} timed out after ${Math.round(ABORT_MS / 1000)}s on this attempt (${refSummary}). ` +
-            "This is provider latency/queue timeout, not a reference-image format error; the sync path will stop early to protect Gemini quota.",
+            "This is provider latency/queue timeout, not a reference-image format error; the queue will retry with a longer Banana backoff to protect Gemini quota.",
           { status: 504 },
         );
       }
@@ -6154,6 +6154,7 @@ const WORKSPACE_JOB_MAX_MS = 60 * 60_000;
 // that ceiling, then let the durable queue retry until the 60 minute deadline.
 const WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS = 150_000;
 const WORKSPACE_JOB_BACKOFF_MS = [3_000, 5_000, 10_000, 15_000, 30_000, 60_000];
+const BANANA_JOB_BACKOFF_MS = [60_000, 180_000, 300_000, 600_000, 900_000];
 const WORKSPACE_JOB_WORKER_BATCH_SIZE = 8;
 const WORKSPACE_JOB_LOCK_SEC = 360;
 const WORKSPACE_JOB_HEARTBEAT_MS = 45_000;
@@ -6162,7 +6163,7 @@ const WORKSPACE_JOB_EXPIRE_SWEEP_LIMIT = 25;
 function workspaceJobMaxAttempts(provider: string): number {
   // Gemini image sync calls consume request quota on every retry because there
   // is no task id to resume. Keep Banana conservative until it moves to Batch.
-  return provider === "banana" ? 2 : 18;
+  return provider === "banana" ? 6 : 18;
 }
 
 type WorkspaceJobStatus =
@@ -6229,7 +6230,6 @@ function isPermanentWorkspaceJobError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return (
     classifyError(msg) === "permanent" ||
-    /Nano Banana .*failed \(HTTP (?:503|504), key=primary\).*?(?:DEADLINE_EXCEEDED|UNAVAILABLE|high demand|timed out|Please try again)/i.test(msg) ||
     /authentication|unauthor(ized|ised)|invalid.*api.?key/i.test(msg) ||
     /content[\s_-]*polic|moderation|blocked|safety (?:system|filter)|privacy-sensitive|Seedance rejected the reference media/i.test(msg) ||
     /unsupported node type|No executor for provider/i.test(msg) ||
@@ -6631,8 +6631,13 @@ function workspaceJobProviderLabel(job: WorkspaceJobRow): string {
   return String(job.model ?? job.provider ?? job.node_type ?? "generation");
 }
 
-function workspaceJobBackoffSeconds(attempt: number): number {
-  const ms = WORKSPACE_JOB_BACKOFF_MS[Math.min(Math.max(attempt - 1, 0), WORKSPACE_JOB_BACKOFF_MS.length - 1)];
+function workspaceJobBackoffMs(attempt: number, provider?: string): number {
+  const schedule = provider === "banana" ? BANANA_JOB_BACKOFF_MS : WORKSPACE_JOB_BACKOFF_MS;
+  return schedule[Math.min(Math.max(attempt - 1, 0), schedule.length - 1)];
+}
+
+function workspaceJobBackoffSeconds(attempt: number, provider?: string): number {
+  const ms = workspaceJobBackoffMs(attempt, provider);
   return Math.max(5, Math.ceil(ms / 1000));
 }
 
@@ -7060,7 +7065,7 @@ async function processWorkspaceGenerationJobTick(args: {
       return { job_id: job.id, status: "failed", detail: "max_attempts_exhausted" };
     }
 
-    const delaySeconds = workspaceJobBackoffSeconds(attempt);
+    const delaySeconds = workspaceJobBackoffSeconds(attempt, job.provider);
     await args.supabase
       .from("workspace_generation_jobs")
       .update({
@@ -7299,10 +7304,20 @@ async function processWorkspaceGenerationJob(args: {
       }
 
       const remaining = budgetEndsAt - Date.now();
-      const backoff = WORKSPACE_JOB_BACKOFF_MS[
-        Math.min(attempt - 1, WORKSPACE_JOB_BACKOFF_MS.length - 1)
-      ];
+      const backoff = workspaceJobBackoffMs(attempt, job.provider);
       if (remaining < backoff + 1_000) break;
+      if (job.provider === "banana") {
+        await args.supabase
+          .from("workspace_generation_jobs")
+          .update({
+            status: "running",
+            attempts: attempt,
+            last_error: lastError,
+            run_after: new Date(Date.now() + backoff).toISOString(),
+          })
+          .eq("id", job.id);
+        return;
+      }
       await sleep(backoff);
     }
   }
