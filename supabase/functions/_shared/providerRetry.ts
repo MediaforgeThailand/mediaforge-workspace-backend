@@ -62,6 +62,10 @@ export function classifyError(errMsg: string): "permanent" | "transient" | "unkn
   if (/safety|invalid input|invalid_argument|prompt blocked/i.test(errMsg)) {
     return "permanent";
   }
+  // Provider-side validation: reference media constraints cannot be fixed by retrying.
+  if (/reference videos?.*(?:must|duration|invalid)|video duration.*(?:must|invalid|exceed)|total reference video duration|total duration of all videos/i.test(errMsg)) {
+    return "permanent";
+  }
   // Programming errors — retrying never helps. Refund immediately.
   if (/is not defined|is not a function|cannot read prop(?:erty|erties) of (?:undefined|null)|ReferenceError|TypeError|SyntaxError/i.test(errMsg)) {
     return "permanent";
