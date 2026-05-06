@@ -56,6 +56,7 @@ import {
   submitVeoTask,
   type VeoAspectRatio,
   type VeoDuration,
+  type VeoImage,
   type VeoPersonGeneration,
   type VeoResolution,
 } from "../_shared/veo.ts";
@@ -1691,8 +1692,36 @@ async function executeSeedance(
  * frames, so any upstream URL (image gen output, uploaded asset) is
  * fetched here and converted on the fly.
  */
+async function fetchVeoFrameAsInline(
+  url: string,
+  supabaseClient?: ReturnType<typeof createClient>,
+): Promise<VeoImage> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+  const parsedStorageUrl = supabaseUrl ? parseSupabaseStorageUrl(url, supabaseUrl) : null;
+
+  if (parsedStorageUrl && supabaseClient) {
+    const { data, error } = await supabaseClient.storage
+      .from(parsedStorageUrl.bucket)
+      .download(parsedStorageUrl.path);
+    if (!error && data) {
+      const bytes = new Uint8Array(await data.arrayBuffer());
+      return {
+        mimeType: data.type?.split(";")[0]?.trim() || "image/png",
+        data: bytesToBase64(bytes),
+      };
+    }
+    console.warn(
+      `[veo] storage download failed for ${parsedStorageUrl.bucket}/${parsedStorageUrl.path}: ` +
+        `${error?.message ?? "no data"}`,
+    );
+  }
+
+  return await fetchImageAsInline(url);
+}
+
 async function executeVeo(
   params: Record<string, unknown>,
+  supabaseClient?: ReturnType<typeof createClient>,
 ): Promise<ProviderResult> {
   const modelSlug = String(
     params.model_name ?? params.model ?? "veo-3.1-generate-preview",
@@ -1737,8 +1766,8 @@ async function executeVeo(
   const endFrameUrl = (params.end_frame ?? params.image_tail_url) as
     | string
     | undefined;
-  const startFrame = startFrameUrl ? await fetchImageAsInline(startFrameUrl) : undefined;
-  const endFrame = endFrameUrl ? await fetchImageAsInline(endFrameUrl) : undefined;
+  const startFrame = startFrameUrl ? await fetchVeoFrameAsInline(startFrameUrl, supabaseClient) : undefined;
+  const endFrame = endFrameUrl ? await fetchVeoFrameAsInline(endFrameUrl, supabaseClient) : undefined;
   const hasFrameInput = Boolean(startFrame || endFrame);
 
   // Veo 3.1 accepts different personGeneration values by mode:
@@ -3906,7 +3935,7 @@ async function executeOneStep(
       case "motion_control":
         return await executeKling(stepParams);
       case "veo":
-        return await executeVeo(stepParams);
+        return await executeVeo(stepParams, supabase);
       case "banana":
         return await executeBanana(stepParams, SUPABASE_URL, token);
       case "chat_ai":
@@ -8314,7 +8343,7 @@ serve(async (req) => {
         result = await executeSeedance(params);
         break;
       case "veo":
-        result = await executeVeo(params);
+        result = await executeVeo(params, supabase);
         break;
       case "seedream":
         result = await executeSeedream(params);
