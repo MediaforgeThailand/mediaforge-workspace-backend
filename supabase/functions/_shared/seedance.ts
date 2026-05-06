@@ -353,7 +353,8 @@ export async function submitSeedanceTask(
 
   const text = await res.text();
   if (!res.ok) {
-    console.error(`[seedance] submit HTTP ${res.status}: ${text.substring(0, 500)}`);
+    const errorText = text.substring(0, 1000);
+    console.error(`[seedance] submit HTTP ${res.status}: ${errorText}`);
     if (
       res.status === 402 ||
       (res.status !== 429 &&
@@ -361,8 +362,13 @@ export async function submitSeedanceTask(
     ) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
+    if (/content\[\d+\].*video duration|reference videos?.*duration|total duration of all videos/i.test(text)) {
+      throw new Error(
+        "Seedance reference video is invalid: reference videos must be 2-15 seconds each, and total reference video duration must not exceed 15 seconds.",
+      );
+    }
     throw new Error(
-      `Seedance API error (HTTP ${res.status}): ${text.substring(0, 200)}`,
+      `Seedance API error (HTTP ${res.status}): ${errorText}`,
     );
   }
 
