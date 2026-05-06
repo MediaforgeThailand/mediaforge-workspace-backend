@@ -50,6 +50,15 @@ export interface RetryOutcome<T> {
   classification: "success" | "permanent" | "high_demand" | "provider_down" | "exhausted";
 }
 
+export function isNonRetryableQuotaError(errMsg: string): boolean {
+  const quotaExhausted =
+    /RESOURCE_EXHAUSTED|exceeded your current quota|quota exceeded|check your plan and billing details/i.test(
+      errMsg,
+    );
+  if (!quotaExhausted) return false;
+  return !/please retry in\b|retryDelay|RetryInfo/i.test(errMsg);
+}
+
 /**
  * Classify an error message to decide whether retrying makes sense.
  *
@@ -59,6 +68,7 @@ export interface RetryOutcome<T> {
  */
 export function classifyError(errMsg: string): "permanent" | "transient" | "unknown" {
   if (errMsg === "PROVIDER_BILLING_ERROR") return "permanent";
+  if (isNonRetryableQuotaError(errMsg)) return "permanent";
   if (/safety|invalid input|invalid_argument|prompt blocked/i.test(errMsg)) {
     return "permanent";
   }

@@ -17,6 +17,7 @@ import {
   INLINE_BUDGET_ATTEMPTS,
   enqueueRetryJob,
   classifyError,
+  isNonRetryableQuotaError,
   TOTAL_MAX_RETRIES,
 } from "../_shared/providerRetry.ts";
 import { recordGenerationEvent } from "../_shared/analytics.ts";
@@ -102,8 +103,9 @@ async function imageUrlToBase64(url: string): Promise<string> {
 
 function isProviderBillingLike(status: number, text: string): boolean {
   // 429 is provider pressure/rate limiting, so it must stay retryable in the
-  // durable workspace queue. Only stop immediately on real balance/payment
-  // failures or explicit non-429 quota/billing messages.
+  // durable workspace queue unless the provider explicitly says quota/billing
+  // is exhausted and does not include a retry hint.
+  if (isNonRetryableQuotaError(text)) return true;
   if (status === 429) return false;
   if (status === 402) return true;
   return /account balance not enough|insufficient balance|insufficient_quota|billing|payment required|prepaid|top[ -]?up|quota exceeded/i.test(text);
