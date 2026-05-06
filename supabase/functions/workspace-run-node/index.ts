@@ -159,6 +159,10 @@ function canUseMagnificVeo(): boolean {
   );
 }
 
+function canUseMagnificImage(): boolean {
+  return canUseMagnificVeo();
+}
+
 function canUseReplicateVeo(): boolean {
   return Boolean(Deno.env.get("REPLICATE_API_TOKEN"));
 }
@@ -2358,6 +2362,17 @@ const GEMINI_IMAGE_MODELS: Record<string, { gemini_model: string }> = {
   "nano-banana-2":   { gemini_model: "gemini-3.1-flash-image-preview" },
 };
 
+const MAGNIFIC_BANANA_MODELS: Record<string, { endpoint_slug: string; provider_model_id: string }> = {
+  "nano-banana-pro": {
+    endpoint_slug: "nano-banana-pro",
+    provider_model_id: "nano-banana-pro",
+  },
+  "nano-banana-2": {
+    endpoint_slug: "nano-banana-pro-flash",
+    provider_model_id: "nano-banana-pro-flash",
+  },
+};
+
 type GeminiImageApiKeyAlias = "primary" | "gemini2";
 
 function loadGeminiImageApiKey(alias: GeminiImageApiKeyAlias = "primary"): string {
@@ -2385,6 +2400,150 @@ function shouldFallbackGeminiImageKey(status: number, errMsg: string): boolean {
     isNonRetryableQuotaError(errMsg) ||
     /RESOURCE_EXHAUSTED|exceeded your current quota|rate-limits|ai\.dev\/rate-limit/i.test(errMsg)
   );
+}
+
+function normalizeMagnificImageResolution(value: string): string {
+  const v = value.trim().toUpperCase();
+  if (v === "1K" || v === "2K" || v === "4K") return v;
+  if (v === "LOW" || v === "MEDIUM" || v === "HIGH") return v.toLowerCase();
+  return "2K";
+}
+
+function extractProviderMediaUrl(value: unknown): string {
+  if (typeof value === "string") {
+    return /^https:\/\//i.test(value) ? value : "";
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = extractProviderMediaUrl(item);
+      if (found) return found;
+    }
+    return "";
+  }
+  if (value && typeof value === "object") {
+    const row = value as Record<string, unknown>;
+    for (const key of ["url", "image", "image_url", "output", "download_url"]) {
+      const found = extractProviderMediaUrl(row[key]);
+      if (found) return found;
+    }
+    for (const nested of Object.values(row)) {
+      const found = extractProviderMediaUrl(nested);
+      if (found) return found;
+    }
+  }
+  return "";
+}
+
+async function submitMagnificBananaTask(args: {
+  modelId: string;
+  prompt: string;
+  aspectRatio: string;
+  imageSize: string;
+  imageUrls: string[];
+  resolvedReferenceCount: number;
+  failedReferenceCount: number;
+}): Promise<ProviderResult> {
+  const config = MAGNIFIC_BANANA_MODELS[args.modelId];
+  if (!config) {
+    throw new Error(`No Magnific Banana fallback mapping for ${args.modelId}`);
+  }
+  const apiKey = loadMagnificApiKey();
+  const endpoint = `${MAGNIFIC_BASE}/ai/text-to-image/${config.endpoint_slug}`;
+  const endpointHost = new URL(endpoint).hostname;
+  const authHeaderName = endpointHost.includes("magnific.com")
+    ? "x-magnific-api-key"
+    : "x-freepik-api-key";
+  const payload: Record<string, unknown> = {
+    prompt: args.prompt,
+    aspect_ratio: args.aspectRatio && args.aspectRatio !== "Auto" ? args.aspectRatio : "1:1",
+    resolution: normalizeMagnificImageResolution(
+      args.imageSize || (args.modelId === "nano-banana-2" ? "1K" : "2K"),
+    ),
+  };
+  const referenceImages = args.imageUrls
+    .slice(0, 3)
+    .filter((url) => /^https:\/\//i.test(url))
+    .map((url, index) => ({
+      image: url,
+      text: `Reference ${index + 1}`,
+    }));
+  if (referenceImages.length > 0) payload.reference_images = referenceImages;
+  if (args.modelId === "nano-banana-2") payload.use_google_search_tool = false;
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      [authHeaderName]: apiKey,
+    },
+    body: JSON.stringify(payload),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Freepik/Magnific Banana submit failed (HTTP ${res.status}): ${text.slice(0, 500)}`);
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  } catch {
+    throw new Error(`Freepik/Magnific Banana submit returned non-JSON: ${text.slice(0, 200)}`);
+  }
+  const data = parsed.data && typeof parsed.data === "object"
+    ? (parsed.data as Record<string, unknown>)
+    : parsed;
+  const generated = Array.isArray(data.generated)
+    ? data.generated
+    : Array.isArray(parsed.generated)
+      ? parsed.generated
+      : [];
+  const immediateUrl = extractProviderMediaUrl(generated);
+  if (immediateUrl) {
+    return {
+      result_url: immediateUrl,
+      outputs: { output_image: immediateUrl },
+      output_type: "image_url" as const,
+      provider_meta: {
+        provider: "freepik_image",
+        source_provider: "magnific",
+        fallback_for: "banana",
+        model: args.modelId,
+        provider_model_id: config.provider_model_id,
+        provider_endpoint: endpoint,
+        resolution: payload.resolution,
+        aspect_ratio: payload.aspect_ratio,
+        reference_image_count: args.resolvedReferenceCount,
+        reference_image_requested_count: args.imageUrls.length,
+        reference_image_failed_count: args.failedReferenceCount,
+        immediate_result: true,
+      },
+    };
+  }
+  const taskId = String(data.task_id ?? data.id ?? "").trim();
+  if (!taskId) {
+    throw new Error("Freepik/Magnific Banana submit succeeded but no task_id returned");
+  }
+  console.warn(
+    `[banana-magnific] submitted ${args.modelId} fallback task=${taskId} endpoint=${config.endpoint_slug}`,
+  );
+  return {
+    task_id: taskId,
+    outputs: { output_image: "" },
+    output_type: "image_url" as const,
+    provider_meta: {
+      provider: "freepik_image",
+      source_provider: "magnific",
+      fallback_for: "banana",
+      model: args.modelId,
+      provider_model_id: config.provider_model_id,
+      provider_endpoint: endpoint,
+      resolution: payload.resolution,
+      aspect_ratio: payload.aspect_ratio,
+      reference_image_count: args.resolvedReferenceCount,
+      reference_image_requested_count: args.imageUrls.length,
+      reference_image_failed_count: args.failedReferenceCount,
+      poll_endpoint: endpoint,
+    },
+  };
 }
 
 async function executeBanana(
@@ -2569,6 +2728,7 @@ async function executeBanana(
 
   let apiKeyAlias: GeminiImageApiKeyAlias = "primary";
   let aiResponse = await callGeminiImage(apiKeyAlias);
+  let usedGemini2Fallback = false;
 
   if (!aiResponse.ok) {
     let statusCode = aiResponse.status;
@@ -2577,6 +2737,7 @@ async function executeBanana(
     if (shouldFallbackGeminiImageKey(statusCode, errorText) && canUseGemini2Image()) {
       console.warn(`[banana-direct] primary key hit quota/rate limit; retrying ${modelConfig.gemini_model} with GEMINI2_API_KEY`);
       apiKeyAlias = "gemini2";
+      usedGemini2Fallback = true;
       aiResponse = await callGeminiImage(apiKeyAlias);
       if (!aiResponse.ok) {
         statusCode = aiResponse.status;
@@ -2585,6 +2746,20 @@ async function executeBanana(
       }
     }
     if (!aiResponse.ok) {
+      if (usedGemini2Fallback && shouldFallbackGeminiImageKey(statusCode, errorText) && canUseMagnificImage()) {
+        console.warn(
+          `[banana-direct] both Gemini image keys hit quota/rate limit; falling back to Magnific ${modelId}`,
+        );
+        return await submitMagnificBananaTask({
+          modelId,
+          prompt,
+          aspectRatio,
+          imageSize,
+          imageUrls,
+          resolvedReferenceCount,
+          failedReferenceCount,
+        });
+      }
       if (isProviderBillingLike(statusCode, errorText)) {
         throw new Error("PROVIDER_BILLING_ERROR");
       }
@@ -4507,7 +4682,11 @@ async function executeOneStep(
   // ── SUCCESS path ─────────────────────────────────────────────────
   if (inlineOutcome.classification === "success" && inlineOutcome.result) {
     const stepResult = inlineOutcome.result;
-    const isAsync = stepDef.is_async && !!stepResult.task_id;
+    const stepProviderMeta =
+      stepResult.provider_meta && typeof stepResult.provider_meta === "object"
+        ? (stepResult.provider_meta as Record<string, unknown>)
+        : {};
+    const isAsync = (stepDef.is_async || Boolean(stepProviderMeta.poll_endpoint)) && !!stepResult.task_id;
     return {
       step_index: stepIndex, node_id: stepDef.node_id, node_type: stepDef.node_type,
       provider: stepDef.provider,
@@ -6098,6 +6277,7 @@ interface WorkspaceRunBody {
     | "poll_veo"
     | "poll_replicate_veo"
     | "poll_freepik_veo"
+    | "poll_freepik_image"
     | "poll_hyper3d"
     | "poll_tripo3d"
     | "mirror_tripo_url"
@@ -6356,6 +6536,8 @@ async function pollWorkspaceAsyncResult(args: {
         ? "poll_replicate_veo"
       : provider === "freepik_veo"
         ? "poll_freepik_veo"
+      : provider === "freepik_image"
+        ? "poll_freepik_image"
         : "poll_kling";
   const intervalMs = provider === "tripo3d" ? 4_000 : provider === "hyper3d" ? 6_000 : 5_000;
   const successStatuses = new Set([
@@ -6457,6 +6639,8 @@ async function pollWorkspaceAsyncResultOnce(args: {
         ? "poll_replicate_veo"
       : provider === "freepik_veo"
         ? "poll_freepik_veo"
+      : provider === "freepik_image"
+        ? "poll_freepik_image"
         : "poll_kling";
 
   const pollResp = await invokeWorkspaceRunOnce({
@@ -6551,6 +6735,7 @@ function inferAsyncPollProvider(
     endpoint.includes("api.magnific.com") ||
     endpoint.includes("api.freepik.com")
   ) {
+    if (endpoint.includes("/text-to-image/")) return "freepik_image";
     return "freepik_veo";
   }
   if (endpoint.includes("api.replicate.com")) return "replicate_veo";
@@ -8539,6 +8724,155 @@ serve(async (req) => {
      * with the API key. The frontend uses the same polling hook as
      * Kling/Seedance — we normalise statuses and surface the video URL
      * once the operation reports `done: true`. */
+    if (body.action === "poll_freepik_image") {
+      const taskId = String(body.task_id ?? "").trim();
+      const pollEndpoint = String(body.poll_endpoint ?? "").trim();
+      if (!taskId || !pollEndpoint) {
+        return new Response(
+          JSON.stringify({ error: "task_id and poll_endpoint required for poll_freepik_image" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let pollUrlOk = false;
+      try {
+        const u = new URL(pollEndpoint);
+        pollUrlOk =
+          u.protocol === "https:" &&
+          (u.hostname === "api.magnific.com" || u.hostname === "api.freepik.com") &&
+          /^\/v1\/ai\/text-to-image\/(?:nano-banana-pro|nano-banana-pro-flash)\/?$/.test(u.pathname);
+      } catch {
+        pollUrlOk = false;
+      }
+      if (!pollUrlOk) {
+        return new Response(
+          JSON.stringify({ error: "poll_endpoint must be a Magnific/Freepik Banana image endpoint" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let apiKey: string;
+      try {
+        apiKey = loadMagnificApiKey();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({ error: msg }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const pollUrl = `${pollEndpoint.replace(/\/+$/, "")}/${encodeURIComponent(taskId)}`;
+      let payload: Record<string, unknown>;
+      try {
+        const endpointHost = new URL(pollEndpoint).hostname;
+        const authHeaderName = endpointHost.includes("magnific.com")
+          ? "x-magnific-api-key"
+          : "x-freepik-api-key";
+        const r = await fetch(pollUrl, {
+          method: "GET",
+          headers: {
+            [authHeaderName]: apiKey,
+          },
+        });
+        const text = await r.text();
+        if (!r.ok) {
+          return new Response(
+            JSON.stringify({
+              status: "polling_error",
+              message: `Freepik/Magnific Banana poll failed (HTTP ${r.status}): ${text.slice(0, 300)}`,
+            }),
+            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({
+            status: "polling_error",
+            message: msg.substring(0, 300),
+          }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const data = payload.data && typeof payload.data === "object"
+        ? (payload.data as Record<string, unknown>)
+        : payload;
+      const rawStatus = String(data.status ?? payload.status ?? "").toUpperCase();
+      const generated = Array.isArray(data.generated)
+        ? data.generated
+        : Array.isArray(payload.generated)
+          ? payload.generated
+          : [];
+      const providerImageUrl = extractProviderMediaUrl(generated);
+      const errorMessage = String(
+        data.error ??
+          data.message ??
+          payload.error ??
+          payload.message ??
+          "",
+      );
+      const normalised =
+        rawStatus === "COMPLETED" || rawStatus === "DONE" || rawStatus === "SUCCEEDED" || providerImageUrl
+          ? "succeed"
+          : rawStatus === "FAILED" || rawStatus === "ERROR" || rawStatus === "CANCELLED" || rawStatus === "CANCELED"
+            ? "failed"
+            : "processing";
+
+      let publicUrl = "";
+      if (normalised === "succeed" && providerImageUrl) {
+        try {
+          const imageRes = await fetch(providerImageUrl);
+          if (!imageRes.ok) {
+            throw new Error(`download HTTP ${imageRes.status}`);
+          }
+          const bytes = new Uint8Array(await imageRes.arrayBuffer());
+          const contentType = imageRes.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
+          const ext =
+            contentType.includes("jpeg") ? "jpg" :
+            contentType.includes("webp") ? "webp" :
+            contentType.includes("png") ? "png" :
+            "png";
+          const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
+          const path = `pipeline/magnific_banana_${safeTaskId}.${ext}`;
+          const upload = await supabase.storage
+            .from("ai-media")
+            .upload(path, bytes, { contentType, upsert: true });
+          if (upload.error) throw upload.error;
+          const signed = await supabase.storage
+            .from("ai-media")
+            .createSignedUrl(path, 60 * 60 * 24 * 7);
+          if (signed.error || !signed.data?.signedUrl) {
+            throw signed.error ?? new Error("no signed URL");
+          }
+          publicUrl = signed.data.signedUrl;
+        } catch (err) {
+          console.error("[poll_freepik_image] rehost failed:", err);
+          return new Response(
+            JSON.stringify({
+              status: "failed",
+              task_id: taskId,
+              url: "",
+              message: `Freepik/Magnific Banana finished but the image couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
+            }),
+            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          status: normalised,
+          task_id: taskId,
+          url: publicUrl,
+          message: normalised === "failed" ? errorMessage || "Freepik/Magnific Banana task failed" : rawStatus,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
     if (body.action === "poll_veo") {
       const taskId = normalizeVeoOperationName(String(body.task_id ?? ""));
       if (!taskId) {
