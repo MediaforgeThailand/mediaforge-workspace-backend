@@ -2128,7 +2128,7 @@ async function executeVeo(
     console.warn("[veo] no-audio request ignored; Google Veo 3.1 is the primary provider and always returns audio");
   }
   if (shouldPreferReplicateVeo() || shouldPreferMagnificVeo()) {
-    console.warn("[veo] wrapper provider override ignored; cross-provider fallback/routing is disabled");
+    console.warn("[veo] wrapper provider override is treated as final fallback; Google keys are tried first");
   }
 
   const startFrame = startFrameUrl ? await fetchVeoFrameAsInline(startFrameUrl, supabaseClient) : undefined;
@@ -2151,6 +2151,23 @@ async function executeVeo(
     resolution,
     durationSeconds,
     personGeneration,
+  };
+
+  const submitReplicateFallback = async (fallbackFrom: string): Promise<ProviderResult> => {
+    console.warn(`[veo] submitting Replicate fallback after ${fallbackFrom}`);
+    return await submitReplicateVeoTask({
+      prompt,
+      negativePrompt: String(params.negative_prompt ?? "").trim() || undefined,
+      startFrameUrl,
+      endFrameUrl,
+      aspectRatio,
+      resolution,
+      durationSeconds,
+      modelSlug,
+      providerModelId: entry.model,
+      generateAudio: shouldGenerateFallbackVeoAudio(params),
+      fallbackFrom,
+    });
   };
 
   const body = buildVeoRequest(requestParams);
@@ -2179,8 +2196,15 @@ async function executeVeo(
         operationName = await submitVeoTask(entry.model, body, loadVeoApiKey(veoApiKeyAlias));
         recoveredFromSubmitError = true;
       } catch (gemini2Err) {
+        const gemini2Message = gemini2Err instanceof Error ? gemini2Err.message : String(gemini2Err);
+        if (canUseReplicateVeo()) {
+          return await submitReplicateFallback(`primary_quota_then_gemini2_failed: ${gemini2Message.slice(0, 160)}`);
+        }
         throw gemini2Err;
       }
+    }
+    if (!recoveredFromSubmitError && shouldFallbackVeoQuota(firstMessage) && canUseReplicateVeo()) {
+      return await submitReplicateFallback(`primary_quota: ${firstMessage.slice(0, 160)}`);
     }
     if (!recoveredFromSubmitError && (startFrame || endFrame) && firstMessage.includes("`bytesBase64Encoded` isn't supported")) {
       console.warn("[veo] bytesBase64Encoded rejected; retrying inlineData payload");
@@ -4146,6 +4170,84 @@ async function submitMagnificVeoTask(args: {
 /* ═══════════════════════════════════════════════════════════
    @mention resolver — Provider-Aware
    ═══════════════════════════════════════════════════════════ */
+
+async function submitReplicateVeoTask(args: {
+  prompt: string;
+  negativePrompt?: string;
+  startFrameUrl?: string;
+  endFrameUrl?: string;
+  aspectRatio: VeoAspectRatio;
+  resolution: VeoResolution;
+  durationSeconds: VeoDuration;
+  modelSlug: string;
+  providerModelId: string;
+  generateAudio: boolean;
+  fallbackFrom?: string;
+}): Promise<ProviderResult> {
+  const apiToken = Deno.env.get("REPLICATE_API_TOKEN")?.trim();
+  if (!apiToken) {
+    throw new Error("Replicate Veo fallback is not configured. Set REPLICATE_API_TOKEN.");
+  }
+
+  const input: Record<string, unknown> = {
+    prompt: args.prompt,
+    aspect_ratio: args.aspectRatio,
+    duration: args.durationSeconds,
+    resolution: args.resolution,
+    generate_audio: args.generateAudio,
+  };
+  if (args.negativePrompt) input.negative_prompt = args.negativePrompt;
+  if (args.startFrameUrl) input.image = args.startFrameUrl;
+  if (args.endFrameUrl) input.last_frame = args.endFrameUrl;
+
+  const res = await fetch("https://api.replicate.com/v1/models/google/veo-3.1/predictions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ input }),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Replicate Veo submit failed (HTTP ${res.status}): ${text.slice(0, 500)}`);
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  } catch {
+    throw new Error(`Replicate Veo returned invalid JSON: ${text.slice(0, 300)}`);
+  }
+  const predictionId = String(parsed.id ?? "").trim();
+  if (!predictionId) {
+    throw new Error(`Replicate Veo returned no prediction id: ${text.slice(0, 300)}`);
+  }
+
+  return {
+    task_id: predictionId,
+    outputs: {
+      output_video: "",
+      output_start_frame: args.startFrameUrl ?? "",
+      output_end_frame: args.endFrameUrl ?? "",
+    },
+    output_type: "video_url",
+    provider_meta: {
+      provider: "replicate_veo",
+      model: args.modelSlug,
+      provider_model_id: "google/veo-3.1",
+      google_provider_model_id: args.providerModelId,
+      fallback_from: args.fallbackFrom ?? "google_veo",
+      poll_endpoint: "https://api.replicate.com/v1/predictions",
+      duration_seconds: args.durationSeconds,
+      resolution: args.resolution,
+      aspect_ratio: args.aspectRatio,
+      has_audio: args.generateAudio,
+      is_image2video: Boolean(args.startFrameUrl),
+      has_end_frame: Boolean(args.endFrameUrl),
+    },
+  };
+}
 
 interface MentionResolution {
   resolvedPrompt: string;
