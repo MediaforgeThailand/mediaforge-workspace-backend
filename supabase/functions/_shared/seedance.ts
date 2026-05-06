@@ -355,12 +355,27 @@ export async function submitSeedanceTask(
   if (!res.ok) {
     const errorText = text.substring(0, 1000);
     console.error(`[seedance] submit HTTP ${res.status}: ${errorText}`);
+    let providerCode = "";
+    let providerMessage = "";
+    try {
+      const parsed = JSON.parse(text) as { error?: { code?: string; message?: string; type?: string } };
+      providerCode = String(parsed.error?.code ?? "");
+      providerMessage = String(parsed.error?.message ?? "");
+    } catch {
+      // Keep raw text below.
+    }
+    const providerError = `${providerCode} ${providerMessage} ${text}`;
     if (
       res.status === 402 ||
       (res.status !== 429 &&
         /account balance not enough|insufficient balance|insufficient_quota|billing|payment required|prepaid|top[ -]?up|quota exceeded/i.test(text))
     ) {
       throw new Error("PROVIDER_BILLING_ERROR");
+    }
+    if (/SensitiveContentDetected|PrivacyInformation|real person|privacy-sensitive|input image may contain real person/i.test(providerError)) {
+      throw new Error(
+        "Seedance rejected the reference media because its safety filter detected a real person or privacy-sensitive content in the input. Use consented non-sensitive reference media, anonymize the person, or try another model.",
+      );
     }
     if (/content\[\d+\].*video duration|reference videos?.*duration|total duration of all videos/i.test(text)) {
       throw new Error(
