@@ -5689,6 +5689,38 @@ async function readJsonSafe(res: Response): Promise<Record<string, unknown>> {
   }
 }
 
+function safeJsonSnippet(value: unknown, maxLength = 1200): string {
+  try {
+    const text = JSON.stringify(value);
+    if (!text) return "";
+    return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+  } catch {
+    return String(value);
+  }
+}
+
+function formatVeoPollFailure(statusObj: unknown): string {
+  const status =
+    statusObj && typeof statusObj === "object"
+      ? (statusObj as Record<string, unknown>)
+      : {};
+  const rawError =
+    status.error && typeof status.error === "object"
+      ? (status.error as Record<string, unknown>)
+      : null;
+  if (rawError) {
+    const code = rawError.code != null ? `code=${String(rawError.code)}` : "";
+    const statusCode = rawError.status != null ? `status=${String(rawError.status)}` : "";
+    const message = String(rawError.message ?? "").trim();
+    const prefix = [code, statusCode].filter(Boolean).join(" ");
+    if (message) {
+      return `Veo operation failed${prefix ? ` (${prefix})` : ""}: ${message}`;
+    }
+    return `Veo operation failed${prefix ? ` (${prefix})` : ""}: ${safeJsonSnippet(rawError)}`;
+  }
+  return `Veo operation finished without a video URL: ${safeJsonSnippet(statusObj)}`;
+}
+
 async function invokeWorkspaceRunOnce(args: {
   functionUrl: string;
   authHeader: string;
@@ -6721,6 +6753,31 @@ function collectUrlStrings(value: unknown, output = new Set<string>(), depth = 0
   return output;
 }
 
+async function validateVeoFrameInputs(
+  supabaseClient: ReturnType<typeof createClient>,
+  inputs: unknown,
+  supabaseUrl: string,
+): Promise<string | null> {
+  if (!inputs || typeof inputs !== "object" || Array.isArray(inputs)) return null;
+  const frameInputs = inputs as Record<string, unknown>;
+  for (const key of ["start_frame", "end_frame"]) {
+    const raw = frameInputs[key];
+    const values = Array.isArray(raw) ? raw : [raw];
+    for (const value of values) {
+      if (typeof value !== "string" || value.startsWith("data:")) continue;
+      const parsed = parseSupabaseStorageUrl(value, supabaseUrl);
+      if (!parsed) continue;
+      const { data, error } = await supabaseClient.storage
+        .from(parsed.bucket)
+        .download(parsed.path);
+      if (error || !data) {
+        return "Reference image is no longer available. Please select or upload the image again before generating Veo.";
+      }
+    }
+  }
+  return null;
+}
+
 function isOwnWorkspaceStoragePath(bucket: string, path: string, userId: string): boolean {
   if (!bucket || !path || path.split("/").some((part) => part === "..")) return false;
   if (bucket === "user_assets") {
@@ -7169,6 +7226,19 @@ serve(async (req) => {
           runRequest.params?.model ??
           nodeType,
       );
+      if (provider === "veo") {
+        const frameInputError = await validateVeoFrameInputs(
+          supabase,
+          runRequest.inputs,
+          SUPABASE_URL,
+        );
+        if (frameInputError) {
+          return new Response(
+            JSON.stringify({ error: frameInputError }),
+            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+      }
       let jobCharge: WorkspaceCreditCharge | null = null;
       try {
         jobCharge = await consumeWorkspaceCredits({
@@ -7664,8 +7734,8 @@ serve(async (req) => {
         );
       }
       const isDone = statusObj.done === true;
-      const opError = statusObj.error?.message;
       const videoUri = extractVeoVideoUri(statusObj);
+      const opError = statusObj.error ? formatVeoPollFailure(statusObj) : "";
       const normalised = !isDone
         ? "processing"
         : opError
@@ -7720,7 +7790,7 @@ serve(async (req) => {
       }
 
       const message =
-        opError ?? (normalised === "failed" ? "Veo operation failed" : "");
+        opError || (normalised === "failed" ? formatVeoPollFailure(statusObj) : "");
       return new Response(
         JSON.stringify({
           status: normalised,
