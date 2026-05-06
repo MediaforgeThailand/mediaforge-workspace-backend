@@ -1748,7 +1748,7 @@ async function executeVeo(
   // Resolution — only "720p" / "1080p" are accepted by Veo 3.1; "4k"
   // is gated behind preview access we don't surface to users yet.
   const rawRes = String(params.resolution ?? "720p");
-  const resolution: VeoResolution = rawRes === "1080p" ? "1080p" : "720p";
+  let resolution: VeoResolution = rawRes === "1080p" ? "1080p" : "720p";
 
   // Duration — discrete 4 | 6 | 8. The slider used for other
   // providers may hand us numbers — coerce + snap to nearest valid.
@@ -1759,6 +1759,13 @@ async function executeVeo(
       : parseInt(String(rawDuration ?? "8"), 10) || 8;
   const durationSeconds: VeoDuration =
     durationNum <= 4 ? 4 : durationNum <= 6 ? 6 : 8;
+  if (resolution === "1080p" && durationSeconds !== 8) {
+    console.warn(
+      `[veo] downgrading resolution to 720p because 1080p only supports 8s ` +
+        `(requested=${durationSeconds}s)`,
+    );
+    resolution = "720p";
+  }
 
   const startFrameUrl = (params.start_frame ?? params.image_url) as
     | string

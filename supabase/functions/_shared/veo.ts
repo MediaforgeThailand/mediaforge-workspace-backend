@@ -125,9 +125,8 @@ export async function fetchImageAsInline(url: string): Promise<VeoImage> {
 }
 
 /** Build the JSON body for the predictLongRunning call. The "8s
- *  required for 1080p/refs" constraint is enforced here — we
- *  silently coerce duration to "8" when the resolution forces it,
- *  because the API otherwise responds with an opaque 400. */
+ *  required for 1080p" constraint is enforced here so callers do
+ *  not silently get a different duration than they selected. */
 function veoImagePayload(image: VeoImage, encoding: VeoImageEncoding): Record<string, unknown> {
   if (encoding === "bytesBase64Encoded") {
     return { bytesBase64Encoded: image.data, mimeType: image.mimeType };
@@ -139,9 +138,9 @@ export function buildVeoRequest(
   p: VeoSubmitParams,
   imageEncoding: VeoImageEncoding = "bytesBase64Encoded",
 ): Record<string, unknown> {
-  let duration = p.durationSeconds ?? 8;
-  if ((p.resolution === "1080p") && duration !== 8) {
-    duration = 8;
+  const duration = p.durationSeconds ?? 8;
+  if (p.resolution === "1080p" && duration !== 8) {
+    throw new Error("Veo 1080p only supports 8 seconds. Use 720p for 4s or 6s.");
   }
 
   const instance: Record<string, unknown> = { prompt: p.prompt };
