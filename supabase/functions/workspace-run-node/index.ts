@@ -167,6 +167,18 @@ function canUseMagnificVideo(): boolean {
   return canUseMagnificVeo();
 }
 
+// Magnific's current public docs list Seedance Pro/Lite endpoints, not
+// Dreamina Seedance 2.0. Keep this off unless the operator explicitly accepts
+// that the fallback changes provider/model semantics.
+function shouldUseMagnificSeedanceFallback(): boolean {
+  const value = String(
+    Deno.env.get("SEEDANCE_REAL_PERSON_FALLBACK_PROVIDER") ??
+      Deno.env.get("SEEDANCE_FALLBACK_PROVIDER") ??
+      "",
+  ).trim().toLowerCase();
+  return value === "magnific" || value === "freepik" || value === "freepik_seedance";
+}
+
 function canUseReplicateVeo(): boolean {
   return Boolean(Deno.env.get("REPLICATE_API_TOKEN"));
 }
@@ -1947,10 +1959,11 @@ async function executeSeedance(
       isV2 &&
       isSeedanceRealPersonPolicyError(message) &&
       fallbackImageUrl &&
+      shouldUseMagnificSeedanceFallback() &&
       canUseMagnificVideo()
     ) {
       console.warn(
-        "[seedance] BytePlus real-person policy rejected image input; trying Freepik/Magnific Seedance fallback",
+        "[seedance] BytePlus real-person policy rejected image input; using explicitly enabled Freepik/Magnific Seedance Pro/Lite fallback",
       );
       return await submitMagnificSeedanceTask({
         modelSlug,
