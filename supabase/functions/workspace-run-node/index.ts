@@ -2458,61 +2458,14 @@ const GEMINI_IMAGE_MODELS: Record<string, { gemini_model: string }> = {
   "nano-banana-2":   { gemini_model: "gemini-3.1-flash-image-preview" },
 };
 
-const MAGNIFIC_BANANA_MODELS: Record<string, { endpoint_slug: string; provider_model_id: string }> = {
-  "nano-banana-pro": {
-    endpoint_slug: "nano-banana-pro",
-    provider_model_id: "nano-banana-pro",
-  },
-  "nano-banana-2": {
-    endpoint_slug: "nano-banana-pro-flash",
-    provider_model_id: "nano-banana-pro-flash",
-  },
-};
-
-type GeminiImageApiKeyAlias = "primary" | "gemini2";
+type GeminiImageApiKeyAlias = "primary";
 
 function loadGeminiImageApiKey(alias: GeminiImageApiKeyAlias = "primary"): string {
-  const key =
-    alias === "gemini2"
-      ? Deno.env.get("GEMINI2_API_KEY")
-      : Deno.env.get("GOOGLE_AI_STUDIO_KEY") ?? Deno.env.get("GEMINI_API_KEY");
+  const key = Deno.env.get("GOOGLE_AI_STUDIO_KEY") ?? Deno.env.get("GEMINI_API_KEY");
   if (!key) {
-    throw new Error(
-      alias === "gemini2"
-        ? "Gemini image: GEMINI2_API_KEY is not configured in Supabase project secrets."
-        : "Gemini image: GOOGLE_AI_STUDIO_KEY (or GEMINI_API_KEY) is not configured in Supabase project secrets.",
-    );
+    throw new Error("Gemini image: GOOGLE_AI_STUDIO_KEY (or GEMINI_API_KEY) is not configured in Supabase project secrets.");
   }
   return key;
-}
-
-function canUseGemini2Image(): boolean {
-  return Boolean(Deno.env.get("GEMINI2_API_KEY"));
-}
-
-function shouldFallbackGeminiImageKey(status: number, errMsg: string): boolean {
-  return (
-    status === 429 ||
-    status === 503 ||
-    status === 504 ||
-    isNonRetryableQuotaError(errMsg) ||
-    /RESOURCE_EXHAUSTED|exceeded your current quota|rate-limits|ai\.dev\/rate-limit|UNAVAILABLE|DEADLINE_EXCEEDED|gateway timeout/i.test(errMsg)
-  );
-}
-
-function shouldFallbackGeminiImageToMagnific(status: number, errMsg: string): boolean {
-  return (
-    status === 429 ||
-    isNonRetryableQuotaError(errMsg) ||
-    /RESOURCE_EXHAUSTED|exceeded your current quota|rate-limits|ai\.dev\/rate-limit/i.test(errMsg)
-  );
-}
-
-function normalizeMagnificImageResolution(value: string): string {
-  const v = value.trim().toUpperCase();
-  if (v === "1K" || v === "2K" || v === "4K") return v;
-  if (v === "LOW" || v === "MEDIUM" || v === "HIGH") return v.toLowerCase();
-  return "2K";
 }
 
 function extractProviderMediaUrl(value: unknown): string {
@@ -2540,128 +2493,13 @@ function extractProviderMediaUrl(value: unknown): string {
   return "";
 }
 
-async function submitMagnificBananaTask(args: {
-  modelId: string;
-  prompt: string;
-  aspectRatio: string;
-  imageSize: string;
-  imageUrls: string[];
-  resolvedReferenceCount: number;
-  failedReferenceCount: number;
-}): Promise<ProviderResult> {
-  const config = MAGNIFIC_BANANA_MODELS[args.modelId];
-  if (!config) {
-    throw new Error(`No Magnific Banana fallback mapping for ${args.modelId}`);
-  }
-  const apiKey = loadMagnificApiKey();
-  const endpoint = `${MAGNIFIC_BASE}/ai/text-to-image/${config.endpoint_slug}`;
-  const endpointHost = new URL(endpoint).hostname;
-  const authHeaderName = endpointHost.includes("magnific.com")
-    ? "x-magnific-api-key"
-    : "x-freepik-api-key";
-  const payload: Record<string, unknown> = {
-    prompt: args.prompt,
-    aspect_ratio: args.aspectRatio && args.aspectRatio !== "Auto" ? args.aspectRatio : "1:1",
-    resolution: normalizeMagnificImageResolution(
-      args.imageSize || (args.modelId === "nano-banana-2" ? "1K" : "2K"),
-    ),
-  };
-  const referenceImages = args.imageUrls
-    .slice(0, 3)
-    .filter((url) => /^https:\/\//i.test(url))
-    .map((url, index) => ({
-      image: url,
-      text: `Reference ${index + 1}`,
-    }));
-  if (referenceImages.length > 0) payload.reference_images = referenceImages;
-  if (args.modelId === "nano-banana-2") payload.use_google_search_tool = false;
-
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      [authHeaderName]: apiKey,
-    },
-    body: JSON.stringify(payload),
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(
-      `Freepik/Magnific Banana submit failed (HTTP ${res.status}): ${
-        summarizeProviderErrorText(text, 300) || text.slice(0, 300)
-      }`,
-    );
-  }
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
-  } catch {
-    throw new Error(`Freepik/Magnific Banana submit returned non-JSON: ${text.slice(0, 200)}`);
-  }
-  const data = parsed.data && typeof parsed.data === "object"
-    ? (parsed.data as Record<string, unknown>)
-    : parsed;
-  const generated = Array.isArray(data.generated)
-    ? data.generated
-    : Array.isArray(parsed.generated)
-      ? parsed.generated
-      : [];
-  const immediateUrl = extractProviderMediaUrl(generated);
-  if (immediateUrl) {
-    return {
-      result_url: immediateUrl,
-      outputs: { output_image: immediateUrl },
-      output_type: "image_url" as const,
-      provider_meta: {
-        provider: "freepik_image",
-        source_provider: "magnific",
-        fallback_for: "banana",
-        model: args.modelId,
-        provider_model_id: config.provider_model_id,
-        provider_endpoint: endpoint,
-        resolution: payload.resolution,
-        aspect_ratio: payload.aspect_ratio,
-        reference_image_count: args.resolvedReferenceCount,
-        reference_image_requested_count: args.imageUrls.length,
-        reference_image_failed_count: args.failedReferenceCount,
-        immediate_result: true,
-      },
-    };
-  }
-  const taskId = String(data.task_id ?? data.id ?? "").trim();
-  if (!taskId) {
-    throw new Error("Freepik/Magnific Banana submit succeeded but no task_id returned");
-  }
-  console.warn(
-    `[banana-magnific] submitted ${args.modelId} fallback task=${taskId} endpoint=${config.endpoint_slug}`,
-  );
-  return {
-    task_id: taskId,
-    outputs: { output_image: "" },
-    output_type: "image_url" as const,
-    provider_meta: {
-      provider: "freepik_image",
-      source_provider: "magnific",
-      fallback_for: "banana",
-      model: args.modelId,
-      provider_model_id: config.provider_model_id,
-      provider_endpoint: endpoint,
-      resolution: payload.resolution,
-      aspect_ratio: payload.aspect_ratio,
-      reference_image_count: args.resolvedReferenceCount,
-      reference_image_requested_count: args.imageUrls.length,
-      reference_image_failed_count: args.failedReferenceCount,
-      poll_endpoint: endpoint,
-    },
-  };
-}
-
 async function executeBanana(
   params: Record<string, unknown>,
   supabase: ReturnType<typeof createClient>,
 ): Promise<ProviderResult> {
-  // Validate the primary key early. Quota/rate-limit fallback below swaps
-  // API keys only; it never changes the requested Banana model.
+  // Banana must stay on the primary Gemini image key. Do not silently route
+  // to secondary keys or wrapper providers; this keeps failures attributable
+  // to one provider path and prevents hidden cost drift.
   loadGeminiImageApiKey("primary");
 
   const rawModel = String(params.model_name ?? params.model ?? "nano-banana-pro");
@@ -2844,31 +2682,18 @@ async function executeBanana(
 
   let apiKeyAlias: GeminiImageApiKeyAlias = "primary";
   let aiResponse = await callGeminiImage(apiKeyAlias);
-  let usedGemini2Fallback = false;
 
   if (!aiResponse.ok) {
     let statusCode = aiResponse.status;
     let errorText = await aiResponse.text();
     console.error(`[banana-direct] Gemini API error key=${apiKeyAlias}: ${statusCode}`, errorText.substring(0, 500));
-    if (shouldFallbackGeminiImageKey(statusCode, errorText) && canUseGemini2Image()) {
-      console.warn(`[banana-direct] primary key hit quota/rate limit; retrying ${modelConfig.gemini_model} with GEMINI2_API_KEY`);
-      apiKeyAlias = "gemini2";
-      usedGemini2Fallback = true;
-      aiResponse = await callGeminiImage(apiKeyAlias);
-      if (!aiResponse.ok) {
-        statusCode = aiResponse.status;
-        errorText = await aiResponse.text();
-        console.error(`[banana-direct] Gemini API error key=${apiKeyAlias}: ${statusCode}`, errorText.substring(0, 500));
-      }
-    }
     if (!aiResponse.ok) {
       if (isProviderBillingLike(statusCode, errorText)) {
         throw new Error("PROVIDER_BILLING_ERROR");
       }
       const providerDetail = summarizeProviderErrorBody(errorText);
-      const keyDetail = usedGemini2Fallback ? "key=gemini2 after primary" : `key=${apiKeyAlias}`;
       throw new Error(
-        `${modelLabel} failed (HTTP ${statusCode}, ${keyDetail}): ` +
+        `${modelLabel} failed (HTTP ${statusCode}, key=${apiKeyAlias}): ` +
           (providerDetail || "Provider returned no error body."),
       );
     }
@@ -6802,11 +6627,6 @@ function workspaceJobBackoffSeconds(attempt: number): number {
   return Math.max(5, Math.ceil(ms / 1000));
 }
 
-function workspaceJobMaxAttemptsForRequest(provider: string, model: string): number {
-  if (provider === "banana" && /^nano-banana-/i.test(model)) return 60;
-  return TOTAL_MAX_RETRIES;
-}
-
 function workspaceJobPollDelaySeconds(result: Record<string, unknown>): number {
   const providerMeta =
     result.provider_meta && typeof result.provider_meta === "object"
@@ -8073,7 +7893,7 @@ serve(async (req) => {
           status: "queued",
           run_after: new Date().toISOString(),
           deadline_at: new Date(Date.now() + WORKSPACE_JOB_MAX_MS).toISOString(),
-          max_attempts: workspaceJobMaxAttemptsForRequest(provider, model),
+          max_attempts: 18,
           credits_charged: jobCharge?.amount ?? 0,
           credit_team_id: jobCharge?.teamId ?? null,
           credit_organization_id: jobCharge?.organizationId ?? null,
