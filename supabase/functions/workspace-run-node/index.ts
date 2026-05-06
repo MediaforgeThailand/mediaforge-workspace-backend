@@ -2633,6 +2633,14 @@ function shouldFallbackGeminiImageKey(status: number, errMsg: string): boolean {
   );
 }
 
+function shouldFallbackGeminiImageToMagnific(status: number, errMsg: string): boolean {
+  return (
+    status === 429 ||
+    isNonRetryableQuotaError(errMsg) ||
+    /RESOURCE_EXHAUSTED|exceeded your current quota|rate-limits|ai\.dev\/rate-limit/i.test(errMsg)
+  );
+}
+
 function normalizeMagnificImageResolution(value: string): string {
   const v = value.trim().toUpperCase();
   if (v === "1K" || v === "2K" || v === "4K") return v;
@@ -2711,7 +2719,11 @@ async function submitMagnificBananaTask(args: {
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`Freepik/Magnific Banana submit failed (HTTP ${res.status}): ${text.slice(0, 500)}`);
+    throw new Error(
+      `Freepik/Magnific Banana submit failed (HTTP ${res.status}): ${
+        summarizeProviderErrorText(text, 300) || text.slice(0, 300)
+      }`,
+    );
   }
   let parsed: Record<string, unknown>;
   try {
@@ -2919,7 +2931,7 @@ async function executeBanana(
   // Keep this lower than WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS and the Edge runtime
   // gateway ceiling. If Gemini is slow/queued, the durable workspace queue will
   // retry instead of letting the worker get killed and marked as dropped.
-  const ABORT_MS = canUseMagnificImage() ? 45_000 : 118_000;
+  const ABORT_MS = 118_000;
   const modelLabel = modelId === "nano-banana-pro" ? "Nano Banana Pro" : "Nano Banana 2";
 
   async function callGeminiImage(apiKeyAlias: GeminiImageApiKeyAlias): Promise<Response> {
@@ -2978,7 +2990,7 @@ async function executeBanana(
       }
     }
     if (!aiResponse.ok) {
-      if (usedGemini2Fallback && shouldFallbackGeminiImageKey(statusCode, errorText) && canUseMagnificImage()) {
+      if (usedGemini2Fallback && shouldFallbackGeminiImageToMagnific(statusCode, errorText) && canUseMagnificImage()) {
         console.warn(
           `[banana-direct] both Gemini image keys hit quota/rate limit; falling back to Magnific ${modelId}`,
         );
