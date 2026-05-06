@@ -112,8 +112,9 @@ function isProviderBillingLike(status: number, text: string): boolean {
 }
 
 const MAGNIFIC_BASE =
+  Deno.env.get("FREEPIK_API_BASE")?.trim().replace(/\/+$/, "") ||
   Deno.env.get("MAGNIFIC_API_BASE")?.trim().replace(/\/+$/, "") ||
-  "https://api.magnific.com/v1";
+  "https://api.freepik.com/v1";
 
 function loadMagnificApiKey(): string {
   const key =
@@ -3618,6 +3619,19 @@ async function submitMagnificVeoTask(args: {
   const endpoint = hasImageInput
     ? `${MAGNIFIC_BASE}/ai/image-to-video/veo-3-1`
     : `${MAGNIFIC_BASE}/ai/text-to-video/veo-3-1`;
+  const endpointHost = new URL(endpoint).hostname;
+  const authHeaderName = endpointHost.includes("magnific.com")
+    ? "x-magnific-api-key"
+    : "x-freepik-api-key";
+  let imagePayload = args.startFrameUrl;
+  if (hasImageInput && args.startFrameUrl) {
+    try {
+      imagePayload = bytesToBase64(await fetchImageBuffer(args.startFrameUrl));
+      console.log(`[veo-freepik] Converted start frame to base64 (${Math.round(imagePayload.length / 1024)}KB)`);
+    } catch (err) {
+      console.warn("[veo-freepik] start frame base64 conversion failed, using URL:", err);
+    }
+  }
   const payload: Record<string, unknown> = {
     prompt: args.prompt,
     duration: args.durationSeconds,
@@ -3626,14 +3640,13 @@ async function submitMagnificVeoTask(args: {
     generate_audio: true,
   };
   if (args.negativePrompt) payload.negative_prompt = args.negativePrompt;
-  if (hasImageInput) payload.image = args.startFrameUrl;
+  if (hasImageInput) payload.image = imagePayload;
 
   const res = await fetch(endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-magnific-api-key": apiKey,
-      "x-freepik-api-key": apiKey,
+      [authHeaderName]: apiKey,
     },
     body: JSON.stringify(payload),
   });
@@ -7914,11 +7927,14 @@ serve(async (req) => {
       const pollUrl = `${pollEndpoint.replace(/\/+$/, "")}/${encodeURIComponent(taskId)}`;
       let payload: Record<string, unknown>;
       try {
+        const endpointHost = new URL(pollEndpoint).hostname;
+        const authHeaderName = endpointHost.includes("magnific.com")
+          ? "x-magnific-api-key"
+          : "x-freepik-api-key";
         const r = await fetch(pollUrl, {
           method: "GET",
           headers: {
-            "x-magnific-api-key": apiKey,
-            "x-freepik-api-key": apiKey,
+            [authHeaderName]: apiKey,
           },
         });
         const text = await r.text();
