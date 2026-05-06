@@ -163,15 +163,27 @@ function canUseReplicateVeo(): boolean {
   return Boolean(Deno.env.get("REPLICATE_API_TOKEN"));
 }
 
-function shouldGenerateReplicateVeoAudio(params: Record<string, unknown>): boolean {
+function truthyParam(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value === "number") return value === 1;
+  if (typeof value !== "string") return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function shouldGenerateFallbackVeoAudio(params: Record<string, unknown>): boolean {
   const envValue = String(Deno.env.get("REPLICATE_VEO_GENERATE_AUDIO") ?? "").trim().toLowerCase();
-  if (envValue === "1" || envValue === "true" || envValue === "yes" || envValue === "on") {
+  if (envValue === "1" || envValue === "true" || envValue === "yes" || envValue === "on" || envValue === "force") {
     return true;
   }
-  if (envValue === "0" || envValue === "false" || envValue === "no" || envValue === "off") {
+  if (envValue === "0" || envValue === "false" || envValue === "no" || envValue === "off" || envValue === "never") {
     return false;
   }
-  return String(params.replicate_generate_audio ?? "").trim().toLowerCase() === "true";
+  return (
+    truthyParam(params.replicate_generate_audio) ||
+    truthyParam(params.generate_audio) ||
+    truthyParam(params.has_audio)
+  );
 }
 
 function canUseGemini2Veo(): boolean {
@@ -1848,7 +1860,41 @@ async function executeVeo(
   const endFrameUrl = (params.end_frame ?? params.image_tail_url) as
     | string
     | undefined;
-  const replicateGenerateAudio = shouldGenerateReplicateVeoAudio(params);
+  const fallbackGenerateAudio = shouldGenerateFallbackVeoAudio(params);
+
+  if (!fallbackGenerateAudio) {
+    if (canUseReplicateVeo()) {
+      console.warn("[veo] no-audio requested; using Replicate Veo 3.1 because Gemini API does not expose a no-audio toggle");
+      return await submitReplicateVeoTask({
+        prompt,
+        negativePrompt: String(params.negative_prompt ?? "").trim(),
+        startFrameUrl,
+        endFrameUrl,
+        aspectRatio,
+        resolution,
+        durationSeconds,
+        modelSlug,
+        providerModelId: entry.model,
+        seed: params.seed,
+        generateAudio: false,
+      });
+    }
+    if (canUseMagnificVeo()) {
+      console.warn("[veo] no-audio requested; using Freepik/Magnific Veo 3.1 because Gemini API does not expose a no-audio toggle");
+      return await submitMagnificVeoTask({
+        prompt,
+        negativePrompt: String(params.negative_prompt ?? "").trim(),
+        startFrameUrl,
+        endFrameUrl,
+        aspectRatio,
+        resolution,
+        durationSeconds,
+        modelSlug,
+        providerModelId: entry.model,
+        generateAudio: false,
+      });
+    }
+  }
 
   if (shouldPreferReplicateVeo()) {
     return await submitReplicateVeoTask({
@@ -1862,7 +1908,7 @@ async function executeVeo(
       modelSlug,
       providerModelId: entry.model,
       seed: params.seed,
-      generateAudio: replicateGenerateAudio,
+      generateAudio: fallbackGenerateAudio,
     });
   }
 
@@ -1877,6 +1923,7 @@ async function executeVeo(
       durationSeconds,
       modelSlug,
       providerModelId: entry.model,
+      generateAudio: fallbackGenerateAudio,
     });
   }
 
@@ -1942,7 +1989,7 @@ async function executeVeo(
                 modelSlug,
                 providerModelId: entry.model,
                 seed: params.seed,
-                generateAudio: replicateGenerateAudio,
+                generateAudio: fallbackGenerateAudio,
               });
             } catch (replicateErr) {
               const replicateMessage = replicateErr instanceof Error ? replicateErr.message : String(replicateErr);
@@ -1964,6 +2011,7 @@ async function executeVeo(
               durationSeconds,
               modelSlug,
               providerModelId: entry.model,
+              generateAudio: fallbackGenerateAudio,
             });
           }
         }
@@ -1984,7 +2032,7 @@ async function executeVeo(
             modelSlug,
             providerModelId: entry.model,
             seed: params.seed,
-            generateAudio: replicateGenerateAudio,
+            generateAudio: fallbackGenerateAudio,
           });
         } catch (replicateErr) {
           const replicateMessage = replicateErr instanceof Error ? replicateErr.message : String(replicateErr);
@@ -2006,6 +2054,7 @@ async function executeVeo(
           durationSeconds,
           modelSlug,
           providerModelId: entry.model,
+          generateAudio: fallbackGenerateAudio,
         });
       }
     }
@@ -3871,6 +3920,7 @@ async function submitMagnificVeoTask(args: {
   durationSeconds: VeoDuration;
   modelSlug: string;
   providerModelId: string;
+  generateAudio: boolean;
 }): Promise<ProviderResult> {
   const apiKey = loadMagnificApiKey();
   const hasImageInput = Boolean(args.startFrameUrl);
@@ -3898,7 +3948,7 @@ async function submitMagnificVeoTask(args: {
     duration: args.durationSeconds,
     resolution: args.resolution,
     aspect_ratio: args.aspectRatio,
-    generate_audio: true,
+    generate_audio: args.generateAudio,
   };
   if (args.negativePrompt) payload.negative_prompt = args.negativePrompt;
   if (hasImageInput) payload.image = imagePayload;
@@ -3953,7 +4003,7 @@ async function submitMagnificVeoTask(args: {
       duration_seconds: args.durationSeconds,
       resolution: args.resolution,
       aspect_ratio: args.aspectRatio,
-      has_audio: true,
+      has_audio: args.generateAudio,
       is_image2video: hasImageInput,
       unsupported_end_frame: Boolean(args.endFrameUrl),
       poll_endpoint: endpoint,
