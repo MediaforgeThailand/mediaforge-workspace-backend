@@ -5667,7 +5667,7 @@ function isPermanentWorkspaceJobError(err: unknown): boolean {
   return (
     classifyError(msg) === "permanent" ||
     /authentication|unauthor(ized|ised)|invalid.*api.?key/i.test(msg) ||
-    /content[\s_-]*polic|moderation|blocked|safety system/i.test(msg) ||
+    /content[\s_-]*polic|moderation|blocked|safety (?:system|filter)|privacy-sensitive|Seedance rejected the reference media/i.test(msg) ||
     /unsupported node type|No executor for provider/i.test(msg) ||
     /\bnot configured\b|missing.*key|credentials missing/i.test(msg) ||
     /is not defined|is not a function|cannot read prop(?:erty|erties) of (?:undefined|null)/i.test(msg) ||
