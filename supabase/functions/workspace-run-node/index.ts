@@ -490,6 +490,16 @@ const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     ref_video:     { internal_key: "reference_video_urls", data_type: "video" },
     ref_audio:     { internal_key: "reference_audio_urls", data_type: "audio" },
   },
+  replicate_video: {
+    start_frame:   { internal_key: "image_url",      data_type: "image" },
+    end_frame:     { internal_key: "image_tail_url", data_type: "image" },
+    image_input:   { internal_key: "image_url",      data_type: "image" },
+    image:         { internal_key: "image_url",      data_type: "image" },
+    ref_image:     { internal_key: "reference_image_urls", data_type: "image" },
+    reference_image: { internal_key: "reference_image_urls", data_type: "image" },
+    ref_video:     { internal_key: "reference_video_urls", data_type: "video" },
+    ref_audio:     { internal_key: "reference_audio_urls", data_type: "audio" },
+  },
   tripo3d: {
     image:         { internal_key: "image_url",      data_type: "image" },
     image_input:   { internal_key: "image_url",      data_type: "image" },
@@ -4249,6 +4259,173 @@ async function submitReplicateVeoTask(args: {
   };
 }
 
+const REPLICATE_SEEDANCE_MODEL_SLUG = "replicate-seedance-2-0";
+const REPLICATE_SEEDANCE_PROVIDER_MODEL_ID = "bytedance/seedance-2.0";
+const REPLICATE_PREDICTIONS_ENDPOINT = "https://api.replicate.com/v1/predictions";
+
+function collectStringUrls(params: Record<string, unknown>, keys: string[], max: number): string[] {
+  const values: string[] = [];
+  const push = (value: unknown) => {
+    if (typeof value === "string" && value.trim()) values.push(value.trim());
+  };
+  for (const key of keys) {
+    const value = params[key];
+    if (Array.isArray(value)) value.forEach(push);
+    else push(value);
+  }
+  return Array.from(new Set(values)).slice(0, max);
+}
+
+function parseReplicateSeedanceDuration(value: unknown): number {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : parseInt(String(value ?? "5"), 10);
+  if (parsed === -1) return -1;
+  if (!Number.isFinite(parsed)) return 5;
+  return Math.min(15, Math.max(1, parsed));
+}
+
+async function executeReplicateVideo(
+  params: Record<string, unknown>,
+): Promise<ProviderResult> {
+  const modelSlug = String(params.model_name ?? params.model ?? REPLICATE_SEEDANCE_MODEL_SLUG);
+  if (modelSlug !== REPLICATE_SEEDANCE_MODEL_SLUG) {
+    throw new Error(`Unknown Replicate video model: ${modelSlug}`);
+  }
+
+  const apiToken = Deno.env.get("REPLICATE_API_TOKEN")?.trim();
+  if (!apiToken) {
+    throw new Error("Replicate video is not configured. Set REPLICATE_API_TOKEN.");
+  }
+
+  const prompt = String(params.prompt ?? "").trim();
+  if (!prompt) {
+    throw new Error("Replicate Seedance 2.0 requires a prompt.");
+  }
+
+  const startFrameUrl = String(params.image_url ?? params.start_frame ?? "").trim();
+  const endFrameUrl = String(params.image_tail_url ?? params.end_frame ?? "").trim();
+  const referenceImageUrls = collectStringUrls(
+    params,
+    ["reference_image_urls", "reference_image_url", "reference_image", "ref_image"],
+    9,
+  );
+  const referenceVideoUrls = collectStringUrls(
+    params,
+    ["reference_video_urls", "reference_video_url", "video_urls", "video_url", "ref_video"],
+    3,
+  );
+  const referenceAudioUrls = collectStringUrls(
+    params,
+    ["reference_audio_urls", "reference_audio_url", "audio_urls", "audio_url", "ref_audio"],
+    3,
+  );
+
+  if (endFrameUrl && !startFrameUrl) {
+    throw new Error("Replicate Seedance 2.0 last_frame_image requires a start_frame image.");
+  }
+  if ((startFrameUrl || endFrameUrl) && (referenceImageUrls.length > 0 || referenceVideoUrls.length > 0 || referenceAudioUrls.length > 0)) {
+    throw new Error("Replicate Seedance 2.0 cannot mix start/end frame mode with reference media mode.");
+  }
+  if (referenceAudioUrls.length > 0 && referenceImageUrls.length === 0 && referenceVideoUrls.length === 0) {
+    throw new Error("Replicate Seedance 2.0 reference_audios require at least one reference_image or ref_video.");
+  }
+
+  const resolutionRaw = String(params.resolution ?? "720p").toLowerCase();
+  const resolution = ["480p", "720p", "1080p"].includes(resolutionRaw) ? resolutionRaw : "720p";
+  const aspectRaw = String(params.aspect_ratio ?? params.ratio ?? "16:9");
+  const aspectRatio = ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "9:21", "adaptive"].includes(aspectRaw)
+    ? aspectRaw
+    : "16:9";
+  const duration = parseReplicateSeedanceDuration(params.duration);
+  const generateAudioRaw = params.generate_audio ?? params.has_audio;
+  const generateAudio = generateAudioRaw === undefined
+    ? true
+    : generateAudioRaw === true || generateAudioRaw === "true";
+  const seedRaw = params.seed;
+  const seed = seedRaw === null || seedRaw === undefined || String(seedRaw).trim() === ""
+    ? undefined
+    : parseInt(String(seedRaw), 10);
+
+  const input: Record<string, unknown> = {
+    prompt,
+    duration,
+    resolution,
+    aspect_ratio: aspectRatio,
+    generate_audio: generateAudio,
+  };
+  if (startFrameUrl) input.image = startFrameUrl;
+  if (endFrameUrl) input.last_frame_image = endFrameUrl;
+  if (referenceImageUrls.length > 0) input.reference_images = referenceImageUrls;
+  if (referenceVideoUrls.length > 0) input.reference_videos = referenceVideoUrls;
+  if (referenceAudioUrls.length > 0) input.reference_audios = referenceAudioUrls;
+  if (typeof seed === "number" && Number.isFinite(seed)) input.seed = seed;
+
+  console.log(
+    `[replicate-seedance] submit duration=${duration}s resolution=${resolution} ` +
+      `aspect=${aspectRatio} audio=${generateAudio} i2v=${!!startFrameUrl} ` +
+      `irefs=${referenceImageUrls.length} vrefs=${referenceVideoUrls.length} arefs=${referenceAudioUrls.length}`,
+  );
+
+  const res = await fetch(
+    `https://api.replicate.com/v1/models/${REPLICATE_SEEDANCE_PROVIDER_MODEL_ID}/predictions`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ input }),
+    },
+  );
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Replicate Seedance 2.0 submit failed (HTTP ${res.status}): ${text.slice(0, 500)}`);
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  } catch {
+    throw new Error(`Replicate Seedance 2.0 returned invalid JSON: ${text.slice(0, 300)}`);
+  }
+
+  const predictionId = String(parsed.id ?? "").trim();
+  if (!predictionId) {
+    throw new Error(`Replicate Seedance 2.0 returned no prediction id: ${text.slice(0, 300)}`);
+  }
+
+  return {
+    task_id: predictionId,
+    outputs: {
+      output_video: "",
+      output_start_frame: startFrameUrl,
+      output_end_frame: endFrameUrl,
+      output_last_frame: "",
+    },
+    output_type: "video_url",
+    provider_meta: {
+      provider: "replicate_video",
+      source_provider: "replicate",
+      model: modelSlug,
+      provider_model_id: REPLICATE_SEEDANCE_PROVIDER_MODEL_ID,
+      poll_endpoint: REPLICATE_PREDICTIONS_ENDPOINT,
+      duration_seconds: duration,
+      resolution,
+      aspect_ratio: aspectRatio,
+      has_audio: generateAudio,
+      is_image2video: Boolean(startFrameUrl),
+      has_image_ref: referenceImageUrls.length > 0,
+      reference_image_count: referenceImageUrls.length,
+      has_video_ref: referenceVideoUrls.length > 0,
+      reference_video_count: referenceVideoUrls.length,
+      has_audio_ref: referenceAudioUrls.length > 0,
+      reference_audio_count: referenceAudioUrls.length,
+    },
+  };
+}
+
 interface MentionResolution {
   resolvedPrompt: string;
   mentionedImageUrls: string[];
@@ -4552,9 +4729,10 @@ async function executeOneStep(
       stepParams.mention_image_urls = allMentionedImageUrls;
       if (!stepParams.image_url) stepParams.image_url = allMentionedImageUrls[0];
     } else if (
-      p === "seedance" &&
+      (p === "seedance" || p === "replicate_video") &&
       (String(stepParams.model_name ?? stepParams.model ?? "").startsWith("seedance-2-0") ||
-        String(stepParams.model_name ?? stepParams.model ?? "").startsWith("dreamina-seedance-2-0"))
+        String(stepParams.model_name ?? stepParams.model ?? "").startsWith("dreamina-seedance-2-0") ||
+        String(stepParams.model_name ?? stepParams.model ?? "").startsWith("replicate-seedance-2-0"))
     ) {
       const existing = Array.isArray(stepParams.reference_image_urls)
         ? (stepParams.reference_image_urls as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
@@ -4618,9 +4796,10 @@ async function executeOneStep(
   if (allAggregatedImages.length > 0) {
     const p = stepDef.provider.toLowerCase();
     const isSeedanceV2 =
-      p === "seedance" &&
+      (p === "seedance" || p === "replicate_video") &&
       (String(stepParams.model_name ?? stepParams.model ?? "").startsWith("seedance-2-0") ||
-        String(stepParams.model_name ?? stepParams.model ?? "").startsWith("dreamina-seedance-2-0"));
+        String(stepParams.model_name ?? stepParams.model ?? "").startsWith("dreamina-seedance-2-0") ||
+        String(stepParams.model_name ?? stepParams.model ?? "").startsWith("replicate-seedance-2-0"));
     if (isSeedanceV2) {
       const hasKeyframeInput = Boolean(
         stepParams.image_url ||
@@ -4656,6 +4835,8 @@ async function executeOneStep(
         return await executeKling(stepParams);
       case "veo":
         return await executeVeo(stepParams, supabase);
+      case "replicate_video":
+        return await executeReplicateVideo(stepParams);
       case "banana":
         return await executeBanana(stepParams, SUPABASE_URL, token);
       case "chat_ai":
@@ -5126,6 +5307,7 @@ function getProviderForNodeType(
     return "banana";
   }
   if (nodeType === "klingVideoNode" || nodeType === "videoGenNode") {
+    if (m.startsWith("replicate-seedance")) return "replicate_video";
     if (m.startsWith("seedance") || m.startsWith("dreamina-seedance")) return "seedance";
     if (m.startsWith("veo-")) return "veo";
     return "kling";
@@ -5164,7 +5346,7 @@ function workspaceProviderDef(
 ): ProviderDef {
   const p = provider as ProviderKey;
   const output: ProviderDef["output_type"] =
-    p === "kling" || p === "seedance" || p === "veo" || p === "merge_audio"
+    p === "kling" || p === "seedance" || p === "veo" || p === "replicate_video" || p === "merge_audio"
       ? "video_url"
       : p === "tripo3d" || p === "hyper3d"
         ? "model_3d"
@@ -5178,7 +5360,7 @@ function workspaceProviderDef(
     p === "openai" ? "generate_openai_image" :
     p === "seedream" ? "generate_seedream_image" :
     p === "banana" ? "generate_freepik_image" :
-    p === "kling" || p === "seedance" || p === "veo" ? "generate_freepik_video" :
+    p === "kling" || p === "seedance" || p === "veo" || p === "replicate_video" ? "generate_freepik_video" :
     p === "remove_bg" ? "remove_background" :
     p === "merge_audio" ? "merge_audio_video" :
     p === "chat_ai" ? "chat_ai" :
@@ -5190,7 +5372,7 @@ function workspaceProviderDef(
     provider: p,
     feature,
     output_type: output,
-    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio",
+    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "replicate_video" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio",
   };
 }
 
@@ -5215,6 +5397,7 @@ function workspaceMultiplierForProvider(
     case "kling":
     case "seedance":
     case "veo":
+    case "replicate_video":
     case "merge_audio":
       return multipliers.video;
     case "chat_ai":
@@ -6283,6 +6466,7 @@ interface WorkspaceRunBody {
     | "poll_seedance"
     | "poll_veo"
     | "poll_replicate_veo"
+    | "poll_replicate_video"
     | "poll_freepik_veo"
     | "poll_freepik_video"
     | "poll_freepik_image"
@@ -6549,6 +6733,8 @@ async function pollWorkspaceAsyncResult(args: {
         ? "poll_veo"
       : provider === "replicate_veo"
         ? "poll_replicate_veo"
+      : provider === "replicate_video"
+        ? "poll_replicate_video"
       : provider === "freepik_veo" || provider === "freepik_seedance"
         ? "poll_freepik_video"
       : provider === "freepik_image"
@@ -6652,6 +6838,8 @@ async function pollWorkspaceAsyncResultOnce(args: {
         ? "poll_veo"
       : provider === "replicate_veo"
         ? "poll_replicate_veo"
+      : provider === "replicate_video"
+        ? "poll_replicate_video"
       : provider === "freepik_veo" || provider === "freepik_seedance"
         ? "poll_freepik_video"
       : provider === "freepik_image"
@@ -6754,7 +6942,10 @@ function inferAsyncPollProvider(
     if (endpoint.includes("/seedance-")) return "freepik_seedance";
     return "freepik_veo";
   }
-  if (endpoint.includes("api.replicate.com")) return "replicate_veo";
+  if (endpoint.includes("api.replicate.com")) {
+    const model = String(providerMeta.model ?? providerMeta.provider_model_id ?? "").toLowerCase();
+    return model.includes("seedance") ? "replicate_video" : "replicate_veo";
+  }
   if (
     endpoint.includes("generativelanguage.googleapis.com") ||
     task.startsWith("operations/") ||
@@ -8503,12 +8694,14 @@ serve(async (req) => {
      * exhausted. Magnific returns { data: { status, generated[] } }; on
      * terminal success we mirror the provider URL into Supabase storage so
      * the browser sees the same signed-URL shape as direct Veo. */
-    if (body.action === "poll_replicate_veo") {
+    if (body.action === "poll_replicate_veo" || body.action === "poll_replicate_video") {
       const taskId = String(body.task_id ?? "").trim();
       const pollEndpoint = String(body.poll_endpoint ?? "").trim();
+      const isReplicateVeoPoll = body.action === "poll_replicate_veo";
+      const replicateLabel = isReplicateVeoPoll ? "Replicate Veo" : "Replicate video";
       if (!taskId || !pollEndpoint) {
         return new Response(
-          JSON.stringify({ error: "task_id and poll_endpoint required for poll_replicate_veo" }),
+          JSON.stringify({ error: "task_id and poll_endpoint required for Replicate polling" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       }
@@ -8549,7 +8742,7 @@ serve(async (req) => {
           return new Response(
             JSON.stringify({
               status: "polling_error",
-              message: `Replicate Veo poll failed (HTTP ${r.status}): ${text.slice(0, 300)}`,
+              message: `${replicateLabel} poll failed (HTTP ${r.status}): ${text.slice(0, 300)}`,
             }),
             { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
           );
@@ -8586,7 +8779,8 @@ serve(async (req) => {
           const bytes = new Uint8Array(await videoRes.arrayBuffer());
           const contentType = videoRes.headers.get("content-type")?.split(";")[0]?.trim() || "video/mp4";
           const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
-          const path = `${user.id}/veo-renders/replicate_${safeTaskId}.mp4`;
+          const folder = isReplicateVeoPoll ? "veo-renders" : "replicate-video-renders";
+          const path = `${user.id}/${folder}/replicate_${safeTaskId}.mp4`;
           const upload = await supabase.storage
             .from("user_assets")
             .upload(path, bytes, { contentType, upsert: true });
@@ -8599,13 +8793,13 @@ serve(async (req) => {
           }
           publicUrl = signed.data.signedUrl;
         } catch (err) {
-          console.error("[poll_replicate_veo] rehost failed:", err);
+          console.error("[poll_replicate] rehost failed:", err);
           return new Response(
             JSON.stringify({
               status: "failed",
               task_id: taskId,
               url: "",
-              message: `Replicate Veo finished but the video couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
+              message: `${replicateLabel} finished but the video couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
             }),
             { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
           );
@@ -8617,7 +8811,7 @@ serve(async (req) => {
           status: normalised,
           task_id: taskId,
           url: publicUrl,
-          message: normalised === "failed" ? errorMessage || "Replicate Veo task failed" : rawStatus,
+          message: normalised === "failed" ? errorMessage || `${replicateLabel} task failed` : rawStatus,
         }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
@@ -9532,11 +9726,12 @@ serve(async (req) => {
         ]));
         params.image_urls = merged;
         if (!params.image_url) params.image_url = merged[0];
-      } else if (provider === "seedance") {
+      } else if (provider === "seedance" || provider === "replicate_video") {
         const model = String(params.model_name ?? params.model ?? "").toLowerCase();
         const isSeedanceV2 =
           model.startsWith("seedance-2-0") ||
-          model.startsWith("dreamina-seedance-2-0");
+          model.startsWith("dreamina-seedance-2-0") ||
+          model.startsWith("replicate-seedance-2-0");
         if (isSeedanceV2) {
           const hasKeyframeInput = Boolean(
             params.image_url ||
@@ -9649,6 +9844,9 @@ serve(async (req) => {
         break;
       case "seedance":
         result = await executeSeedance(params);
+        break;
+      case "replicate_video":
+        result = await executeReplicateVideo(params);
         break;
       case "veo":
         result = await executeVeo(params, supabase);

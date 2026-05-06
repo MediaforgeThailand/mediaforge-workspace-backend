@@ -23,6 +23,7 @@ export type ProviderKey =
   | "kling"
   | "seedance"
   | "veo"
+  | "replicate_video"
   | "banana"
   | "openai"
   | "seedream"
@@ -325,19 +326,33 @@ export async function lookupBaseCost(
 
   /* ── Video (Kling — unified: I2V, Extension, Motion Control, Omni) ── */
   const model = String(params.model_name ?? params.model ?? DEFAULT_VIDEO_MODEL);
+  const hasRefVideoInput =
+    params._has_ref_video === true ||
+    params._has_ref_video === "true" ||
+    (Array.isArray(params.reference_video_urls) && params.reference_video_urls.length > 0) ||
+    Boolean(params.reference_video_url || params.video_url || params.ref_video);
+  const replicatePricingModel =
+    model === "replicate-seedance-2-0" && hasRefVideoInput
+      ? `${model}-video-ref`
+      : model;
   const modelAliases =
     model === "veo-3.1-generate-001" || model === "veo-3.1-generate-preview"
       ? Array.from(new Set([model, "veo-3.1-generate-preview", "veo-3.1-generate-001"]))
-      : [model];
+      : replicatePricingModel !== model
+        ? [replicatePricingModel, model]
+        : [model];
   const isMotion = model.includes("motion");
   const isOmni = model === "kling-v3-omni";
 
   // For motion models, duration comes from ref_video (passed as ref_video_duration).
   // For Omni models, duration comes from the slider (3-15s).
   // For standard models, use the explicit duration param.
-  const duration = isMotion
+  const parsedDuration = isMotion
     ? (parseInt(String(params.ref_video_duration ?? "0"), 10) || 0)
     : (parseInt(String(params.duration ?? "5"), 10) || 5);
+  const duration = model.startsWith("replicate-seedance") && parsedDuration <= 0
+    ? 5
+    : parsedDuration;
 
   const hasAudio =
     params.has_audio === true ||

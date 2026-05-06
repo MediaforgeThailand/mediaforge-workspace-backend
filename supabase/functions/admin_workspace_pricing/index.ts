@@ -236,6 +236,33 @@ const SEEDANCE_ROWS: CreditCostWriteRow[] = [
   notes: row.notes,
 }));
 
+const REPLICATE_SEEDANCE_2_ROWS: CreditCostWriteRow[] = ([
+  { model: "replicate-seedance-2-0", label: "Seedance 2.0 Replicate 480p", resolution: "480p", usdPerSecond: 0.08, videoInput: false },
+  { model: "replicate-seedance-2-0", label: "Seedance 2.0 Replicate 720p", resolution: "720p", usdPerSecond: 0.18, videoInput: false },
+  { model: "replicate-seedance-2-0", label: "Seedance 2.0 Replicate 1080p", resolution: "1080p", usdPerSecond: 0.45, videoInput: false },
+  { model: "replicate-seedance-2-0", label: "Seedance 2.0 Replicate fallback", resolution: null, usdPerSecond: 0.18, videoInput: false },
+  { model: "replicate-seedance-2-0-video-ref", label: "Seedance 2.0 Replicate 480p + video ref", resolution: "480p", usdPerSecond: 0.10, videoInput: true },
+  { model: "replicate-seedance-2-0-video-ref", label: "Seedance 2.0 Replicate 720p + video ref", resolution: "720p", usdPerSecond: 0.22, videoInput: true },
+  { model: "replicate-seedance-2-0-video-ref", label: "Seedance 2.0 Replicate 1080p + video ref", resolution: "1080p", usdPerSecond: 0.55, videoInput: true },
+  { model: "replicate-seedance-2-0-video-ref", label: "Seedance 2.0 Replicate video-ref fallback", resolution: null, usdPerSecond: 0.22, videoInput: true },
+] as const).flatMap((row) =>
+  ([false, true] as const).map((audio) => ({
+    feature: "generate_freepik_video",
+    model: row.resolution ? `${row.model}:${row.resolution}` : row.model,
+    label: `${row.label}${audio ? " + audio" : ""}`,
+    cost: creditsFromUsd(row.usdPerSecond),
+    pricing_type: "per_second",
+    has_audio: audio,
+    provider: "replicate",
+    price_key: `${row.model}:${row.resolution ?? "default"}:${row.videoInput ? "video_in" : "non_video_in"}:${audio ? "audio" : "silent"}`,
+    resolution: row.resolution,
+    source: "replicate_docs",
+    source_url: "https://replicate.com/bytedance/seedance-2.0",
+    provider_unit: "per second",
+    notes: `Replicate bytedance/seedance-2.0 ${row.videoInput ? "video input" : "non-video input"} ${row.resolution ?? "default 720p"} costs $${row.usdPerSecond}/sec. Audio toggle does not change Replicate pricing; duplicate audio rows keep runtime cost lookup strict.`,
+  }))
+);
+
 const VEO_ROWS: CreditCostWriteRow[] = ([
   { model: "veo-3.1-generate-001", label: "Google Veo 3.1 no audio", usdPerSecond: 0.20, audio: false },
   { model: "veo-3.1-generate-001", label: "Google Veo 3.1 + audio", usdPerSecond: 0.40, audio: true },
@@ -311,6 +338,7 @@ const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   ...NANO_BANANA_FALLBACK_ROWS,
   ...KLING_ROWS,
   ...SEEDANCE_ROWS,
+  ...REPLICATE_SEEDANCE_2_ROWS,
   ...VEO_ROWS,
   { feature: "generate_seedream_image", model: "seedream-5-0-260128", label: "Seedream 5.0", cost: 60, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-5-0-260128", source: "master_pricing_sheet", source_url: "https://www.byteplus.com/en/product/modelark", provider_unit: "per image", notes: "Master Pricing Sheet: $0.035/image -> approx 60 credits/image at Workspace ratio." },
   { feature: "generate_seedream_image", model: "seedream-5-0", label: "Seedream 5.0 alias", cost: 60, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-5-0-260128", source: "master_pricing_sheet", source_url: "https://www.byteplus.com/en/product/modelark", provider_unit: "per image", notes: "Runtime alias for Seedream 5.0." },
