@@ -231,8 +231,39 @@ function mapWorkspaceJobToGenerationLogRow(row: Record<string, unknown>) {
     error_message: errorMessage,
     error_classification: errorMessage ? String(row.status ?? "") : null,
     display_name: null,
+    user_email: null,
     flow_name: flowName || "Workspace generation",
   };
+}
+
+async function enrichGenerationRowsWithUsers(
+  client: SupabaseClient,
+  rows: Array<ReturnType<typeof mapWorkspaceJobToGenerationLogRow>>,
+): Promise<Array<ReturnType<typeof mapWorkspaceJobToGenerationLogRow>>> {
+  const userIds = [...new Set(rows.map((r) => r.user_id).filter(Boolean))];
+  if (userIds.length === 0) return rows;
+
+  const [{ data: profiles }, authUsers] = await Promise.all([
+    client.from("profiles").select("user_id, display_name").in("user_id", userIds),
+    Promise.all(
+      userIds.map(async (userId) => {
+        const { data, error } = await client.auth.admin.getUserById(userId);
+        if (error || !data?.user) return { user_id: userId, email: null };
+        return { user_id: userId, email: data.user.email ?? null };
+      }),
+    ),
+  ]);
+
+  const displayNameByUser = new Map(
+    (profiles ?? []).map((p) => [String(p.user_id), p.display_name ? String(p.display_name) : null]),
+  );
+  const emailByUser = new Map(authUsers.map((u) => [u.user_id, u.email]));
+
+  return rows.map((row) => ({
+    ...row,
+    display_name: displayNameByUser.get(row.user_id) ?? null,
+    user_email: emailByUser.get(row.user_id) ?? null,
+  }));
 }
 
 // Reads
@@ -283,7 +314,12 @@ async function listFlowRunsForGenLog(
     .filter((r) => status !== "failed_refunded" || r.status === "failed_refunded")
     .filter((r) => status !== "failed" || r.status === "failed");
 
-  return { rows, total: count ?? rows.length, limit, offset };
+  return {
+    rows: await enrichGenerationRowsWithUsers(client, rows),
+    total: count ?? rows.length,
+    limit,
+    offset,
+  };
 }
 
 /**
