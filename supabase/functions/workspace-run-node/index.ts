@@ -106,6 +106,7 @@ function isProviderBillingLike(status: number, text: string): boolean {
   // 429 is provider pressure/rate limiting, so it must stay retryable in the
   // durable workspace queue unless the provider explicitly says quota/billing
   // is exhausted and does not include a retry hint.
+  if (/exceeded your current quota|check your plan and billing details|quota exceeded|insufficient_quota/i.test(text)) return true;
   if (isNonRetryableQuotaError(text)) return true;
   if (status === 429) return false;
   if (status === 402) return true;
