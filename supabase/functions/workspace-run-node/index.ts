@@ -197,6 +197,18 @@ function shouldFallbackVeoQuota(errMsg: string): boolean {
   );
 }
 
+function summarizeProviderErrorText(raw: string, maxLength = 500): string {
+  const title = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1];
+  const source = title ?? raw;
+  return source
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
 async function fetchWithAttemptTimeout(
   input: string | URL | Request,
   init: RequestInit,
@@ -2346,20 +2358,42 @@ const GEMINI_IMAGE_MODELS: Record<string, { gemini_model: string }> = {
   "nano-banana-2":   { gemini_model: "gemini-3.1-flash-image-preview" },
 };
 
+type GeminiImageApiKeyAlias = "primary" | "gemini2";
+
+function loadGeminiImageApiKey(alias: GeminiImageApiKeyAlias = "primary"): string {
+  const key =
+    alias === "gemini2"
+      ? Deno.env.get("GEMINI2_API_KEY")
+      : Deno.env.get("GOOGLE_AI_STUDIO_KEY") ?? Deno.env.get("GEMINI_API_KEY");
+  if (!key) {
+    throw new Error(
+      alias === "gemini2"
+        ? "Gemini image: GEMINI2_API_KEY is not configured in Supabase project secrets."
+        : "Gemini image: GOOGLE_AI_STUDIO_KEY (or GEMINI_API_KEY) is not configured in Supabase project secrets.",
+    );
+  }
+  return key;
+}
+
+function canUseGemini2Image(): boolean {
+  return Boolean(Deno.env.get("GEMINI2_API_KEY"));
+}
+
+function shouldFallbackGeminiImageKey(status: number, errMsg: string): boolean {
+  return (
+    status === 429 ||
+    isNonRetryableQuotaError(errMsg) ||
+    /RESOURCE_EXHAUSTED|exceeded your current quota|rate-limits|ai\.dev\/rate-limit/i.test(errMsg)
+  );
+}
+
 async function executeBanana(
   params: Record<string, unknown>,
   supabase: ReturnType<typeof createClient>,
 ): Promise<ProviderResult> {
-  // Workspace dev names this secret `GEMINI_API_KEY`; live editor uses
-  // `GOOGLE_AI_STUDIO_KEY`. Accept either so the same code base runs in
-  // both environments without a migration.
-  const GOOGLE_AI_STUDIO_KEY =
-    Deno.env.get("GOOGLE_AI_STUDIO_KEY") ?? Deno.env.get("GEMINI_API_KEY");
-  if (!GOOGLE_AI_STUDIO_KEY) {
-    throw new Error(
-      "Neither GOOGLE_AI_STUDIO_KEY nor GEMINI_API_KEY is configured",
-    );
-  }
+  // Validate the primary key early. Quota/rate-limit fallback below swaps
+  // API keys only; it never changes the requested Banana model.
+  loadGeminiImageApiKey("primary");
 
   const rawModel = String(params.model_name ?? params.model ?? "nano-banana-pro");
   const modelId = BANANA_MODEL_MAP[rawModel] ?? rawModel;
@@ -2484,9 +2518,6 @@ async function executeBanana(
   }
   const geminiRequestBody = JSON.stringify(requestPayload);
 
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelConfig.gemini_model}:generateContent?key=${GOOGLE_AI_STUDIO_KEY}`;
-  console.log(`[banana-direct] Calling model: ${modelConfig.gemini_model}`);
-
   /* ── Hard client-side timeout ─────────────────────────────
    * Supabase edge functions die with WORKER_RESOURCE_LIMIT once
    * total CPU time crosses ~150s (default tier). Gemini Pro Image
@@ -2499,47 +2530,66 @@ async function executeBanana(
   // gateway ceiling. If Gemini is slow/queued, the durable workspace queue will
   // retry instead of letting the worker get killed and marked as dropped.
   const ABORT_MS = 118_000;
-  const aborter = new AbortController();
-  const abortTimer = setTimeout(() => aborter.abort(), ABORT_MS);
   const modelLabel = modelId === "nano-banana-pro" ? "Nano Banana Pro" : "Nano Banana 2";
 
-  let aiResponse: Response;
-  try {
-    aiResponse = await fetch(geminiUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        // Ask Gemini to return before our Edge attempt budget expires.
-        "X-Server-Timeout": "115",
-      },
-      body: geminiRequestBody,
-      signal: aborter.signal,
-    });
-  } catch (fetchErr) {
-    clearTimeout(abortTimer);
-    if ((fetchErr as { name?: string })?.name === "AbortError") {
-      console.error(`[banana-direct] Gemini fetch aborted after ${ABORT_MS}ms`);
-      const refSummary =
-        imageUrls.length > 0
-          ? `refs loaded ${resolvedReferenceCount}/${imageUrls.length}`
-          : "no refs";
-      throw new Error(
-        `${modelLabel} timed out after ${Math.round(ABORT_MS / 1000)}s on this attempt (${refSummary}). ` +
-          "This is provider latency/queue timeout, not a reference-image format error; the background worker will keep retrying until the 60 minute job deadline.",
-      );
+  async function callGeminiImage(apiKeyAlias: GeminiImageApiKeyAlias): Promise<Response> {
+    const apiKey = loadGeminiImageApiKey(apiKeyAlias);
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelConfig.gemini_model}:generateContent?key=${apiKey}`;
+    console.log(`[banana-direct] Calling model: ${modelConfig.gemini_model} key=${apiKeyAlias}`);
+    const aborter = new AbortController();
+    const abortTimer = setTimeout(() => aborter.abort(), ABORT_MS);
+    try {
+      return await fetch(geminiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          // Ask Gemini to return before our Edge attempt budget expires.
+          "X-Server-Timeout": "115",
+        },
+        body: geminiRequestBody,
+        signal: aborter.signal,
+      });
+    } catch (fetchErr) {
+      if ((fetchErr as { name?: string })?.name === "AbortError") {
+        console.error(`[banana-direct] Gemini fetch aborted after ${ABORT_MS}ms key=${apiKeyAlias}`);
+        const refSummary =
+          imageUrls.length > 0
+            ? `refs loaded ${resolvedReferenceCount}/${imageUrls.length}`
+            : "no refs";
+        throw new Error(
+          `${modelLabel} timed out after ${Math.round(ABORT_MS / 1000)}s on this attempt (${refSummary}). ` +
+            "This is provider latency/queue timeout, not a reference-image format error; the background worker will keep retrying until the 60 minute job deadline.",
+        );
+      }
+      throw fetchErr;
+    } finally {
+      clearTimeout(abortTimer);
     }
-    throw fetchErr;
   }
-  clearTimeout(abortTimer);
+
+  let apiKeyAlias: GeminiImageApiKeyAlias = "primary";
+  let aiResponse = await callGeminiImage(apiKeyAlias);
 
   if (!aiResponse.ok) {
-    const statusCode = aiResponse.status;
-    const errorText = await aiResponse.text();
-    console.error(`[banana-direct] Gemini API error: ${statusCode}`, errorText.substring(0, 500));
-    if (isProviderBillingLike(statusCode, errorText)) {
-      throw new Error("PROVIDER_BILLING_ERROR");
+    let statusCode = aiResponse.status;
+    let errorText = await aiResponse.text();
+    console.error(`[banana-direct] Gemini API error key=${apiKeyAlias}: ${statusCode}`, errorText.substring(0, 500));
+    if (shouldFallbackGeminiImageKey(statusCode, errorText) && canUseGemini2Image()) {
+      console.warn(`[banana-direct] primary key hit quota/rate limit; retrying ${modelConfig.gemini_model} with GEMINI2_API_KEY`);
+      apiKeyAlias = "gemini2";
+      aiResponse = await callGeminiImage(apiKeyAlias);
+      if (!aiResponse.ok) {
+        statusCode = aiResponse.status;
+        errorText = await aiResponse.text();
+        console.error(`[banana-direct] Gemini API error key=${apiKeyAlias}: ${statusCode}`, errorText.substring(0, 500));
+      }
     }
-    throw new Error(`${modelLabel} failed (HTTP ${statusCode}). Please try again.`);
+    if (!aiResponse.ok) {
+      if (isProviderBillingLike(statusCode, errorText)) {
+        throw new Error("PROVIDER_BILLING_ERROR");
+      }
+      throw new Error(`${modelLabel} failed (HTTP ${statusCode}). Please try again.`);
+    }
   }
 
   const aiResult = await aiResponse.json();
@@ -2617,6 +2667,7 @@ async function executeBanana(
     output_type: "image_url" as const,
     provider_meta: {
       model: modelId,
+      api_key_alias: apiKeyAlias,
       reference_image_count: resolvedReferenceCount,
       reference_image_requested_count: imageUrls.length,
       reference_image_failed_count: failedReferenceCount,
@@ -5830,6 +5881,8 @@ function appendMentionContext(
  *   - Surfaces OpenAI's verbatim error message — they're the most
  *     useful diagnostic for billing / safety / quota issues.
  */
+const OPENAI_IMAGE_2_ATTEMPT_TIMEOUT_MS = 118_000;
+
 async function executeOpenAIImage2(
   params: Record<string, unknown>,
   supabase: ReturnType<typeof createClient>,
@@ -5914,7 +5967,7 @@ async function executeOpenAIImage2(
         headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
         body: form,
       },
-      105_000,
+      OPENAI_IMAGE_2_ATTEMPT_TIMEOUT_MS,
       "OpenAI Image 2 edit",
     );
   } else {
@@ -5940,7 +5993,7 @@ async function executeOpenAIImage2(
           moderation,
         }),
       },
-      105_000,
+      OPENAI_IMAGE_2_ATTEMPT_TIMEOUT_MS,
       "OpenAI Image 2 generation",
     );
   }
@@ -5948,11 +6001,11 @@ async function executeOpenAIImage2(
   if (!response.ok) {
     const status = response.status;
     const errorText = await response.text();
-    let errorMsg = errorText.substring(0, 500);
+    let errorMsg = summarizeProviderErrorText(errorText) || errorText.substring(0, 500);
     try {
       const errJson = JSON.parse(errorText);
       errorMsg = (errJson as { error?: { message?: string } })?.error?.message ?? errorMsg;
-    } catch { /* keep raw text */ }
+    } catch { /* keep summarized text */ }
 
     console.error(`[openai-image-2] HTTP ${status}: ${errorMsg.substring(0, 200)}`);
 
@@ -5963,7 +6016,7 @@ async function executeOpenAIImage2(
       throw new Error(`OpenAI ${status}: ${errorMsg}`);
     }
     if (status >= 500) {
-      throw new Error(`OpenAI ${status}: temporary upstream error — ${errorMsg}`);
+      throw new Error(`OpenAI ${status}: temporary upstream error${errorMsg ? ` - ${errorMsg}` : ""}`);
     }
     throw new Error(`GPT Image 2 failed: ${errorMsg}`);
   }
