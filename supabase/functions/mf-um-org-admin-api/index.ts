@@ -1330,6 +1330,10 @@ Deno.serve(async (req) => {
 
         const credit_policy = String(body?.credit_policy ?? orgRow?.default_credit_policy ?? "manual");
         const credit_amount = Number(body?.credit_amount ?? orgRow?.default_credit_amount ?? 250);
+        const initialClassPool = Number(body?.initial_credit_pool ?? body?.credit_pool ?? body?.class_credit_pool ?? 0);
+        if (!Number.isInteger(initialClassPool) || initialClassPool < 0) {
+          return json({ error: "credit_pool_must_be_nonnegative_integer" }, 400);
+        }
 
         const primaryInstructorId = body?.primary_instructor_id ?? auth.userId;
 
@@ -1356,6 +1360,24 @@ Deno.serve(async (req) => {
           .single();
         if (error) return json({ error: error.message }, 400);
 
+        let createdClass = data;
+        if (initialClassPool > 0) {
+          const allocated = await a.rpc("admin_allocate_class_pool", {
+            p_class_id: data.id,
+            p_delta: initialClassPool,
+            p_actor_id: auth.userId,
+            p_description: "teacher_create_class_initial_pool",
+          });
+          if (allocated.error || allocated.data === -1 || allocated.data === -2) {
+            await a.from("classes").delete().eq("id", data.id);
+            if (allocated.error) return json({ error: allocated.error.message }, 500);
+            if (allocated.data === -1) return json({ error: "organization_pool_exhausted" }, 409);
+            return json({ error: "class_pool_remaining_too_low" }, 409);
+          }
+          const { data: refreshed } = await a.from("classes").select("*").eq("id", data.id).maybeSingle();
+          if (refreshed) createdClass = refreshed;
+        }
+
         // Mirror the primary instructor into class_teachers for consistency
         // with the M:N teacher list. Idempotent — UNIQUE(class_id,user_id).
         await a.from("class_members").upsert({
@@ -1367,7 +1389,7 @@ Deno.serve(async (req) => {
           joined_at: new Date().toISOString(),
         }, { onConflict: "class_id,user_id", ignoreDuplicates: true });
 
-        return json({ class: data }, 201);
+        return json({ class: createdClass }, 201);
       }
     }
 
@@ -1443,7 +1465,7 @@ Deno.serve(async (req) => {
     if (segments[0] === "classes" && segments[2] === "allocate" && segments.length === 3) {
       const classId = segments[1];
       if (method === "POST") {
-        const auth = await requireSuperAdmin(req);
+        const auth = await requireClassWriter(req, classId);
         if (auth instanceof Response) return auth;
         const delta = Number(body?.delta ?? 0);
         if (!Number.isInteger(delta) || delta === 0) {
@@ -1458,7 +1480,19 @@ Deno.serve(async (req) => {
         if (error) return json({ error: error.message }, 500);
         if (data === -1) return json({ error: "organization_pool_exhausted" }, 409);
         if (data === -2) return json({ error: "class_pool_remaining_too_low" }, 409);
-        return json({ class_credit_pool: data, delta });
+        const { data: classAfter } = await admin()
+          .from("classes")
+          .select("credit_pool, credit_pool_consumed")
+          .eq("id", classId)
+          .maybeSingle();
+        const classPool = Number(data ?? classAfter?.credit_pool ?? 0);
+        const consumed = Number(classAfter?.credit_pool_consumed ?? 0);
+        return json({
+          class_pool: classPool,
+          class_credit_pool: classPool,
+          class_pool_remaining: Math.max(0, classPool - consumed),
+          delta,
+        });
       }
     }
 
