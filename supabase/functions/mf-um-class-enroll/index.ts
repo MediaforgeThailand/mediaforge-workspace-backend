@@ -6,7 +6,7 @@
 // ------------------
 // Endpoint students hit after scanning a teacher's QR code.
 //
-//   POST { code: "DM-2026-X8K9", student_code: "6612345" }
+//   POST { code: "DM-2026-X8K9", student_code?: "6612345" }
 //
 // Returns:
 //   { ok: true, class_id, class_name, starting_balance, ... }
@@ -15,6 +15,8 @@
 // Auth: requires a Supabase session. Resolves user_id from JWT and passes
 // it to redeem_enrollment_code() which handles all DB writes atomically
 // (upsert membership, log enrolment, grant initial credits per class policy).
+// student_code is optional so QR enrollment can bind to the signed-in
+// account first; the student can add or correct their ID from profile later.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -61,9 +63,6 @@ Deno.serve(async (req) => {
   const studentCode = typeof body.student_code === "string"
     ? body.student_code.trim()
     : null;
-  if (!studentCode) {
-    return json({ ok: false, error: "student_code_required" }, 400);
-  }
 
   const admin = createClient(SUPABASE_URL, SERVICE_KEY);
   const { data, error } = await admin.rpc("redeem_enrollment_code", {

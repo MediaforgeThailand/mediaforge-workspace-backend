@@ -735,26 +735,30 @@ Deno.serve(async (req) => {
             .eq("user_id", auth.userId);
         }
 
-        const classId = String(body?.class_id ?? "");
+        const classId = String(body?.class_id ?? "").trim();
+        const studentCodeProvided = Object.prototype.hasOwnProperty.call(body ?? {}, "student_code");
         const studentCode = String(body?.student_code ?? "").trim();
-        if (classId && studentCode) {
-          const { data: member } = await a.from("class_members")
-            .select("id, role, status")
-            .eq("class_id", classId)
-            .eq("user_id", auth.userId)
-            .maybeSingle();
-          if (!member) return json({ error: "class_membership_not_found" }, 404);
-          await a.from("class_members")
-            .update({ student_code: studentCode, updated_at: new Date().toISOString() })
-            .eq("class_id", classId)
-            .eq("user_id", auth.userId);
+        let studentProfile: any = null;
+        if (classId && studentCodeProvided) {
+          if (!studentCode) return json({ error: "student_code_required" }, 400);
+          const { data: savedCode, error: savedCodeError } = await a.rpc("set_education_student_code", {
+            p_class_id: classId,
+            p_user_id: auth.userId,
+            p_student_code: studentCode,
+            p_actor_id: auth.userId,
+          });
+          if (savedCodeError) return json({ error: savedCodeError.message }, 500);
+          studentProfile = savedCode;
+          if (studentProfile && studentProfile.ok === false) {
+            return json({ error: studentProfile.error ?? "student_code_update_failed" }, 400);
+          }
         }
 
         const { data: profile } = await a.from("profiles")
           .select("user_id, display_name, avatar_url, organization_id, account_type")
           .eq("user_id", auth.userId)
           .maybeSingle();
-        return json({ profile });
+        return json({ profile, student_profile: studentProfile });
       }
     }
 
