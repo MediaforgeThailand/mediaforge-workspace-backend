@@ -112,6 +112,33 @@ function isProviderBillingLike(status: number, text: string): boolean {
   return /account balance not enough|insufficient balance|insufficient_quota|billing|payment required|prepaid|top[ -]?up|quota exceeded/i.test(text);
 }
 
+function summarizeProviderErrorBody(text: string, limit = 700): string {
+  const raw = String(text ?? "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const error = parsed.error as Record<string, unknown> | undefined;
+    const message = typeof error?.message === "string" ? error.message : "";
+    const status = typeof error?.status === "string" ? error.status : "";
+    const code = typeof error?.code === "number" || typeof error?.code === "string"
+      ? String(error.code)
+      : "";
+    const detail = [code ? `code ${code}` : "", status, message]
+      .filter(Boolean)
+      .join(" ");
+    if (detail) return detail.slice(0, limit);
+  } catch {
+    // Fall through to plain-text/html cleanup.
+  }
+  return raw
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, limit);
+}
+
 const MAGNIFIC_BASE =
   Deno.env.get("FREEPIK_API_BASE")?.trim().replace(/\/+$/, "") ||
   Deno.env.get("MAGNIFIC_API_BASE")?.trim().replace(/\/+$/, "") ||
@@ -2663,16 +2690,20 @@ async function executeBanana(
   const imageUrls: string[] = mentionImageUrls ?? (imageUrl ? [imageUrl] : []);
   let resolvedReferenceCount = 0;
   let failedReferenceCount = 0;
+  let totalReferenceBytes = 0;
+  const referenceByteSummaries: string[] = [];
   const hasReferenceImages = imageUrls.length > 0;
   if (hasReferenceImages) {
     for (const url of imageUrls) {
       try {
         const bytes = await fetchImageBuffer(url);
+        totalReferenceBytes += bytes.byteLength;
         const base64 = bytesToBase64(bytes);
         // Detect mime from first bytes
         let mime = "image/png";
         if (bytes[0] === 0xFF && bytes[1] === 0xD8) mime = "image/jpeg";
         else if (bytes[0] === 0x52 && bytes[1] === 0x49) mime = "image/webp";
+        referenceByteSummaries.push(`${mime}:${Math.round(bytes.byteLength / 1024)}KB`);
         parts.push({ inlineData: { mimeType: mime, data: base64 } });
         resolvedReferenceCount += 1;
       } catch (imgErr) {
@@ -2682,6 +2713,7 @@ async function executeBanana(
     }
     console.log(
       `[banana-direct] Added ${resolvedReferenceCount}/${imageUrls.length} reference images` +
+        ` (${Math.round(totalReferenceBytes / 1024)}KB raw: ${referenceByteSummaries.join(", ")})` +
         (failedReferenceCount > 0 ? ` (${failedReferenceCount} failed to load)` : ""),
     );
     if (resolvedReferenceCount === 0) {
@@ -2833,7 +2865,12 @@ async function executeBanana(
       if (isProviderBillingLike(statusCode, errorText)) {
         throw new Error("PROVIDER_BILLING_ERROR");
       }
-      throw new Error(`${modelLabel} failed (HTTP ${statusCode}). Please try again.`);
+      const providerDetail = summarizeProviderErrorBody(errorText);
+      const keyDetail = usedGemini2Fallback ? "key=gemini2 after primary" : `key=${apiKeyAlias}`;
+      throw new Error(
+        `${modelLabel} failed (HTTP ${statusCode}, ${keyDetail}): ` +
+          (providerDetail || "Provider returned no error body."),
+      );
     }
   }
 
@@ -6765,6 +6802,11 @@ function workspaceJobBackoffSeconds(attempt: number): number {
   return Math.max(5, Math.ceil(ms / 1000));
 }
 
+function workspaceJobMaxAttemptsForRequest(provider: string, model: string): number {
+  if (provider === "banana" && /^nano-banana-/i.test(model)) return 60;
+  return TOTAL_MAX_RETRIES;
+}
+
 function workspaceJobPollDelaySeconds(result: Record<string, unknown>): number {
   const providerMeta =
     result.provider_meta && typeof result.provider_meta === "object"
@@ -8031,7 +8073,7 @@ serve(async (req) => {
           status: "queued",
           run_after: new Date().toISOString(),
           deadline_at: new Date(Date.now() + WORKSPACE_JOB_MAX_MS).toISOString(),
-          max_attempts: 18,
+          max_attempts: workspaceJobMaxAttemptsForRequest(provider, model),
           credits_charged: jobCharge?.amount ?? 0,
           credit_team_id: jobCharge?.teamId ?? null,
           credit_organization_id: jobCharge?.organizationId ?? null,
