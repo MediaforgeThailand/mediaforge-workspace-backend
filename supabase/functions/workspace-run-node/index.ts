@@ -1020,7 +1020,8 @@ async function executeKlingOmni(
 ): Promise<ProviderResult> {
   const ENDPOINT = "https://api.klingai.com/v1/videos/omni-video";
 
-  const duration = parseInt(String(params.duration ?? 5), 10) || 5;
+  const rawDuration = parseInt(String(params.duration ?? 5), 10) || 5;
+  const duration = Math.max(3, Math.min(15, rawDuration));
   const prompt = String(params.prompt ?? "").trim();
   const negativePrompt = String(params.negative_prompt ?? "").trim();
 
@@ -5324,9 +5325,17 @@ async function executeOpenAIImage2(
   if (!prompt) throw new Error("A prompt is required.");
 
   const model = String(params.model_name ?? params.model ?? "gpt-image-2");
-  const quality = String(params.quality ?? "medium");
+  const requestedQuality = String(params.quality ?? "medium").toLowerCase();
+  const quality =
+    requestedQuality === "low" || requestedQuality === "medium" || requestedQuality === "high"
+      ? requestedQuality
+      : "medium";
   const size = String(params.size ?? "1024x1024");
   const outputFormat = String(params.output_format ?? "png");
+  const rawOutputCompression = Number(params.output_compression ?? 100);
+  const outputCompression = Number.isFinite(rawOutputCompression)
+    ? Math.max(0, Math.min(100, Math.round(rawOutputCompression)))
+    : 100;
   // `background` accepts "auto" | "transparent" | "opaque". Transparent
   // requires the output format to be png or webp; OpenAI rejects it
   // with jpeg, so we silently force-fallback to "auto" in that case
@@ -5408,6 +5417,9 @@ async function executeOpenAIImage2(
           size,
           quality,
           output_format: outputFormat,
+          ...(outputFormat === "jpeg" || outputFormat === "webp"
+            ? { output_compression: outputCompression }
+            : {}),
           background,
           moderation,
         }),
