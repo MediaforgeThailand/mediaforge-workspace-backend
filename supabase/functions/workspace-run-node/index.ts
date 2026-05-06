@@ -6096,7 +6096,7 @@ async function executeOpenAIImage2(
     rawBackground === "transparent" && outputFormat === "jpeg"
       ? "auto"
       : rawBackground;
-  const moderation = String(params.moderation ?? "auto");
+  const moderation = String(params.moderation ?? "low");
 
   const refUrls: string[] =
     (params.mention_image_urls as string[] | undefined) ??
