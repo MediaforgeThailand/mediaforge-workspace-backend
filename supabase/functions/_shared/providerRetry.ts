@@ -50,6 +50,22 @@ export interface RetryOutcome<T> {
   classification: "success" | "permanent" | "high_demand" | "provider_down" | "exhausted";
 }
 
+/**
+ * Hard cap on consecutive Google `DEADLINE_EXCEEDED` (HTTP 504) errors
+ * before we short-circuit to permanent. Pro image / video models
+ * (Gemini Pro Image, Veo) sometimes hit Google-side render timeouts
+ * that can't recover within our 145s gateway budget no matter how
+ * many times we retry — capping keeps the user from waiting 18×5min
+ * for a refund. After this many consecutive 504s, the retry loop
+ * gives up and refunds with the friendly message the executor
+ * threw.
+ */
+export const DEADLINE_EXCEEDED_RETRY_CAP = 3;
+
+export function isDeadlineExceededError(errMsg: string): boolean {
+  return /DEADLINE_EXCEEDED|HTTP\s*504\b/i.test(errMsg);
+}
+
 export function isNonRetryableQuotaError(errMsg: string): boolean {
   const quotaExhausted =
     /RESOURCE_EXHAUSTED|exceeded your current quota|quota exceeded|check your plan and billing details/i.test(
@@ -125,6 +141,7 @@ export async function executeWithUnifiedRetry<T>(
   let attempts = 0;
   let enteredExtendedPhase = false;
   let healthProbe: HealthProbe | undefined;
+  let deadlineExceededHits = 0;
 
   // ─── Phase 1: PRIMARY_RETRIES (12) ────────────────────────────────
   for (let attempt = 0; attempt < PRIMARY_RETRIES; attempt++) {
@@ -148,6 +165,26 @@ export async function executeWithUnifiedRetry<T>(
           enteredExtendedPhase: false,
           classification: "permanent",
         };
+      }
+
+      // Streak-based short-circuit: Google DEADLINE_EXCEEDED on Pro
+      // image / video models almost always comes in long streaks; one
+      // success out of 18 attempts is rare enough that waiting it out
+      // costs the user more than refunding promptly.
+      if (isDeadlineExceededError(errMsg)) {
+        deadlineExceededHits++;
+        if (deadlineExceededHits >= DEADLINE_EXCEEDED_RETRY_CAP) {
+          console.error(
+            `${logTag} ${deadlineExceededHits} consecutive DEADLINE_EXCEEDED — short-circuit to permanent: ${errMsg}`,
+          );
+          return {
+            result: null, error: lastError, attempts,
+            enteredExtendedPhase: false,
+            classification: "permanent",
+          };
+        }
+      } else {
+        deadlineExceededHits = 0;
       }
 
       if (attempt === PRIMARY_RETRIES - 1) {
@@ -205,6 +242,26 @@ export async function executeWithUnifiedRetry<T>(
           health_probe: healthProbe,
           classification: "permanent",
         };
+      }
+
+      // Same streak short-circuit as phase 1 — counter persists across
+      // phases so a deadline-exceeded streak that starts in phase 1 and
+      // continues in phase 2 still trips the cap.
+      if (isDeadlineExceededError(errMsg)) {
+        deadlineExceededHits++;
+        if (deadlineExceededHits >= DEADLINE_EXCEEDED_RETRY_CAP) {
+          console.error(
+            `${logTag} EXT ${deadlineExceededHits} consecutive DEADLINE_EXCEEDED — short-circuit to permanent: ${errMsg}`,
+          );
+          return {
+            result: null, error: lastError, attempts,
+            enteredExtendedPhase: true,
+            health_probe: healthProbe,
+            classification: "permanent",
+          };
+        }
+      } else {
+        deadlineExceededHits = 0;
       }
 
       if (i === EXTENDED_RETRIES - 1) {
@@ -311,6 +368,7 @@ export async function executeWithInlineBudget<T>(
 ): Promise<InlineBudgetOutcome<T>> {
   let lastError: Error | null = null;
   let attempts = 0;
+  let deadlineExceededHits = 0;
 
   for (let attempt = 0; attempt < INLINE_BUDGET_ATTEMPTS; attempt++) {
     attempts++;
@@ -324,6 +382,22 @@ export async function executeWithInlineBudget<T>(
       if (kind === "permanent") {
         console.error(`${logTag} attempt ${attempts} PERMANENT: ${lastError.message}`);
         return { result: null, error: lastError, attempts, classification: "permanent" };
+      }
+
+      // Streak short-circuit on Google DEADLINE_EXCEEDED — same logic
+      // as the durable retry loop. Inline budget is shorter (4 attempts)
+      // so the cap rarely triggers here, but it still saves the user a
+      // pointless final retry.
+      if (isDeadlineExceededError(lastError.message)) {
+        deadlineExceededHits++;
+        if (deadlineExceededHits >= DEADLINE_EXCEEDED_RETRY_CAP) {
+          console.error(
+            `${logTag} attempt ${attempts} ${deadlineExceededHits} consecutive DEADLINE_EXCEEDED — short-circuit: ${lastError.message}`,
+          );
+          return { result: null, error: lastError, attempts, classification: "permanent" };
+        }
+      } else {
+        deadlineExceededHits = 0;
       }
 
       if (attempt === INLINE_BUDGET_ATTEMPTS - 1) {

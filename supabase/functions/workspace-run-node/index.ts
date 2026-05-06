@@ -2747,6 +2747,24 @@ async function executeBanana(
       if (isProviderBillingLike(statusCode, errorText)) {
         throw new Error("PROVIDER_BILLING_ERROR");
       }
+      // Google's Pro image model occasionally returns 504
+      // DEADLINE_EXCEEDED when its render queue can't finish within
+      // the X-Server-Timeout we send (145s — just under the
+      // Supabase Edge gateway's idle limit). Both keys hit it when
+      // Google's backend itself is slow that minute. Surface a
+      // clearer message to the user so they understand the queue
+      // retries are bounded by Google's latency, not our code, and
+      // they can proactively switch to nano-banana-2 (Flash) for a
+      // faster result.
+      const isDeadlineExceeded =
+        statusCode === 504 || /DEADLINE_EXCEEDED/i.test(errorText);
+      if (isDeadlineExceeded) {
+        throw new Error(
+          `${modelLabel} timed out on Google's side (HTTP 504 DEADLINE_EXCEEDED, key=${apiKeyAlias}). ` +
+            "Pro image rendering is heavy; this usually clears within a few minutes when Google's queue catches up. " +
+            "If it keeps failing, try a shorter prompt, fewer reference images, or Nano Banana 2 (Flash) for a quicker render.",
+        );
+      }
       const providerDetail = summarizeProviderErrorBody(errorText);
       throw new Error(
         `${modelLabel} failed (HTTP ${statusCode}, key=${apiKeyAlias}): ` +
