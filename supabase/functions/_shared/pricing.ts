@@ -87,11 +87,11 @@ function normaliseResolutionTier(size: string): "1k" | "2k" | "4k" | "auto" {
 function openAiImagePriceKeys(params: Record<string, unknown>): string[] {
   const baseModel = String(params.model_name ?? params.model ?? "gpt-image-2").toLowerCase();
   const rawQuality = String(params.quality ?? "medium").toLowerCase();
-  const quality = ["low", "medium", "high"].includes(rawQuality) ? rawQuality : "medium";
+  const quality = ["low", "medium", "high", "auto"].includes(rawQuality) ? rawQuality : "medium";
   const rawSize = String(params.size ?? "1024x1024").toLowerCase();
   const size = rawSize === "auto" ? "1024x1024" : rawSize;
   const tier = normaliseResolutionTier(size);
-  const exactGptImage2Sku = baseModel.match(/^gpt-image-2:(1k|2k|4k):(low|medium|high)$/);
+  const exactGptImage2Sku = baseModel.match(/^gpt-image-2:(1k|2k|4k):(low|medium|high|auto)$/);
   if (exactGptImage2Sku) return [baseModel];
 
   if (baseModel === "gpt-image-2") {
@@ -331,15 +331,19 @@ export async function lookupBaseCost(
     params._has_ref_video === "true" ||
     (Array.isArray(params.reference_video_urls) && params.reference_video_urls.length > 0) ||
     Boolean(params.reference_video_url || params.video_url || params.ref_video);
-  const replicatePricingModel =
-    model === "replicate-seedance-2-0" && hasRefVideoInput
-      ? `${model}-video-ref`
+  const isSeedanceV2PricingModel =
+    model.startsWith("seedance-2-0") ||
+    model.startsWith("dreamina-seedance-2-0") ||
+    model.startsWith("replicate-seedance-2-0");
+  const seedanceV2VideoRefPricingModel =
+    isSeedanceV2PricingModel && hasRefVideoInput
+      ? "replicate-seedance-2-0-video-ref"
       : model;
   const modelAliases =
     model === "veo-3.1-generate-001" || model === "veo-3.1-generate-preview"
       ? Array.from(new Set([model, "veo-3.1-generate-preview", "veo-3.1-generate-001"]))
-      : replicatePricingModel !== model
-        ? [replicatePricingModel, model]
+      : seedanceV2VideoRefPricingModel !== model
+        ? [seedanceV2VideoRefPricingModel, model]
         : [model];
   const isMotion = model.includes("motion");
   const isOmni = model === "kling-v3-omni";

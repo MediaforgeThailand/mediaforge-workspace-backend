@@ -65,6 +65,7 @@ const USD_TO_THB = 35;
 const FLOW_CREDITS_PER_THB = 125;
 const WORKSPACE_CREDITS_PER_THB = 50;
 const FLOW_TO_WORKSPACE_RATIO = WORKSPACE_CREDITS_PER_THB / FLOW_CREDITS_PER_THB;
+const REPLICATE_PRICE_FACTOR = 0.9;
 type CreditCostWriteRow = {
   feature: string;
   model: string | null;
@@ -85,7 +86,11 @@ type CreditCostWriteRow = {
 };
 
 function creditsFromUsd(usd: number): number {
-  return Math.max(1, Math.ceil(usd * USD_TO_THB * WORKSPACE_CREDITS_PER_THB));
+  return Math.max(1, Math.ceil((usd * USD_TO_THB * WORKSPACE_CREDITS_PER_THB) - 1e-9));
+}
+
+function creditsFromReplicateUsd(usd: number): number {
+  return creditsFromUsd(usd * REPLICATE_PRICE_FACTOR);
 }
 
 function creditsFromThb(thb: number): number {
@@ -106,10 +111,20 @@ function gptImage2Credits(width: number, height: number, quality: "low" | "mediu
   return creditsFromUsd((gptImage2OutputTokens(width, height, quality) * 30) / 1_000_000);
 }
 
-const QUALITY_LABEL: Record<"low" | "medium" | "high", string> = {
+type GptImage2Quality = "low" | "medium" | "high" | "auto";
+
+const QUALITY_LABEL: Record<GptImage2Quality, string> = {
   low: "Low",
   medium: "Medium",
   high: "High",
+  auto: "Auto",
+};
+
+const GPT_IMAGE_2_REPLICATE_USD: Record<GptImage2Quality, number> = {
+  low: 0.012,
+  medium: 0.047,
+  high: 0.128,
+  auto: 0.128,
 };
 
 const GPT_IMAGE_2_ROWS: CreditCostWriteRow[] = ([
@@ -117,21 +132,21 @@ const GPT_IMAGE_2_ROWS: CreditCostWriteRow[] = ([
   ["2k", 2048, 2048],
   ["4k", 3840, 2160],
 ] as const).flatMap(([tier, width, height]) =>
-  (["low", "medium", "high"] as const).map((quality) => ({
+  (["low", "medium", "high", "auto"] as const).map((quality) => ({
     feature: "generate_openai_image",
     model: `gpt-image-2:${tier}:${quality}`,
     label: `GPT Image 2 ${tier.toUpperCase()} ${QUALITY_LABEL[quality]}`,
-    cost: gptImage2Credits(width, height, quality),
+    cost: creditsFromReplicateUsd(GPT_IMAGE_2_REPLICATE_USD[quality]),
     pricing_type: "per_operation",
     provider: "openai",
     price_key: `gpt-image-2:${tier}:${quality}`,
     resolution: tier.toUpperCase(),
     quality,
-    source: "official_docs",
-    source_url: "https://developers.openai.com/api/docs/guides/image-generation#calculating-costs",
-    source_ratio: null,
+    source: "replicate_docs_minus_10_percent",
+    source_url: "https://replicate.com/openai/gpt-image-2",
+    source_ratio: REPLICATE_PRICE_FACTOR,
     provider_unit: "per image",
-    notes: `Calculated from official gpt-image-2 output-token calculator at ${width}x${height}, then USD -> THB ${USD_TO_THB} and Workspace ${WORKSPACE_CREDITS_PER_THB} credits/THB.`,
+    notes: `Replicate openai/gpt-image-2 ${quality} is $${GPT_IMAGE_2_REPLICATE_USD[quality]}/image. Workspace charges 90% of that Replicate price, converted at ${USD_TO_THB} THB/USD and ${WORKSPACE_CREDITS_PER_THB} credits/THB. Resolution tier ${width}x${height} is retained for runtime matching; Replicate bills this model by quality, not resolution.`,
   }))
 );
 
@@ -214,13 +229,15 @@ const SEEDANCE_ROWS: CreditCostWriteRow[] = [
   { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro 1080p + audio", cost: 200, resolution: "1080p", audio: true, notes: "Master Pricing Sheet: 1080p with audio approx 200 credits/sec." },
   { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro fallback", cost: 100, resolution: null, audio: false, notes: "Fallback when runtime receives no resolution; uses no-audio base rate." },
   { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro + audio fallback", cost: 200, resolution: null, audio: true, notes: "Fallback when runtime receives audio without a resolution split." },
-  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast 720p", cost: 200, resolution: "720p", audio: false, notes: "Master Pricing Sheet: 720p text/image-to-video without video input approx 200 credits/sec." },
-  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast fallback", cost: 200, resolution: null, audio: false, notes: "Fallback for Seedance 2.0 Fast when runtime receives no resolution." },
-  { model: "dreamina-seedance-2-0-fast-260128", label: "Seedance 2.0 Fast direct-id fallback", cost: 200, resolution: null, audio: false, notes: "Direct BytePlus model id alias for Seedance 2.0 Fast." },
-  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 720p", cost: 250, resolution: "720p", audio: false, notes: "Master Pricing Sheet: 720p text/image-to-video without video input approx 250 credits/sec." },
-  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 1080p", cost: 615, resolution: "1080p", audio: false, notes: "Master Pricing Sheet: 1080p no-video-input approx 615 credits/sec." },
-  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro fallback", cost: 250, resolution: null, audio: false, notes: "Fallback when runtime receives no resolution; uses 720p default rate." },
-  { model: "dreamina-seedance-2-0-260128", label: "Seedance 2.0 Pro direct-id fallback", cost: 250, resolution: null, audio: false, notes: "Direct BytePlus model id alias for Seedance 2.0 Pro." },
+  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast 480p", cost: creditsFromReplicateUsd(0.08), resolution: "480p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 480p costs $0.08/sec; Workspace charges 90% of the Replicate price." },
+  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast 720p", cost: creditsFromReplicateUsd(0.18), resolution: "720p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 720p costs $0.18/sec; Workspace charges 90% of the Replicate price." },
+  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast fallback", cost: creditsFromReplicateUsd(0.18), resolution: null, audio: false, replicate: true, notes: "Fallback when runtime receives no resolution; uses discounted Replicate 720p non-video-input rate." },
+  { model: "dreamina-seedance-2-0-fast-260128", label: "Seedance 2.0 Fast direct-id fallback", cost: creditsFromReplicateUsd(0.18), resolution: null, audio: false, replicate: true, notes: "Direct BytePlus model id alias for Seedance 2.0 Fast; uses discounted Replicate 720p non-video-input rate." },
+  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 480p", cost: creditsFromReplicateUsd(0.08), resolution: "480p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 480p costs $0.08/sec; Workspace charges 90% of the Replicate price." },
+  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 720p", cost: creditsFromReplicateUsd(0.18), resolution: "720p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 720p costs $0.18/sec; Workspace charges 90% of the Replicate price." },
+  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 1080p", cost: creditsFromReplicateUsd(0.45), resolution: "1080p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 1080p costs $0.45/sec; Workspace charges 90% of the Replicate price." },
+  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro fallback", cost: creditsFromReplicateUsd(0.18), resolution: null, audio: false, replicate: true, notes: "Fallback when runtime receives no resolution; uses discounted Replicate 720p non-video-input rate." },
+  { model: "dreamina-seedance-2-0-260128", label: "Seedance 2.0 Pro direct-id fallback", cost: creditsFromReplicateUsd(0.18), resolution: null, audio: false, replicate: true, notes: "Direct BytePlus model id alias for Seedance 2.0 Pro; uses discounted Replicate 720p non-video-input rate." },
 ].map((row) => ({
   feature: "generate_freepik_video",
   model: row.resolution ? `${row.model}:${row.resolution}` : row.model,
@@ -231,7 +248,9 @@ const SEEDANCE_ROWS: CreditCostWriteRow[] = [
   provider: "seedance",
   price_key: `${row.model}:${row.resolution ?? "default"}:${row.audio ? "audio" : "video"}`,
   resolution: row.resolution,
-  source: "master_pricing_sheet",
+  source: row.replicate ? "replicate_docs_minus_10_percent" : "master_pricing_sheet",
+  source_url: row.replicate ? "https://replicate.com/bytedance/seedance-2.0" : null,
+  source_ratio: row.replicate ? REPLICATE_PRICE_FACTOR : null,
   provider_unit: "per second",
   notes: row.notes,
 }));
@@ -250,16 +269,17 @@ const REPLICATE_SEEDANCE_2_ROWS: CreditCostWriteRow[] = ([
     feature: "generate_freepik_video",
     model: row.resolution ? `${row.model}:${row.resolution}` : row.model,
     label: `${row.label}${audio ? " + audio" : ""}`,
-    cost: creditsFromUsd(row.usdPerSecond),
+    cost: creditsFromReplicateUsd(row.usdPerSecond),
     pricing_type: "per_second",
     has_audio: audio,
     provider: "replicate",
     price_key: `${row.model}:${row.resolution ?? "default"}:${row.videoInput ? "video_in" : "non_video_in"}:${audio ? "audio" : "silent"}`,
     resolution: row.resolution,
-    source: "replicate_docs",
+    source: "replicate_docs_minus_10_percent",
     source_url: "https://replicate.com/bytedance/seedance-2.0",
+    source_ratio: REPLICATE_PRICE_FACTOR,
     provider_unit: "per second",
-    notes: `Replicate bytedance/seedance-2.0 ${row.videoInput ? "video input" : "non-video input"} ${row.resolution ?? "default 720p"} costs $${row.usdPerSecond}/sec. Audio toggle does not change Replicate pricing; duplicate audio rows keep runtime cost lookup strict.`,
+    notes: `Replicate bytedance/seedance-2.0 ${row.videoInput ? "video input" : "non-video input"} ${row.resolution ?? "default 720p"} costs $${row.usdPerSecond}/sec. Workspace charges 90% of the Replicate price; audio toggle does not change Replicate pricing, duplicate audio rows keep runtime cost lookup strict.`,
   }))
 );
 
