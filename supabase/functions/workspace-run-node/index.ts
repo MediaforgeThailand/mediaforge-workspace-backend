@@ -141,12 +141,26 @@ function shouldPreferMagnificVeo(): boolean {
   return value === "freepik" || value === "magnific" || value === "freepik_veo";
 }
 
+function shouldPreferReplicateVeo(): boolean {
+  const value = String(
+    Deno.env.get("VEO_PROVIDER") ??
+      Deno.env.get("VEO_BACKEND") ??
+      Deno.env.get("VEO_FALLBACK_PROVIDER") ??
+      "",
+  ).trim().toLowerCase();
+  return value === "replicate" || value === "replicate_veo";
+}
+
 function canUseMagnificVeo(): boolean {
   return Boolean(
     Deno.env.get("MAGNIFIC_API_KEY") ??
       Deno.env.get("FREEPIK_API_KEY") ??
       Deno.env.get("MAGNIFIC_KEY"),
   );
+}
+
+function canUseReplicateVeo(): boolean {
+  return Boolean(Deno.env.get("REPLICATE_API_TOKEN"));
 }
 
 function canUseGemini2Veo(): boolean {
@@ -1824,6 +1838,21 @@ async function executeVeo(
     | string
     | undefined;
 
+  if (shouldPreferReplicateVeo()) {
+    return await submitReplicateVeoTask({
+      prompt,
+      negativePrompt: String(params.negative_prompt ?? "").trim(),
+      startFrameUrl,
+      endFrameUrl,
+      aspectRatio,
+      resolution,
+      durationSeconds,
+      modelSlug,
+      providerModelId: entry.model,
+      seed: params.seed,
+    });
+  }
+
   if (shouldPreferMagnificVeo()) {
     return await submitMagnificVeoTask({
       prompt,
@@ -1885,9 +1914,52 @@ async function executeVeo(
         operationName = await submitVeoTask(entry.model, body, loadVeoApiKey(veoApiKeyAlias));
       } catch (gemini2Err) {
         const gemini2Message = gemini2Err instanceof Error ? gemini2Err.message : String(gemini2Err);
-        if (shouldFallbackVeoQuota(gemini2Message) && canUseMagnificVeo()) {
-          console.warn("[veo] GEMINI2 quota exhausted; falling back to Freepik/Magnific Veo 3.1");
-          return await submitMagnificVeoTask({
+        if (shouldFallbackVeoQuota(gemini2Message)) {
+          if (canUseReplicateVeo()) {
+            console.warn("[veo] GEMINI2 quota exhausted; falling back to Replicate Veo 3.1");
+            try {
+              return await submitReplicateVeoTask({
+                prompt,
+                negativePrompt: String(params.negative_prompt ?? "").trim(),
+                startFrameUrl,
+                endFrameUrl,
+                aspectRatio,
+                resolution,
+                durationSeconds,
+                modelSlug,
+                providerModelId: entry.model,
+                seed: params.seed,
+              });
+            } catch (replicateErr) {
+              const replicateMessage = replicateErr instanceof Error ? replicateErr.message : String(replicateErr);
+              if (!replicateMessage.startsWith("REPLICATE_CAPACITY_ERROR") || !canUseMagnificVeo()) {
+                throw replicateErr;
+              }
+              console.warn("[veo] Replicate capacity fallback failed; trying Freepik/Magnific Veo 3.1");
+            }
+          }
+          if (canUseMagnificVeo()) {
+            console.warn("[veo] GEMINI2 quota exhausted; falling back to Freepik/Magnific Veo 3.1");
+            return await submitMagnificVeoTask({
+              prompt,
+              negativePrompt: String(params.negative_prompt ?? "").trim(),
+              startFrameUrl,
+              endFrameUrl,
+              aspectRatio,
+              resolution,
+              durationSeconds,
+              modelSlug,
+              providerModelId: entry.model,
+            });
+          }
+        }
+        throw gemini2Err;
+      }
+    } else if (shouldFallbackVeoQuota(firstMessage)) {
+      if (canUseReplicateVeo()) {
+        console.warn("[veo] Google quota exhausted; falling back to Replicate Veo 3.1");
+        try {
+          return await submitReplicateVeoTask({
             prompt,
             negativePrompt: String(params.negative_prompt ?? "").trim(),
             startFrameUrl,
@@ -1897,23 +1969,30 @@ async function executeVeo(
             durationSeconds,
             modelSlug,
             providerModelId: entry.model,
+            seed: params.seed,
           });
+        } catch (replicateErr) {
+          const replicateMessage = replicateErr instanceof Error ? replicateErr.message : String(replicateErr);
+          if (!replicateMessage.startsWith("REPLICATE_CAPACITY_ERROR") || !canUseMagnificVeo()) {
+            throw replicateErr;
+          }
+          console.warn("[veo] Replicate capacity fallback failed; trying Freepik/Magnific Veo 3.1");
         }
-        throw gemini2Err;
       }
-    } else if (shouldFallbackVeoQuota(firstMessage) && canUseMagnificVeo()) {
-      console.warn("[veo] Google quota exhausted; falling back to Freepik/Magnific Veo 3.1");
-      return await submitMagnificVeoTask({
-        prompt,
-        negativePrompt: String(params.negative_prompt ?? "").trim(),
-        startFrameUrl,
-        endFrameUrl,
-        aspectRatio,
-        resolution,
-        durationSeconds,
-        modelSlug,
-        providerModelId: entry.model,
-      });
+      if (canUseMagnificVeo()) {
+        console.warn("[veo] Google quota exhausted; falling back to Freepik/Magnific Veo 3.1");
+        return await submitMagnificVeoTask({
+          prompt,
+          negativePrompt: String(params.negative_prompt ?? "").trim(),
+          startFrameUrl,
+          endFrameUrl,
+          aspectRatio,
+          resolution,
+          durationSeconds,
+          modelSlug,
+          providerModelId: entry.model,
+        });
+      }
     }
     if ((startFrame || endFrame) && firstMessage.includes("`bytesBase64Encoded` isn't supported")) {
       console.warn("[veo] bytesBase64Encoded rejected; retrying inlineData payload");
@@ -3639,6 +3718,131 @@ async function executeGeminiTts(
       style_prompt: stylePrompt || null,
     },
   };
+}
+
+async function submitReplicateVeoTask(args: {
+  prompt: string;
+  negativePrompt?: string;
+  startFrameUrl?: string;
+  endFrameUrl?: string;
+  aspectRatio: VeoAspectRatio;
+  resolution: VeoResolution;
+  durationSeconds: VeoDuration;
+  modelSlug: string;
+  providerModelId: string;
+  seed?: unknown;
+}): Promise<ProviderResult> {
+  const apiToken = Deno.env.get("REPLICATE_API_TOKEN")?.trim();
+  if (!apiToken) {
+    throw new Error("Replicate Veo fallback is not configured. Set REPLICATE_API_TOKEN.");
+  }
+
+  const input: Record<string, unknown> = {
+    prompt: args.prompt,
+    aspect_ratio: args.aspectRatio,
+    duration: args.durationSeconds,
+    resolution: args.resolution,
+    generate_audio: true,
+  };
+  if (args.negativePrompt) input.negative_prompt = args.negativePrompt;
+  if (args.startFrameUrl) input.image = args.startFrameUrl;
+  if (args.endFrameUrl) input.last_frame = args.endFrameUrl;
+  if (typeof args.seed === "number" && Number.isFinite(args.seed)) input.seed = args.seed;
+
+  const endpoint = "https://api.replicate.com/v1/models/google/veo-3.1/predictions";
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      "Content-Type": "application/json",
+      "Cancel-After": "1h",
+    },
+    body: JSON.stringify({ input }),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    const providerPressure =
+      res.status === 402 ||
+      res.status === 429 ||
+      res.status >= 500 ||
+      /billing|payment|required|quota|rate limit|temporarily|overloaded|capacity/i.test(text);
+    if (providerPressure) {
+      throw new Error(`REPLICATE_CAPACITY_ERROR: Replicate Veo submit failed (HTTP ${res.status}): ${text.slice(0, 500)}`);
+    }
+    throw new Error(`Replicate Veo submit failed (HTTP ${res.status}): ${text.slice(0, 500)}`);
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  } catch {
+    throw new Error(`Replicate Veo submit returned non-JSON: ${text.slice(0, 200)}`);
+  }
+
+  const taskId = String(parsed.id ?? "").trim();
+  if (!taskId) {
+    throw new Error("Replicate Veo submit succeeded but no prediction id returned");
+  }
+
+  console.log(
+    `[veo-replicate] submit task=${taskId} duration=${args.durationSeconds}s ` +
+      `resolution=${args.resolution} aspect=${args.aspectRatio} i2v=${!!args.startFrameUrl}`,
+  );
+
+  return {
+    task_id: taskId,
+    outputs: {
+      output_video: "",
+      output_start_frame: args.startFrameUrl ?? "",
+      output_end_frame: "",
+    },
+    output_type: "video_url",
+    provider_meta: {
+      provider: "replicate_veo",
+      source_provider: "replicate",
+      fallback_for: "veo",
+      model: args.modelSlug,
+      provider_model_id: args.providerModelId,
+      replicate_model: "google/veo-3.1",
+      tier: "standard",
+      duration_seconds: args.durationSeconds,
+      resolution: args.resolution,
+      aspect_ratio: args.aspectRatio,
+      has_audio: true,
+      is_image2video: Boolean(args.startFrameUrl),
+      has_end_frame: Boolean(args.endFrameUrl),
+      poll_endpoint: "https://api.replicate.com/v1/predictions",
+      prediction_url:
+        parsed.urls && typeof parsed.urls === "object"
+          ? String((parsed.urls as Record<string, unknown>).web ?? "")
+          : "",
+    },
+  };
+}
+
+function extractReplicateOutputUrl(value: unknown): string {
+  if (typeof value === "string") {
+    return /^https:\/\//i.test(value) ? value : "";
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = extractReplicateOutputUrl(item);
+      if (found) return found;
+    }
+    return "";
+  }
+  if (value && typeof value === "object") {
+    const row = value as Record<string, unknown>;
+    for (const key of ["url", "video", "video_url", "output", "download_url"]) {
+      const found = extractReplicateOutputUrl(row[key]);
+      if (found) return found;
+    }
+    for (const nested of Object.values(row)) {
+      const found = extractReplicateOutputUrl(nested);
+      if (found) return found;
+    }
+  }
+  return "";
 }
 
 async function submitMagnificVeoTask(args: {
@@ -5773,6 +5977,7 @@ interface WorkspaceRunBody {
     | "poll_kling"
     | "poll_seedance"
     | "poll_veo"
+    | "poll_replicate_veo"
     | "poll_freepik_veo"
     | "poll_hyper3d"
     | "poll_tripo3d"
@@ -6028,6 +6233,8 @@ async function pollWorkspaceAsyncResult(args: {
         ? "poll_seedance"
       : provider === "veo"
         ? "poll_veo"
+      : provider === "replicate_veo"
+        ? "poll_replicate_veo"
       : provider === "freepik_veo"
         ? "poll_freepik_veo"
         : "poll_kling";
@@ -6127,6 +6334,8 @@ async function pollWorkspaceAsyncResultOnce(args: {
         ? "poll_seedance"
       : provider === "veo"
         ? "poll_veo"
+      : provider === "replicate_veo"
+        ? "poll_replicate_veo"
       : provider === "freepik_veo"
         ? "poll_freepik_veo"
         : "poll_kling";
@@ -6225,6 +6434,7 @@ function inferAsyncPollProvider(
   ) {
     return "freepik_veo";
   }
+  if (endpoint.includes("api.replicate.com")) return "replicate_veo";
   if (
     endpoint.includes("generativelanguage.googleapis.com") ||
     task.startsWith("operations/") ||
@@ -7928,6 +8138,126 @@ serve(async (req) => {
      * exhausted. Magnific returns { data: { status, generated[] } }; on
      * terminal success we mirror the provider URL into Supabase storage so
      * the browser sees the same signed-URL shape as direct Veo. */
+    if (body.action === "poll_replicate_veo") {
+      const taskId = String(body.task_id ?? "").trim();
+      const pollEndpoint = String(body.poll_endpoint ?? "").trim();
+      if (!taskId || !pollEndpoint) {
+        return new Response(
+          JSON.stringify({ error: "task_id and poll_endpoint required for poll_replicate_veo" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let pollUrlOk = false;
+      try {
+        const u = new URL(pollEndpoint);
+        pollUrlOk =
+          u.protocol === "https:" &&
+          u.hostname === "api.replicate.com" &&
+          /^\/v1\/predictions\/?$/.test(u.pathname);
+      } catch {
+        pollUrlOk = false;
+      }
+      if (!pollUrlOk) {
+        return new Response(
+          JSON.stringify({ error: "poll_endpoint must be a Replicate predictions endpoint" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const apiToken = Deno.env.get("REPLICATE_API_TOKEN")?.trim();
+      if (!apiToken) {
+        return new Response(
+          JSON.stringify({ error: "REPLICATE_API_TOKEN is not configured" }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let payload: Record<string, unknown>;
+      try {
+        const r = await fetch(`${pollEndpoint.replace(/\/+$/, "")}/${encodeURIComponent(taskId)}`, {
+          method: "GET",
+          headers: { Authorization: `Bearer ${apiToken}` },
+        });
+        const text = await r.text();
+        if (!r.ok) {
+          return new Response(
+            JSON.stringify({
+              status: "polling_error",
+              message: `Replicate Veo poll failed (HTTP ${r.status}): ${text.slice(0, 300)}`,
+            }),
+            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({
+            status: "polling_error",
+            message: msg.substring(0, 300),
+          }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const rawStatus = String(payload.status ?? "").toLowerCase();
+      const providerVideoUrl = extractReplicateOutputUrl(payload.output);
+      const normalised =
+        rawStatus === "succeeded" || providerVideoUrl
+          ? "succeed"
+          : rawStatus === "failed" || rawStatus === "canceled" || rawStatus === "cancelled"
+            ? "failed"
+            : "processing";
+      const errorMessage = String(payload.error ?? "");
+
+      let publicUrl = "";
+      if (normalised === "succeed" && providerVideoUrl) {
+        try {
+          const videoRes = await fetch(providerVideoUrl);
+          if (!videoRes.ok) {
+            throw new Error(`download HTTP ${videoRes.status}`);
+          }
+          const bytes = new Uint8Array(await videoRes.arrayBuffer());
+          const contentType = videoRes.headers.get("content-type")?.split(";")[0]?.trim() || "video/mp4";
+          const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
+          const path = `${user.id}/veo-renders/replicate_${safeTaskId}.mp4`;
+          const upload = await supabase.storage
+            .from("user_assets")
+            .upload(path, bytes, { contentType, upsert: true });
+          if (upload.error) throw upload.error;
+          const signed = await supabase.storage
+            .from("user_assets")
+            .createSignedUrl(path, 60 * 60 * 24 * 365);
+          if (signed.error || !signed.data?.signedUrl) {
+            throw signed.error ?? new Error("no signed URL");
+          }
+          publicUrl = signed.data.signedUrl;
+        } catch (err) {
+          console.error("[poll_replicate_veo] rehost failed:", err);
+          return new Response(
+            JSON.stringify({
+              status: "failed",
+              task_id: taskId,
+              url: "",
+              message: `Replicate Veo finished but the video couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
+            }),
+            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          status: normalised,
+          task_id: taskId,
+          url: publicUrl,
+          message: normalised === "failed" ? errorMessage || "Replicate Veo task failed" : rawStatus,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
     if (body.action === "poll_freepik_veo") {
       const taskId = String(body.task_id ?? "").trim();
       const pollEndpoint = String(body.poll_endpoint ?? "").trim();
