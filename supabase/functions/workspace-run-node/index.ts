@@ -163,6 +163,17 @@ function canUseReplicateVeo(): boolean {
   return Boolean(Deno.env.get("REPLICATE_API_TOKEN"));
 }
 
+function shouldGenerateReplicateVeoAudio(params: Record<string, unknown>): boolean {
+  const envValue = String(Deno.env.get("REPLICATE_VEO_GENERATE_AUDIO") ?? "").trim().toLowerCase();
+  if (envValue === "1" || envValue === "true" || envValue === "yes" || envValue === "on") {
+    return true;
+  }
+  if (envValue === "0" || envValue === "false" || envValue === "no" || envValue === "off") {
+    return false;
+  }
+  return String(params.replicate_generate_audio ?? "").trim().toLowerCase() === "true";
+}
+
 function canUseGemini2Veo(): boolean {
   return Boolean(Deno.env.get("GEMINI2_API_KEY"));
 }
@@ -1837,6 +1848,7 @@ async function executeVeo(
   const endFrameUrl = (params.end_frame ?? params.image_tail_url) as
     | string
     | undefined;
+  const replicateGenerateAudio = shouldGenerateReplicateVeoAudio(params);
 
   if (shouldPreferReplicateVeo()) {
     return await submitReplicateVeoTask({
@@ -1850,6 +1862,7 @@ async function executeVeo(
       modelSlug,
       providerModelId: entry.model,
       seed: params.seed,
+      generateAudio: replicateGenerateAudio,
     });
   }
 
@@ -1929,6 +1942,7 @@ async function executeVeo(
                 modelSlug,
                 providerModelId: entry.model,
                 seed: params.seed,
+                generateAudio: replicateGenerateAudio,
               });
             } catch (replicateErr) {
               const replicateMessage = replicateErr instanceof Error ? replicateErr.message : String(replicateErr);
@@ -1970,6 +1984,7 @@ async function executeVeo(
             modelSlug,
             providerModelId: entry.model,
             seed: params.seed,
+            generateAudio: replicateGenerateAudio,
           });
         } catch (replicateErr) {
           const replicateMessage = replicateErr instanceof Error ? replicateErr.message : String(replicateErr);
@@ -3731,6 +3746,7 @@ async function submitReplicateVeoTask(args: {
   modelSlug: string;
   providerModelId: string;
   seed?: unknown;
+  generateAudio: boolean;
 }): Promise<ProviderResult> {
   const apiToken = Deno.env.get("REPLICATE_API_TOKEN")?.trim();
   if (!apiToken) {
@@ -3742,7 +3758,7 @@ async function submitReplicateVeoTask(args: {
     aspect_ratio: args.aspectRatio,
     duration: args.durationSeconds,
     resolution: args.resolution,
-    generate_audio: true,
+    generate_audio: args.generateAudio,
   };
   if (args.negativePrompt) input.negative_prompt = args.negativePrompt;
   if (args.startFrameUrl) input.image = args.startFrameUrl;
@@ -3786,7 +3802,7 @@ async function submitReplicateVeoTask(args: {
 
   console.log(
     `[veo-replicate] submit task=${taskId} duration=${args.durationSeconds}s ` +
-      `resolution=${args.resolution} aspect=${args.aspectRatio} i2v=${!!args.startFrameUrl}`,
+      `resolution=${args.resolution} aspect=${args.aspectRatio} audio=${args.generateAudio} i2v=${!!args.startFrameUrl}`,
   );
 
   return {
@@ -3808,7 +3824,7 @@ async function submitReplicateVeoTask(args: {
       duration_seconds: args.durationSeconds,
       resolution: args.resolution,
       aspect_ratio: args.aspectRatio,
-      has_audio: true,
+      has_audio: args.generateAudio,
       is_image2video: Boolean(args.startFrameUrl),
       has_end_frame: Boolean(args.endFrameUrl),
       poll_endpoint: "https://api.replicate.com/v1/predictions",
