@@ -7031,6 +7031,22 @@ async function processWorkspaceGenerationJobTick(args: {
     job.result && typeof job.result === "object"
       ? (job.result as Record<string, unknown>)
       : null;
+  const currentAttempts = Math.max(0, Number(job.attempts ?? 0) || 0);
+  const maxAttempts = Math.max(1, Number(job.max_attempts ?? TOTAL_MAX_RETRIES) || TOTAL_MAX_RETRIES);
+
+  if (!currentResult?.task_id && currentAttempts >= maxAttempts) {
+    const msg =
+      `${workspaceJobProviderLabel(job)} could not finish after ${maxAttempts} attempts. ` +
+      `${job.last_error ? `Last provider error: ${job.last_error}` : "Credits were refunded."}`;
+    await failWorkspaceJob({
+      supabase: args.supabase,
+      job,
+      status: "failed",
+      error: msg,
+      refundReason: `workspace job exhausted attempts: ${String(job.last_error ?? "").substring(0, 160)}`,
+    });
+    return { job_id: job.id, status: "failed", detail: "max_attempts_exhausted" };
+  }
 
   if (currentResult?.task_id && !currentResult.url) {
     try {
@@ -7092,7 +7108,7 @@ async function processWorkspaceGenerationJobTick(args: {
     }
   }
 
-  const attempt = Number(job.attempts ?? 0) + 1;
+  const attempt = currentAttempts + 1;
   await args.supabase
     .from("workspace_generation_jobs")
     .update({
@@ -7158,6 +7174,19 @@ async function processWorkspaceGenerationJobTick(args: {
         refundReason: `workspace job failed: ${msg.substring(0, 160)}`,
       });
       return { job_id: job.id, status: "permanent_failed", detail: msg.substring(0, 120) };
+    }
+    if (attempt >= maxAttempts) {
+      const finalMsg =
+        `${workspaceJobProviderLabel(job)} could not finish after ${maxAttempts} attempts. ` +
+        `Last provider error: ${msg}`;
+      await failWorkspaceJob({
+        supabase: args.supabase,
+        job: { ...job, attempts: attempt, last_error: msg },
+        status: "failed",
+        error: finalMsg,
+        refundReason: `workspace job exhausted attempts: ${msg.substring(0, 160)}`,
+      });
+      return { job_id: job.id, status: "failed", detail: "max_attempts_exhausted" };
     }
 
     const delaySeconds = workspaceJobBackoffSeconds(attempt);
