@@ -2397,8 +2397,10 @@ function canUseGemini2Image(): boolean {
 function shouldFallbackGeminiImageKey(status: number, errMsg: string): boolean {
   return (
     status === 429 ||
+    status === 503 ||
+    status === 504 ||
     isNonRetryableQuotaError(errMsg) ||
-    /RESOURCE_EXHAUSTED|exceeded your current quota|rate-limits|ai\.dev\/rate-limit/i.test(errMsg)
+    /RESOURCE_EXHAUSTED|exceeded your current quota|rate-limits|ai\.dev\/rate-limit|UNAVAILABLE|DEADLINE_EXCEEDED|gateway timeout/i.test(errMsg)
   );
 }
 
@@ -2688,7 +2690,7 @@ async function executeBanana(
   // Keep this lower than WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS and the Edge runtime
   // gateway ceiling. If Gemini is slow/queued, the durable workspace queue will
   // retry instead of letting the worker get killed and marked as dropped.
-  const ABORT_MS = 118_000;
+  const ABORT_MS = canUseMagnificImage() ? 45_000 : 118_000;
   const modelLabel = modelId === "nano-banana-pro" ? "Nano Banana Pro" : "Nano Banana 2";
 
   async function callGeminiImage(apiKeyAlias: GeminiImageApiKeyAlias): Promise<Response> {
@@ -2715,9 +2717,10 @@ async function executeBanana(
           imageUrls.length > 0
             ? `refs loaded ${resolvedReferenceCount}/${imageUrls.length}`
             : "no refs";
-        throw new Error(
+        return new Response(
           `${modelLabel} timed out after ${Math.round(ABORT_MS / 1000)}s on this attempt (${refSummary}). ` +
             "This is provider latency/queue timeout, not a reference-image format error; the background worker will keep retrying until the 60 minute job deadline.",
+          { status: 504 },
         );
       }
       throw fetchErr;
