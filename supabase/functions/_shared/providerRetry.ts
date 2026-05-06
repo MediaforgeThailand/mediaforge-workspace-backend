@@ -68,6 +68,14 @@ export function isNonRetryableQuotaError(errMsg: string): boolean {
  */
 export function classifyError(errMsg: string): "permanent" | "transient" | "unknown" {
   if (errMsg === "PROVIDER_BILLING_ERROR") return "permanent";
+  // HTTP 429 / 5xx wins before the quota-text classifier. Google's
+  // "ghost 429" responses on Tier-1 paid keys include
+  // "exceeded your current quota" / "check your plan and billing details"
+  // in the body even though the failure is server-side and recovers on
+  // retry — `isNonRetryableQuotaError` would otherwise refund those
+  // permanently. Throwers that include `(HTTP 429)` / `(HTTP 503)` etc.
+  // in the message land in the transient lane instead.
+  if (/HTTP\s*(?:429|500|502|503|504)\b/i.test(errMsg)) return "transient";
   if (isNonRetryableQuotaError(errMsg)) return "permanent";
   if (/safety|invalid input|invalid_argument|prompt blocked/i.test(errMsg)) {
     return "permanent";

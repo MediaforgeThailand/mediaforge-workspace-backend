@@ -103,14 +103,23 @@ async function imageUrlToBase64(url: string): Promise<string> {
 }
 
 function isProviderBillingLike(status: number, text: string): boolean {
-  // 429 is provider pressure/rate limiting, so it must stay retryable in the
-  // durable workspace queue unless the provider explicitly says quota/billing
-  // is exhausted and does not include a retry hint.
-  if (/exceeded your current quota|check your plan and billing details|quota exceeded|insufficient_quota/i.test(text)) return true;
-  if (isNonRetryableQuotaError(text)) return true;
+  // 429 ALWAYS stays transient — even when the body claims "exceeded your
+  // current quota" or "check your plan and billing details". Google's
+  // well-documented "ghost 429" / "free_tier_requests Limit 0" bugs return
+  // billing-flavoured bodies on Tier-1 paid keys (esp. for the Pro image
+  // models like gemini-3-pro-image-preview), and refunding the user
+  // permanently for a Google-side glitch is wrong. The durable queue will
+  // retry on its normal backoff; if it really IS exhausted the queue's
+  // dead-letter budget will eventually catch it.
   if (status === 429) return false;
+  // 402 Payment Required is the only HTTP code Google + most providers use
+  // for genuine billing exhaustion.
   if (status === 402) return true;
-  return /account balance not enough|insufficient balance|insufficient_quota|billing|payment required|prepaid|top[ -]?up|quota exceeded/i.test(text);
+  // Body-keyword fallback for providers that don't use 402 (Kling, Replicate,
+  // Shotstack, etc.). Keep this list TIGHT — generic words like "billing" or
+  // "quota exceeded" can appear in transient errors too. Only match phrases
+  // that unambiguously mean "the account ran out of credit".
+  return /account balance not enough|insufficient balance|payment required|prepaid|top[ -]?up/i.test(text);
 }
 
 function summarizeProviderErrorBody(text: string, limit = 700): string {
@@ -2459,14 +2468,28 @@ const GEMINI_IMAGE_MODELS: Record<string, { gemini_model: string }> = {
   "nano-banana-2":   { gemini_model: "gemini-3.1-flash-image-preview" },
 };
 
-type GeminiImageApiKeyAlias = "primary";
+type GeminiImageApiKeyAlias = "primary" | "gemini2";
 
 function loadGeminiImageApiKey(alias: GeminiImageApiKeyAlias = "primary"): string {
+  if (alias === "gemini2") {
+    const key = Deno.env.get("GEMINI2_API_KEY");
+    if (!key) {
+      throw new Error("Gemini image: GEMINI2_API_KEY is not configured in Supabase project secrets.");
+    }
+    return key;
+  }
   const key = Deno.env.get("GOOGLE_AI_STUDIO_KEY") ?? Deno.env.get("GEMINI_API_KEY");
   if (!key) {
     throw new Error("Gemini image: GOOGLE_AI_STUDIO_KEY (or GEMINI_API_KEY) is not configured in Supabase project secrets.");
   }
   return key;
+}
+
+/** Whether a secondary Gemini API key is configured. Used by executors
+ *  to decide whether to attempt a fallback retry after the primary
+ *  key fails — same pattern as the Veo executor. */
+function hasGeminiImageFallbackKey(): boolean {
+  return Boolean(Deno.env.get("GEMINI2_API_KEY"));
 }
 
 function extractProviderMediaUrl(value: unknown): string {
@@ -2689,6 +2712,35 @@ async function executeBanana(
     let statusCode = aiResponse.status;
     let errorText = await aiResponse.text();
     console.error(`[banana-direct] Gemini API error key=${apiKeyAlias}: ${statusCode}`, errorText.substring(0, 500));
+
+    // Fallback to GEMINI2_API_KEY once when the primary key fails AND a
+    // secondary key is configured. Mirrors the Veo executor pattern. The
+    // common case we're solving is Google's "ghost 429" / Tier-1 lockout
+    // bug where one paid project's key is throttled while another paid
+    // project's key still has headroom. We retry on:
+    //   - any 5xx (provider hiccup)
+    //   - 429 (rate limit / ghost-429)
+    //   - 401/403 (key-side auth issue, separate project might work)
+    // We DO NOT retry on 4xx/safety errors that look prompt-related —
+    // those would just fail again on the second key.
+    const shouldFallback =
+      hasGeminiImageFallbackKey() &&
+      (statusCode === 429 ||
+        statusCode === 401 ||
+        statusCode === 403 ||
+        statusCode >= 500);
+
+    if (shouldFallback) {
+      console.warn(`[banana-direct] retrying with gemini2 key after HTTP ${statusCode}`);
+      apiKeyAlias = "gemini2";
+      aiResponse = await callGeminiImage(apiKeyAlias);
+      if (!aiResponse.ok) {
+        statusCode = aiResponse.status;
+        errorText = await aiResponse.text();
+        console.error(`[banana-direct] Gemini API error key=${apiKeyAlias}: ${statusCode}`, errorText.substring(0, 500));
+      }
+    }
+
     if (!aiResponse.ok) {
       if (isProviderBillingLike(statusCode, errorText)) {
         throw new Error("PROVIDER_BILLING_ERROR");
