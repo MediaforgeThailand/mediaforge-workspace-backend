@@ -180,6 +180,20 @@ async function synthesiseGemini(
   return pcmToWav(pcm, 24000, 1, 16);
 }
 
+/** Chunked base64 encoder — `btoa(String.fromCharCode(...bytes))`
+ *  fails with "Maximum call stack size exceeded" once the byte array
+ *  pushes past ~125k entries (V8 / Deno spread limit). 32KB chunks
+ *  keep each `String.fromCharCode` call well below the threshold,
+ *  and `btoa` itself handles arbitrary-length strings fine. */
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
 function pcmToWav(
   pcm: Uint8Array,
   sampleRate: number,
@@ -405,7 +419,13 @@ serve(async (req) => {
       // from the bytes we already have. Log it so admins can see if
       // bucket policy drift starts breaking the cache path.
       console.error(`[voice-preview] cache upload failed: ${upErr.message}`);
-      const b64 = btoa(String.fromCharCode(...bytes));
+      // CHUNKED base64 encode — `String.fromCharCode(...bytes)` blows
+      // the V8 stack at ~125k args (a 4-second 24kHz s16 PCM clip is
+      // ~192KB → 192k args), so the previous one-liner crashed the
+      // function with "Maximum call stack size exceeded" any time the
+      // upload fallback fired. Iterating in 32KB chunks keeps each
+      // spread under the engine limit.
+      const b64 = bytesToBase64(bytes);
       return new Response(
         JSON.stringify({
           url: `data:${contentType};base64,${b64}`,
