@@ -5644,6 +5644,7 @@ function isPermanentWorkspaceJobError(err: unknown): boolean {
     /is not defined|is not a function|cannot read prop(?:erty|erties) of (?:undefined|null)/i.test(msg) ||
     /ReferenceError|TypeError|SyntaxError/i.test(msg) ||
     /HTTP (?:400|401|403|404|422)\b/i.test(msg) ||
+    /Veo: failed to fetch start\/end frame \((?:400|401|403|404|410)\)/i.test(msg) ||
     /(prompt|input|argument).*required|Validation/i.test(msg) ||
     /Seedance reference video is invalid|reference videos?.*(?:must|duration|invalid)|video duration.*(?:must|invalid|exceed)|total reference video duration|total duration of all videos/i.test(msg)
   );

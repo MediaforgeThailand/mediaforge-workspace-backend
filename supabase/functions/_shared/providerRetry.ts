@@ -66,6 +66,10 @@ export function classifyError(errMsg: string): "permanent" | "transient" | "unkn
   if (/reference videos?.*(?:must|duration|invalid)|video duration.*(?:must|invalid|exceed)|total reference video duration|total duration of all videos/i.test(errMsg)) {
     return "permanent";
   }
+  // Referenced Veo frame URLs that return 4xx are missing/expired or not readable.
+  if (/Veo: failed to fetch start\/end frame \((?:400|401|403|404|410)\)/i.test(errMsg)) {
+    return "permanent";
+  }
   // Programming errors — retrying never helps. Refund immediately.
   if (/is not defined|is not a function|cannot read prop(?:erty|erties) of (?:undefined|null)|ReferenceError|TypeError|SyntaxError/i.test(errMsg)) {
     return "permanent";
