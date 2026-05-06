@@ -2639,10 +2639,11 @@ async function executeBanana(
    * upload + JSON-parse work below to finish before the platform
    * pulls the plug. The caller gets a friendly error instead of a
    * generic platform 500. */
-  // Keep this lower than WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS and the Edge runtime
-  // gateway ceiling. If Gemini is slow/queued, the durable workspace queue will
-  // retry instead of letting the worker get killed and marked as dropped.
-  const ABORT_MS = 118_000;
+  // Keep this just under Supabase Edge's ~150s request idle timeout. Google
+  // image models can spend more than two minutes in prefill; the previous 115s
+  // server hint caused Gemini to return DEADLINE_EXCEEDED before it had a fair
+  // chance to finish.
+  const ABORT_MS = 148_000;
   const modelLabel = modelId === "nano-banana-pro" ? "Nano Banana Pro" : "Nano Banana 2";
 
   async function callGeminiImage(apiKeyAlias: GeminiImageApiKeyAlias): Promise<Response> {
@@ -2656,8 +2657,8 @@ async function executeBanana(
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          // Ask Gemini to return before our Edge attempt budget expires.
-          "X-Server-Timeout": "115",
+          // Ask Gemini to return before the Edge gateway idle timeout.
+          "X-Server-Timeout": "145",
         },
         body: geminiRequestBody,
         signal: aborter.signal,
@@ -6151,7 +6152,7 @@ const WORKSPACE_JOB_MAX_MS = 60 * 60_000;
 // Supabase Edge requests can be terminated by the platform well before
 // long image providers return. Keep each synchronous provider attempt under
 // that ceiling, then let the durable queue retry until the 60 minute deadline.
-const WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS = 125_000;
+const WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS = 150_000;
 const WORKSPACE_JOB_BACKOFF_MS = [3_000, 5_000, 10_000, 15_000, 30_000, 60_000];
 const WORKSPACE_JOB_WORKER_BATCH_SIZE = 8;
 const WORKSPACE_JOB_LOCK_SEC = 360;
