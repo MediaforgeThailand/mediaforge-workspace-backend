@@ -2171,16 +2171,18 @@ async function executeVeo(
     operationName = await submitVeoTask(entry.model, body, apiKey);
   } catch (err) {
     const firstMessage = err instanceof Error ? err.message : String(err);
+    let recoveredFromSubmitError = false;
     if (veoApiKeyAlias !== "gemini2" && shouldFallbackVeoQuota(firstMessage) && canUseGemini2Veo()) {
       console.warn("[veo] primary Google quota exhausted; retrying with GEMINI2_API_KEY");
       try {
         veoApiKeyAlias = "gemini2";
         operationName = await submitVeoTask(entry.model, body, loadVeoApiKey(veoApiKeyAlias));
+        recoveredFromSubmitError = true;
       } catch (gemini2Err) {
         throw gemini2Err;
       }
     }
-    if ((startFrame || endFrame) && firstMessage.includes("`bytesBase64Encoded` isn't supported")) {
+    if (!recoveredFromSubmitError && (startFrame || endFrame) && firstMessage.includes("`bytesBase64Encoded` isn't supported")) {
       console.warn("[veo] bytesBase64Encoded rejected; retrying inlineData payload");
       try {
         const apiKey = loadVeoApiKey(veoApiKeyAlias);
@@ -2197,7 +2199,7 @@ async function executeVeo(
             retryMessage,
         );
       }
-    } else {
+    } else if (!recoveredFromSubmitError) {
       throw err;
     }
   }
