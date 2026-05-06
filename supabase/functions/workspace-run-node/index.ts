@@ -55,6 +55,7 @@ import {
   normalizeVeoOperationName,
   pollVeoOnce,
   submitVeoTask,
+  type VeoApiKeyAlias,
   type VeoAspectRatio,
   type VeoDuration,
   type VeoImage,
@@ -144,6 +145,17 @@ function canUseMagnificVeo(): boolean {
     Deno.env.get("MAGNIFIC_API_KEY") ??
       Deno.env.get("FREEPIK_API_KEY") ??
       Deno.env.get("MAGNIFIC_KEY"),
+  );
+}
+
+function canUseGemini2Veo(): boolean {
+  return Boolean(Deno.env.get("GEMINI2_API_KEY"));
+}
+
+function shouldFallbackVeoQuota(errMsg: string): boolean {
+  return (
+    isNonRetryableQuotaError(errMsg) ||
+    /HTTP 429|RESOURCE_EXHAUSTED|exceeded your current quota|rate-limits|ai\.dev\/rate-limit/i.test(errMsg)
   );
 }
 
@@ -1856,12 +1868,39 @@ async function executeVeo(
   );
 
   let operationName: string;
+  let veoApiKeyAlias: VeoApiKeyAlias =
+    String(params.veo_api_key_alias ?? params.api_key_alias ?? "") === "gemini2"
+      ? "gemini2"
+      : "primary";
   try {
-    const apiKey = loadVeoApiKey();
+    const apiKey = loadVeoApiKey(veoApiKeyAlias);
     operationName = await submitVeoTask(entry.model, body, apiKey);
   } catch (err) {
     const firstMessage = err instanceof Error ? err.message : String(err);
-    if (isNonRetryableQuotaError(firstMessage) && canUseMagnificVeo()) {
+    if (veoApiKeyAlias !== "gemini2" && shouldFallbackVeoQuota(firstMessage) && canUseGemini2Veo()) {
+      console.warn("[veo] primary Google quota exhausted; retrying with GEMINI2_API_KEY");
+      try {
+        veoApiKeyAlias = "gemini2";
+        operationName = await submitVeoTask(entry.model, body, loadVeoApiKey(veoApiKeyAlias));
+      } catch (gemini2Err) {
+        const gemini2Message = gemini2Err instanceof Error ? gemini2Err.message : String(gemini2Err);
+        if (shouldFallbackVeoQuota(gemini2Message) && canUseMagnificVeo()) {
+          console.warn("[veo] GEMINI2 quota exhausted; falling back to Freepik/Magnific Veo 3.1");
+          return await submitMagnificVeoTask({
+            prompt,
+            negativePrompt: String(params.negative_prompt ?? "").trim(),
+            startFrameUrl,
+            endFrameUrl,
+            aspectRatio,
+            resolution,
+            durationSeconds,
+            modelSlug,
+            providerModelId: entry.model,
+          });
+        }
+        throw gemini2Err;
+      }
+    } else if (shouldFallbackVeoQuota(firstMessage) && canUseMagnificVeo()) {
       console.warn("[veo] Google quota exhausted; falling back to Freepik/Magnific Veo 3.1");
       return await submitMagnificVeoTask({
         prompt,
@@ -1878,7 +1917,7 @@ async function executeVeo(
     if ((startFrame || endFrame) && firstMessage.includes("`bytesBase64Encoded` isn't supported")) {
       console.warn("[veo] bytesBase64Encoded rejected; retrying inlineData payload");
       try {
-        const apiKey = loadVeoApiKey();
+        const apiKey = loadVeoApiKey(veoApiKeyAlias);
         operationName = await submitVeoTask(
           entry.model,
           buildVeoRequest(requestParams, "inlineData"),
@@ -1909,6 +1948,7 @@ async function executeVeo(
       provider: "veo",
       model: modelSlug,
       provider_model_id: entry.model,
+      api_key_alias: veoApiKeyAlias,
       tier: entry.tier,
       duration_seconds: durationSeconds,
       resolution,
@@ -5747,6 +5787,7 @@ interface WorkspaceRunBody {
   poll_endpoint?: string;
   model?: string;
   provider_model_id?: string;
+  api_key_alias?: string;
   /** For action="mirror_tripo_url": the Tripo3D CDN URL to mirror
    *  into Supabase storage so model-viewer can fetch it across
    *  CORS. Used to migrate generations that were created before
@@ -6021,6 +6062,7 @@ async function pollWorkspaceAsyncResult(args: {
         poll_endpoint: pollEndpoint,
         model: String(providerMeta.model ?? providerMeta.provider_model_id ?? ""),
         provider_model_id: String(providerMeta.provider_model_id ?? ""),
+        api_key_alias: String(providerMeta.api_key_alias ?? ""),
       } as WorkspaceRunBody,
     });
     lastStatus = String(pollResp.status ?? "").toLowerCase();
@@ -6098,6 +6140,7 @@ async function pollWorkspaceAsyncResultOnce(args: {
       poll_endpoint: pollEndpoint,
       model: String(providerMeta.model ?? providerMeta.provider_model_id ?? ""),
       provider_model_id: String(providerMeta.provider_model_id ?? ""),
+      api_key_alias: String(providerMeta.api_key_alias ?? ""),
     } as WorkspaceRunBody,
   });
 
@@ -8059,7 +8102,8 @@ serve(async (req) => {
       }
       let apiKey: string;
       try {
-        apiKey = loadVeoApiKey();
+        const apiKeyAlias = String(body.api_key_alias ?? "") === "gemini2" ? "gemini2" : "primary";
+        apiKey = loadVeoApiKey(apiKeyAlias);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         return new Response(

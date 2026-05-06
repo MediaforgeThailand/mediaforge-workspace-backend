@@ -94,11 +94,18 @@ export interface VeoOperationStatus {
   };
 }
 
-export function loadVeoApiKey(): string {
-  const key = Deno.env.get("GOOGLE_AI_STUDIO_KEY") ?? Deno.env.get("GEMINI_API_KEY");
+export type VeoApiKeyAlias = "primary" | "gemini2";
+
+export function loadVeoApiKey(alias: VeoApiKeyAlias = "primary"): string {
+  const key =
+    alias === "gemini2"
+      ? Deno.env.get("GEMINI2_API_KEY")
+      : Deno.env.get("GOOGLE_AI_STUDIO_KEY") ?? Deno.env.get("GEMINI_API_KEY");
   if (!key) {
     throw new Error(
-      "Veo: GOOGLE_AI_STUDIO_KEY (or GEMINI_API_KEY) is not configured in Supabase project secrets.",
+      alias === "gemini2"
+        ? "Veo: GEMINI2_API_KEY is not configured in Supabase project secrets."
+        : "Veo: GOOGLE_AI_STUDIO_KEY (or GEMINI_API_KEY) is not configured in Supabase project secrets.",
     );
   }
   return key;
