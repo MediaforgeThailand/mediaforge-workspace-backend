@@ -118,10 +118,11 @@ const MAGNIFIC_BASE =
   "https://api.freepik.com/v1";
 
 function loadMagnificApiKey(): string {
-  const key =
+  const rawKey =
     Deno.env.get("MAGNIFIC_API_KEY") ??
     Deno.env.get("FREEPIK_API_KEY") ??
     Deno.env.get("MAGNIFIC_KEY");
+  const key = rawKey?.trim().replace(/[\u0000-\u001F\u007F-\uFFFF]/g, "");
   if (!key) {
     throw new Error(
       "Freepik/Magnific Veo fallback is not configured. Set MAGNIFIC_API_KEY or FREEPIK_API_KEY.",
