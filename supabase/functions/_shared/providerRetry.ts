@@ -75,6 +75,80 @@ export function isNonRetryableQuotaError(errMsg: string): boolean {
   return !/please retry in\b|retryDelay|RetryInfo/i.test(errMsg);
 }
 
+export type ProviderErrorClass =
+  | "quota"
+  | "billing"
+  | "rate_limit"
+  | "busy"
+  | "timeout"
+  | "safety"
+  | "validation"
+  | "auth"
+  | "programming"
+  | "transient"
+  | "unknown";
+
+export interface ProviderErrorClassification {
+  kind: ProviderErrorClass;
+  retryable: boolean;
+  fast_fallback: boolean;
+  permanent: boolean;
+}
+
+export function classifyProviderError(errMsg: string): ProviderErrorClassification {
+  const msg = String(errMsg ?? "");
+  if (msg === "PROVIDER_BILLING_ERROR") {
+    return { kind: "billing", retryable: false, fast_fallback: true, permanent: false };
+  }
+  if (/is not defined|is not a function|cannot read prop(?:erty|erties) of (?:undefined|null)|ReferenceError|TypeError|SyntaxError/i.test(msg)) {
+    return { kind: "programming", retryable: false, fast_fallback: false, permanent: true };
+  }
+  if (/safety|prompt blocked|blocked this prompt|content policy|prohibited|recitation|SPII/i.test(msg)) {
+    return { kind: "safety", retryable: false, fast_fallback: false, permanent: true };
+  }
+  if (/invalid input|invalid_argument|validation|requires (?:a |an )?[\w ]+ input|missing required|no .* (?:provided|specified|supplied)|input .* is required|cannot be empty/i.test(msg)) {
+    return { kind: "validation", retryable: false, fast_fallback: false, permanent: true };
+  }
+  if (/image recognition failed|image meets the requirements|no complete (?:upper )?body detected|ensure .* clearly visible/i.test(msg)) {
+    return { kind: "validation", retryable: false, fast_fallback: false, permanent: true };
+  }
+  if (/reference videos?.*(?:must|duration|invalid)|video duration.*(?:must|invalid|exceed)|total reference video duration|total duration of all videos/i.test(msg)) {
+    return { kind: "validation", retryable: false, fast_fallback: false, permanent: true };
+  }
+  if (/Veo: failed to fetch start\/end frame \((?:400|401|403|404|410)\)/i.test(msg)) {
+    return { kind: "validation", retryable: false, fast_fallback: false, permanent: true };
+  }
+  if (/HTTP\s*(?:401|403)\b|unauthorized|forbidden|invalid api key|api key.*(?:invalid|not configured|missing)|credentials missing/i.test(msg)) {
+    return { kind: "auth", retryable: false, fast_fallback: false, permanent: true };
+  }
+  if (/HTTP\s*402\b|payment required|insufficient balance|account balance not enough|prepaid|top[ -]?up/i.test(msg)) {
+    return { kind: "billing", retryable: false, fast_fallback: true, permanent: false };
+  }
+  if (isNonRetryableQuotaError(msg)) {
+    return { kind: "quota", retryable: false, fast_fallback: true, permanent: false };
+  }
+  if (/HTTP\s*429\b|rate[ -]?limit|too many requests|rate-limits|ai\.dev\/rate-limit/i.test(msg)) {
+    return { kind: "rate_limit", retryable: true, fast_fallback: true, permanent: false };
+  }
+  if (/OpenAI Image 2 (?:edit|generation) timed out after \d+s/i.test(msg)) {
+    return { kind: "timeout", retryable: true, fast_fallback: true, permanent: false };
+  }
+  if (/DEADLINE_EXCEEDED|HTTP\s*504\b|timeout|timed out|aborted|ETIMEDOUT/i.test(msg)) {
+    return { kind: "timeout", retryable: true, fast_fallback: false, permanent: false };
+  }
+  if (/HTTP\s*503\b|UNAVAILABLE|high demand|overload|busy|queue|capacity|currently experiencing/i.test(msg)) {
+    return { kind: "busy", retryable: true, fast_fallback: false, permanent: false };
+  }
+  if (/HTTP\s*(?:500|502)\b|ECONNRESET|fetch failed|ENOTFOUND|socket hang up/i.test(msg)) {
+    return { kind: "transient", retryable: true, fast_fallback: false, permanent: false };
+  }
+  return { kind: "unknown", retryable: true, fast_fallback: false, permanent: false };
+}
+
+export function shouldFastFallbackProviderError(errMsg: string): boolean {
+  return classifyProviderError(errMsg).fast_fallback;
+}
+
 /**
  * Classify an error message to decide whether retrying makes sense.
  *
@@ -84,6 +158,16 @@ export function isNonRetryableQuotaError(errMsg: string): boolean {
  */
 export function classifyError(errMsg: string): "permanent" | "transient" | "unknown" {
   if (errMsg === "PROVIDER_BILLING_ERROR") return "permanent";
+  // Keep the legacy retry loop behavior: HTTP 429 / 5xx should retry first.
+  // Workspace durable jobs use shouldFastFallbackProviderError() directly when
+  // they need to skip straight to the next provider on quota/rate-limit errors.
+  if (/HTTP\s*(?:429|500|502|503|504)\b/i.test(errMsg)) return "transient";
+  const rich = classifyProviderError(errMsg);
+  if (rich.permanent) return "permanent";
+  if (rich.kind === "billing" || rich.kind === "quota") return "permanent";
+  if (rich.kind === "rate_limit" || rich.kind === "busy" || rich.kind === "timeout" || rich.kind === "transient") {
+    return "transient";
+  }
   // HTTP 429 / 5xx wins before the quota-text classifier. Google's
   // "ghost 429" responses on Tier-1 paid keys include
   // "exceeded your current quota" / "check your plan and billing details"
@@ -91,7 +175,6 @@ export function classifyError(errMsg: string): "permanent" | "transient" | "unkn
   // retry — `isNonRetryableQuotaError` would otherwise refund those
   // permanently. Throwers that include `(HTTP 429)` / `(HTTP 503)` etc.
   // in the message land in the transient lane instead.
-  if (/HTTP\s*(?:429|500|502|503|504)\b/i.test(errMsg)) return "transient";
   if (isNonRetryableQuotaError(errMsg)) return "permanent";
   if (/safety|invalid input|invalid_argument|prompt blocked/i.test(errMsg)) {
     return "permanent";

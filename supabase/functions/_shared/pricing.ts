@@ -24,6 +24,8 @@ export type ProviderKey =
   | "seedance"
   | "veo"
   | "replicate_video"
+  | "replicate_veo"
+  | "replicate_image"
   | "banana"
   | "openai"
   | "seedream"
@@ -106,6 +108,50 @@ function openAiImagePriceKeys(params: Record<string, unknown>): string[] {
     `${baseModel}:${tier}:${quality}`,
     baseModel,
   ]));
+}
+
+function replicateImagePriceKeys(params: Record<string, unknown>): { feature: string; keys: string[] } {
+  const model = String(params.model_name ?? params.model ?? "").toLowerCase();
+  if (model.startsWith("replicate-gpt-image-2")) {
+    return {
+      feature: "generate_openai_image",
+      keys: openAiImagePriceKeys({ ...params, model_name: "gpt-image-2", model: "gpt-image-2" }),
+    };
+  }
+  const sourceModel = model.startsWith("replicate-nano-banana-2")
+    ? "nano-banana-2"
+    : "nano-banana-pro";
+  const aliasModel = model || (sourceModel === "nano-banana-2" ? "replicate-nano-banana-2" : "replicate-nano-banana-pro");
+  if (sourceModel === "nano-banana-2") {
+    return {
+      feature: "generate_freepik_image",
+      keys: Array.from(new Set([aliasModel, sourceModel])),
+    };
+  }
+  const imageSize = String(params.image_size ?? params.resolution ?? "").toLowerCase();
+  return {
+    feature: "generate_freepik_image",
+    keys: Array.from(new Set(
+      imageSize
+        ? [`${aliasModel}:${imageSize}`, `${sourceModel}:${imageSize}`, aliasModel, sourceModel]
+        : [aliasModel, sourceModel],
+    )),
+  };
+}
+
+function replicateVideoPricingVariant(model: string, params: Record<string, unknown>): string | null {
+  if (model === "replicate-veo-3-1") return null;
+  if (model === "replicate-kling-v3-motion-pro") {
+    const raw = String(params.mode ?? params.quality_mode ?? params.resolution ?? "pro").toLowerCase();
+    return raw === "std" || raw === "standard" || raw === "720p" ? "std" : "pro";
+  }
+  if (model.startsWith("replicate-kling-v3")) {
+    const raw = String(params.mode ?? params.quality_mode ?? params.resolution ?? "pro").toLowerCase();
+    if (raw === "4k" || raw === "2160p") return "4k";
+    if (raw === "standard" || raw === "std" || raw === "720p") return "standard";
+    return "pro";
+  }
+  return null;
 }
 
 function googleModelPriceKeys(rawModel: unknown): string[] {
@@ -313,6 +359,19 @@ export async function lookupBaseCost(
     return match.cost;
   }
 
+  /* ── Image (Replicate wrappers for GPT Image 2 / Nano Banana) ── */
+  if (providerDef.provider === "replicate_image") {
+    const { feature, keys } = replicateImagePriceKeys(params);
+    const match = await firstCostByModelKeys(supabase, feature, keys);
+
+    if (!match) {
+      throw new PricingConfigError(
+        `Pricing configuration missing for Replicate image model: ${keys[0]}`
+      );
+    }
+    return match.cost;
+  }
+
   /* ── Image (OpenAI gpt-image-2 / DALL-E) ── */
   if (providerDef.provider === "openai") {
     const keys = openAiImagePriceKeys(params);
@@ -471,9 +530,12 @@ export async function lookupBaseCost(
     isSeedanceV2PricingModel && hasRefVideoInput
       ? "replicate-seedance-2-0-video-ref"
       : model;
+  const replicateVariant = replicateVideoPricingVariant(model, params);
   const modelAliases =
     model === "veo-3.1-generate-001" || model === "veo-3.1-generate-preview"
       ? Array.from(new Set([model, "veo-3.1-generate-preview", "veo-3.1-generate-001"]))
+      : replicateVariant
+        ? [`${model}:${replicateVariant}`, model]
       : seedanceV2VideoRefPricingModel !== model
         ? [seedanceV2VideoRefPricingModel, model]
         : [model];
@@ -501,24 +563,28 @@ export async function lookupBaseCost(
   if (isOmni) {
     const hasRefVideo = params._has_ref_video === true || params._has_ref_video === "true";
     const pricingModel = hasRefVideo ? `${model}-video-ref` : model;
+    const pricingModels = resolution
+      ? [`${pricingModel}:${resolution}`, pricingModel]
+      : [pricingModel];
     const effectiveAudio = hasRefVideo ? false : hasAudio;
+    const findOmniRow = async (models: string[], audio: boolean) => {
+      for (const candidate of models) {
+        const { data } = await supabase
+          .from("credit_costs").select("cost, pricing_type")
+          .eq("feature", "generate_freepik_video")
+          .eq("model", candidate)
+          .eq("has_audio", audio)
+          .limit(1).maybeSingle();
+        if (data) return data;
+      }
+      return null;
+    };
 
     // Try the tier-specific model first
-    let { data: tierRow } = await supabase
-      .from("credit_costs").select("cost, pricing_type")
-      .eq("feature", "generate_freepik_video")
-      .eq("model", pricingModel)
-      .eq("has_audio", effectiveAudio)
-      .limit(1).maybeSingle();
+    let tierRow = await findOmniRow(pricingModels, effectiveAudio);
 
     if (!tierRow && effectiveAudio) {
-      const { data: noAudioTierRow } = await supabase
-        .from("credit_costs").select("cost, pricing_type")
-        .eq("feature", "generate_freepik_video")
-        .eq("model", pricingModel)
-        .eq("has_audio", false)
-        .limit(1).maybeSingle();
-      tierRow = noAudioTierRow;
+      tierRow = await findOmniRow(pricingModels, false);
     }
 
     if (tierRow) {
@@ -530,21 +596,11 @@ export async function lookupBaseCost(
 
     // Fallback to standard model if video-ref row doesn't exist
     if (hasRefVideo) {
-      let { data: stdRow } = await supabase
-        .from("credit_costs").select("cost, pricing_type")
-        .eq("feature", "generate_freepik_video")
-        .eq("model", model)
-        .eq("has_audio", effectiveAudio)
-        .limit(1).maybeSingle();
+      const standardModels = resolution ? [`${model}:${resolution}`, model] : [model];
+      let stdRow = await findOmniRow(standardModels, effectiveAudio);
 
       if (!stdRow && effectiveAudio) {
-        const { data: noAudioStdRow } = await supabase
-          .from("credit_costs").select("cost, pricing_type")
-          .eq("feature", "generate_freepik_video")
-          .eq("model", model)
-          .eq("has_audio", false)
-          .limit(1).maybeSingle();
-        stdRow = noAudioStdRow;
+        stdRow = await findOmniRow(standardModels, false);
       }
 
       if (stdRow) {

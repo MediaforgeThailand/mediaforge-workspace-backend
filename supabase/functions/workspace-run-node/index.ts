@@ -19,7 +19,9 @@ import {
   INLINE_BUDGET_ATTEMPTS,
   enqueueRetryJob,
   classifyError,
+  classifyProviderError,
   isNonRetryableQuotaError,
+  shouldFastFallbackProviderError,
   TOTAL_MAX_RETRIES,
 } from "../_shared/providerRetry.ts";
 import { recordGenerationEvent } from "../_shared/analytics.ts";
@@ -223,6 +225,10 @@ function canUseReplicateVeo(): boolean {
   return Boolean(Deno.env.get("REPLICATE_API_TOKEN"));
 }
 
+function canUseReplicate(): boolean {
+  return Boolean(Deno.env.get("REPLICATE_API_TOKEN")?.trim());
+}
+
 function truthyParam(value: unknown): boolean {
   if (value === true) return true;
   if (typeof value === "number") return value === 1;
@@ -234,10 +240,10 @@ function truthyParam(value: unknown): boolean {
 function enforcePrimaryProviderParams(provider: string, params?: Record<string, unknown>): void {
   if (!params) return;
   if (provider === "veo") {
-    // Google Veo 3.1 always returns audio. Do not reinterpret a no-audio
-    // request as permission to spend on wrapper providers.
-    params.generate_audio = "true";
-    params.has_audio = "true";
+    // Google Veo 3.1 direct always returns audio and has no no-audio
+    // request parameter. Preserve the user's explicit audio preference so
+    // capability/quota fallback providers that do support silent output can
+    // honor it instead of being forced into the expensive audio tier.
     delete params.replicate_generate_audio;
   }
 }
@@ -704,6 +710,17 @@ async function executeKling(
   return await executeKlingStandard(params, mapping, modelSlug, jwtToken, mentioned);
 }
 
+function normalizeDirectKlingMode(
+  params: Record<string, unknown>,
+  fallbackMode: string,
+): "std" | "pro" {
+  const raw = String(
+    params.mode ?? params.quality_mode ?? params.resolution ?? fallbackMode,
+  ).toLowerCase();
+  if (raw === "std" || raw === "standard" || raw === "720p") return "std";
+  return "pro";
+}
+
 /**
  * Poll a Kling task until it completes. Workspace V2 runs inline so the
  * caller is waiting on an open HTTP request — we burn wall-clock here
@@ -828,10 +845,11 @@ async function executeKlingMotionControl(
 
   const keepOriginalSound = String(params.keep_original_sound ?? "no");
   const characterOrientation = String(params.character_orientation ?? "video");
+  const mode = normalizeDirectKlingMode(params, mapping.mode);
 
   const body: Record<string, unknown> = {
     model_name: mapping.model,
-    mode: mapping.mode,
+    mode,
     image_url: imagePayload,
     video_url: rawVideoUrl,
     keep_original_sound: keepOriginalSound,
@@ -882,7 +900,7 @@ async function executeKlingMotionControl(
     if (elementList.length > 0) body.elements = elementList;
   }
 
-  console.log(`[kling-motion] POST ${ENDPOINT} model=${mapping.model} mode=${mapping.mode} orientation=${characterOrientation}`);
+  console.log(`[kling-motion] POST ${ENDPOINT} model=${mapping.model} mode=${mode} orientation=${characterOrientation}`);
 
   const res = await fetch(ENDPOINT, {
     method: "POST",
@@ -932,7 +950,7 @@ async function executeKlingMotionControl(
     output_type: "video_url",
     provider_meta: {
       model: modelSlug,
-      mode: mapping.mode,
+      mode,
       is_motion_control: true,
       poll_endpoint: ENDPOINT,
     },
@@ -1001,7 +1019,7 @@ async function executeKlingStandard(
     resolvedAspect = rawAspect;
   }
 
-  const initialMode = String((params.mode as string) ?? mapping.mode).toLowerCase() === "std" ? "std" : "pro";
+  const initialMode = normalizeDirectKlingMode(params, mapping.mode);
   let durationValue = parseInt(String(params.duration ?? 5), 10) || 5;
   if (mapping.model === "kling-v3") {
     durationValue = Math.max(3, Math.min(durationValue, 15));
@@ -1497,9 +1515,10 @@ async function executeKlingOmni(
   }
 
   // ── Build body ──
+  const mode = normalizeDirectKlingMode(params, mapping.mode);
   const body: Record<string, unknown> = {
     model_name: mapping.model,
-    mode: mapping.mode,
+    mode,
     duration: String(duration),
     aspect_ratio: resolvedAspect,
   };
@@ -1607,7 +1626,7 @@ async function executeKlingOmni(
     }
   }
 
-  console.log(`[kling-omni] POST ${ENDPOINT} model=${mapping.model} mode=${mapping.mode} duration=${duration}s images=${imageList.length} videos=${videoList.length} multi_shot=${isMultiShot}`);
+  console.log(`[kling-omni] POST ${ENDPOINT} model=${mapping.model} mode=${mode} duration=${duration}s images=${imageList.length} videos=${videoList.length} multi_shot=${isMultiShot}`);
 
   const res = await fetch(ENDPOINT, {
     method: "POST",
@@ -1659,7 +1678,7 @@ async function executeKlingOmni(
     output_type: "video_url",
     provider_meta: {
       model: modelSlug,
-      mode: mapping.mode,
+      mode,
       is_omni: true,
       has_video_ref: videoList.length > 0,
       has_image_ref: imageList.length > 0,
@@ -1906,7 +1925,8 @@ async function executeSeedance(
     if (!Number.isFinite(duration) || duration < 2) duration = 2;
     else if (duration > 12) duration = 12;
   }
-  if (mapped.startsWith("dreamina-seedance-2-0") && resolution === "1080p") {
+  const isSeedance20Fast = mapped === "dreamina-seedance-2-0-fast-260128";
+  if (isSeedance20Fast && resolution === "1080p") {
     resolution = "720p";
   }
   const generateAudioRaw = params.generate_audio ?? params.has_audio;
@@ -2149,15 +2169,8 @@ async function executeVeo(
     typeof rawDuration === "number"
       ? rawDuration
       : parseInt(String(rawDuration ?? "8"), 10) || 8;
-  const durationSeconds: VeoDuration =
+  let durationSeconds: VeoDuration =
     durationNum <= 4 ? 4 : durationNum <= 6 ? 6 : 8;
-  if (resolution === "1080p" && durationSeconds !== 8) {
-    console.warn(
-      `[veo] downgrading resolution to 720p because 1080p only supports 8s ` +
-        `(requested=${durationSeconds}s)`,
-    );
-    resolution = "720p";
-  }
 
   const startFrameUrl = (params.start_frame ?? params.image_url) as
     | string
@@ -2165,6 +2178,23 @@ async function executeVeo(
   const endFrameUrl = (params.end_frame ?? params.image_tail_url) as
     | string
     | undefined;
+  if (endFrameUrl && !startFrameUrl) {
+    throw new Error("Veo end_frame requires a start_frame.");
+  }
+  if (endFrameUrl && durationSeconds !== 8) {
+    console.warn(
+      `[veo] forcing duration to 8s because Veo interpolation ` +
+        `(start_frame + end_frame) only supports 8s (requested=${durationSeconds}s)`,
+    );
+    durationSeconds = 8;
+  }
+  if (resolution === "1080p" && durationSeconds !== 8) {
+    console.warn(
+      `[veo] downgrading resolution to 720p because 1080p only supports 8s ` +
+        `(requested=${durationSeconds}s)`,
+    );
+    resolution = "720p";
+  }
   if (!shouldGenerateFallbackVeoAudio(params)) {
     console.warn("[veo] no-audio request ignored; Google Veo 3.1 is the primary provider and always returns audio");
   }
@@ -2219,7 +2249,7 @@ async function executeVeo(
       `i2v=${hasFrameInput} endFrame=${!!endFrameUrl} personGeneration=${personGeneration}`,
   );
 
-  let operationName: string;
+  let operationName = "";
   let veoApiKeyAlias: VeoApiKeyAlias =
     String(params.veo_api_key_alias ?? params.api_key_alias ?? "") === "gemini2"
       ? "gemini2"
@@ -2238,7 +2268,7 @@ async function executeVeo(
         recoveredFromSubmitError = true;
       } catch (gemini2Err) {
         const gemini2Message = gemini2Err instanceof Error ? gemini2Err.message : String(gemini2Err);
-        if (canUseReplicateVeo()) {
+        if (shouldFastFallbackProviderError(gemini2Message) && canUseReplicateVeo()) {
           return await submitReplicateFallback(`primary_quota_then_gemini2_failed: ${gemini2Message.slice(0, 160)}`);
         }
         throw gemini2Err;
@@ -2780,22 +2810,12 @@ async function executeBanana(
     let errorText = await aiResponse.text();
     console.error(`[banana-direct] Gemini API error key=${apiKeyAlias}: ${statusCode}`, errorText.substring(0, 500));
 
-    // Fallback to GEMINI2_API_KEY once when the primary key fails AND a
-    // secondary key is configured. Mirrors the Veo executor pattern. The
-    // common case we're solving is Google's "ghost 429" / Tier-1 lockout
-    // bug where one paid project's key is throttled while another paid
-    // project's key still has headroom. We retry on:
-    //   - any 5xx (provider hiccup)
-    //   - 429 (rate limit / ghost-429)
-    //   - 401/403 (key-side auth issue, separate project might work)
-    // We DO NOT retry on 4xx/safety errors that look prompt-related —
-    // those would just fail again on the second key.
+    // Fallback to GEMINI2_API_KEY only for quota/rate-limit/billing-like
+    // failures. Busy/high-demand 5xx should stay on the same key and let the
+    // durable queue back off; otherwise the backup quota drains too quickly.
     const shouldFallback =
       hasGeminiImageFallbackKey() &&
-      (statusCode === 429 ||
-        statusCode === 401 ||
-        statusCode === 403 ||
-        statusCode >= 500);
+      shouldFastFallbackProviderError(`HTTP ${statusCode}: ${errorText}`);
 
     if (shouldFallback) {
       console.warn(`[banana-direct] retrying with gemini2 key after HTTP ${statusCode}`);
@@ -4290,9 +4310,124 @@ async function submitReplicateVeoTask(args: {
   };
 }
 
+async function executeReplicateVeo(
+  params: Record<string, unknown>,
+): Promise<ProviderResult> {
+  const prompt = String(params.prompt ?? "").trim();
+  if (!prompt) {
+    throw new Error("Replicate Veo 3.1 requires a prompt.");
+  }
+
+  const rawAspect = String(params.aspect_ratio ?? params.ratio ?? "16:9");
+  const aspectRatio: VeoAspectRatio = rawAspect === "9:16" ? "9:16" : "16:9";
+  const rawRes = String(params.resolution ?? "720p");
+  let resolution: VeoResolution = rawRes === "1080p" ? "1080p" : "720p";
+  const rawDuration = params.duration;
+  const durationNum =
+    typeof rawDuration === "number"
+      ? rawDuration
+      : parseInt(String(rawDuration ?? "8"), 10) || 8;
+  const durationSeconds: VeoDuration =
+    durationNum <= 4 ? 4 : durationNum <= 6 ? 6 : 8;
+  if (resolution === "1080p" && durationSeconds !== 8) {
+    resolution = "720p";
+  }
+
+  return await submitReplicateVeoTask({
+    prompt,
+    negativePrompt: String(params.negative_prompt ?? "").trim() || undefined,
+    startFrameUrl: (params.start_frame ?? params.image_url) as string | undefined,
+    endFrameUrl: (params.end_frame ?? params.image_tail_url) as string | undefined,
+    aspectRatio,
+    resolution,
+    durationSeconds,
+    modelSlug: REPLICATE_VEO_MODEL_SLUG,
+    providerModelId: "google/veo-3.1",
+    generateAudio: shouldGenerateFallbackVeoAudio(params),
+    fallbackFrom: String(params.fallback_from ?? "direct_replicate_model"),
+  });
+}
+
 const REPLICATE_SEEDANCE_MODEL_SLUG = "replicate-seedance-2-0";
 const REPLICATE_SEEDANCE_PROVIDER_MODEL_ID = "bytedance/seedance-2.0";
+const REPLICATE_VEO_MODEL_SLUG = "replicate-veo-3-1";
 const REPLICATE_PREDICTIONS_ENDPOINT = "https://api.replicate.com/v1/predictions";
+
+const REPLICATE_KLING_VIDEO_MODELS: Record<string, { providerModelId: string; sourceModel: string }> = {
+  "replicate-kling-v3-pro": {
+    providerModelId: "kwaivgi/kling-v3-video",
+    sourceModel: "kling-v3-pro",
+  },
+  "replicate-kling-v3-omni": {
+    providerModelId: "kwaivgi/kling-v3-omni-video",
+    sourceModel: "kling-v3-omni",
+  },
+  "replicate-kling-v3-motion-pro": {
+    providerModelId: "kwaivgi/kling-v3-motion-control",
+    sourceModel: "kling-v3-motion-pro",
+  },
+};
+
+const REPLICATE_IMAGE_MODELS: Record<string, { providerModelId: string; sourceModel: string; family: "gpt-image-2" | "banana-pro" | "banana-2" }> = {
+  "replicate-gpt-image-2": {
+    providerModelId: "openai/gpt-image-2",
+    sourceModel: "gpt-image-2",
+    family: "gpt-image-2",
+  },
+  "replicate-nano-banana-pro": {
+    providerModelId: "google/nano-banana-pro",
+    sourceModel: "nano-banana-pro",
+    family: "banana-pro",
+  },
+  "replicate-nano-banana-2": {
+    providerModelId: "google/nano-banana",
+    sourceModel: "nano-banana-2",
+    family: "banana-2",
+  },
+};
+
+function loadReplicateApiToken(label = "Replicate"): string {
+  const apiToken = Deno.env.get("REPLICATE_API_TOKEN")?.trim();
+  if (!apiToken) {
+    throw new Error(`${label} is not configured. Set REPLICATE_API_TOKEN.`);
+  }
+  return apiToken;
+}
+
+async function submitReplicatePrediction(
+  providerModelId: string,
+  input: Record<string, unknown>,
+  label: string,
+): Promise<string> {
+  const apiToken = loadReplicateApiToken(label);
+  const res = await fetch(
+    `https://api.replicate.com/v1/models/${providerModelId}/predictions`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ input }),
+    },
+  );
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`${label} submit failed (HTTP ${res.status}): ${text.slice(0, 500)}`);
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  } catch {
+    throw new Error(`${label} returned invalid JSON: ${text.slice(0, 300)}`);
+  }
+  const predictionId = String(parsed.id ?? "").trim();
+  if (!predictionId) {
+    throw new Error(`${label} returned no prediction id: ${text.slice(0, 300)}`);
+  }
+  return predictionId;
+}
 
 function collectStringUrls(params: Record<string, unknown>, keys: string[], max: number): string[] {
   const values: string[] = [];
@@ -4317,18 +4452,142 @@ function parseReplicateSeedanceDuration(value: unknown): number {
   return Math.min(15, Math.max(1, parsed));
 }
 
+function normalizeReplicateKlingMode(params: Record<string, unknown>, motion = false): string {
+  const raw = String(params.mode ?? params.quality_mode ?? params.resolution ?? "").toLowerCase();
+  if (motion) return raw === "std" || raw === "standard" || raw === "720p" ? "std" : "pro";
+  if (raw === "4k" || raw === "2160p") return "4k";
+  if (raw === "standard" || raw === "std" || raw === "720p") return "standard";
+  return "pro";
+}
+
+function normalizeReplicateKlingAspectRatio(value: unknown): string {
+  const raw = String(value ?? "16:9");
+  return ["16:9", "9:16", "1:1"].includes(raw) ? raw : "16:9";
+}
+
+function parseReplicateKlingDuration(value: unknown): number {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : parseInt(String(value ?? "5"), 10);
+  if (!Number.isFinite(parsed)) return 5;
+  return Math.min(15, Math.max(3, Math.round(parsed)));
+}
+
+function boolParam(value: unknown, defaultValue = false): boolean {
+  if (value === undefined || value === null || value === "") return defaultValue;
+  return value === true || value === "true" || value === "1" || value === 1;
+}
+
+async function executeReplicateKlingVideo(
+  modelSlug: string,
+  params: Record<string, unknown>,
+): Promise<ProviderResult> {
+  const entry = REPLICATE_KLING_VIDEO_MODELS[modelSlug];
+  if (!entry) throw new Error(`Unknown Replicate Kling model: ${modelSlug}`);
+
+  const prompt = String(params.prompt ?? "").trim();
+  const startFrameUrl = String(params.image_url ?? params.start_frame ?? params.image ?? "").trim();
+  const endFrameUrl = String(params.image_tail_url ?? params.end_frame ?? "").trim();
+  const referenceImageUrls = collectStringUrls(
+    params,
+    ["ref_image_urls", "reference_image_urls", "reference_image_url", "reference_image", "ref_image"],
+    7,
+  );
+  const referenceVideoUrls = collectStringUrls(
+    params,
+    ["reference_video_urls", "reference_video_url", "video_urls", "video_url", "ref_video"],
+    1,
+  );
+  const duration = parseReplicateKlingDuration(params.duration);
+
+  const input: Record<string, unknown> = {
+    prompt: prompt || "Generate a cinematic video from the provided references.",
+  };
+
+  if (modelSlug === "replicate-kling-v3-motion-pro") {
+    const motionVideo = referenceVideoUrls[0] ?? String(params.video ?? "").trim();
+    if (!startFrameUrl) throw new Error("Replicate Kling 3.0 Motion requires a reference image.");
+    if (!motionVideo) throw new Error("Replicate Kling 3.0 Motion requires a reference video.");
+    input.mode = normalizeReplicateKlingMode(params, true);
+    input.image = startFrameUrl;
+    input.video = motionVideo;
+    input.keep_original_sound = boolParam(params.keep_original_sound, true);
+    const orientation = String(params.character_orientation ?? "image");
+    input.character_orientation = orientation === "video" ? "video" : "image";
+  } else {
+    input.mode = normalizeReplicateKlingMode(params);
+    input.duration = duration;
+    input.aspect_ratio = normalizeReplicateKlingAspectRatio(params.aspect_ratio ?? params.ratio);
+    input.generate_audio = boolParam(params.generate_audio ?? params.has_audio, false);
+    if (params.negative_prompt) input.negative_prompt = String(params.negative_prompt);
+    if (params.multi_prompt) input.multi_prompt = String(params.multi_prompt);
+    if (startFrameUrl) input.start_image = startFrameUrl;
+    if (endFrameUrl) input.end_image = endFrameUrl;
+
+    if (modelSlug === "replicate-kling-v3-omni") {
+      if (referenceImageUrls.length > 0) input.reference_images = referenceImageUrls;
+      if (referenceVideoUrls[0]) input.reference_video = referenceVideoUrls[0];
+      if (referenceVideoUrls[0]) {
+        input.keep_original_sound = boolParam(params.keep_original_sound, true);
+        const videoReferenceType = String(params.video_reference_type ?? "feature");
+        input.video_reference_type = videoReferenceType === "base" ? "base" : "feature";
+        delete input.generate_audio;
+      }
+    }
+  }
+
+  console.log(
+    `[replicate-kling] submit model=${entry.providerModelId} duration=${input.duration ?? "provider"} ` +
+      `mode=${input.mode} start=${!!startFrameUrl} end=${!!endFrameUrl} ` +
+      `refs=${referenceImageUrls.length} videoRef=${referenceVideoUrls.length}`,
+  );
+
+  const predictionId = await submitReplicatePrediction(
+    entry.providerModelId,
+    input,
+    `Replicate Kling ${modelSlug}`,
+  );
+
+  return {
+    task_id: predictionId,
+    outputs: {
+      output_video: "",
+      output_start_frame: startFrameUrl,
+      output_end_frame: endFrameUrl,
+    },
+    output_type: "video_url",
+    provider_meta: {
+      provider: "replicate_video",
+      source_provider: "replicate",
+      model: modelSlug,
+      fallback_for: entry.sourceModel,
+      provider_model_id: entry.providerModelId,
+      poll_endpoint: REPLICATE_PREDICTIONS_ENDPOINT,
+      duration_seconds: input.duration ?? null,
+      mode: input.mode,
+      aspect_ratio: input.aspect_ratio ?? null,
+      has_audio: Boolean(input.generate_audio),
+      is_image2video: Boolean(startFrameUrl),
+      has_end_frame: Boolean(endFrameUrl),
+      reference_image_count: referenceImageUrls.length,
+      reference_video_count: referenceVideoUrls.length,
+    },
+  };
+}
+
 async function executeReplicateVideo(
   params: Record<string, unknown>,
 ): Promise<ProviderResult> {
   const modelSlug = String(params.model_name ?? params.model ?? REPLICATE_SEEDANCE_MODEL_SLUG);
+  if (REPLICATE_KLING_VIDEO_MODELS[modelSlug]) {
+    return await executeReplicateKlingVideo(modelSlug, params);
+  }
   if (modelSlug !== REPLICATE_SEEDANCE_MODEL_SLUG) {
     throw new Error(`Unknown Replicate video model: ${modelSlug}`);
   }
 
-  const apiToken = Deno.env.get("REPLICATE_API_TOKEN")?.trim();
-  if (!apiToken) {
-    throw new Error("Replicate video is not configured. Set REPLICATE_API_TOKEN.");
-  }
+  loadReplicateApiToken("Replicate video");
 
   const prompt = String(params.prompt ?? "").trim();
   if (!prompt) {
@@ -4399,33 +4658,11 @@ async function executeReplicateVideo(
       `irefs=${referenceImageUrls.length} vrefs=${referenceVideoUrls.length} arefs=${referenceAudioUrls.length}`,
   );
 
-  const res = await fetch(
-    `https://api.replicate.com/v1/models/${REPLICATE_SEEDANCE_PROVIDER_MODEL_ID}/predictions`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ input }),
-    },
+  const predictionId = await submitReplicatePrediction(
+    REPLICATE_SEEDANCE_PROVIDER_MODEL_ID,
+    input,
+    "Replicate Seedance 2.0",
   );
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`Replicate Seedance 2.0 submit failed (HTTP ${res.status}): ${text.slice(0, 500)}`);
-  }
-
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
-  } catch {
-    throw new Error(`Replicate Seedance 2.0 returned invalid JSON: ${text.slice(0, 300)}`);
-  }
-
-  const predictionId = String(parsed.id ?? "").trim();
-  if (!predictionId) {
-    throw new Error(`Replicate Seedance 2.0 returned no prediction id: ${text.slice(0, 300)}`);
-  }
 
   return {
     task_id: predictionId,
@@ -4453,6 +4690,119 @@ async function executeReplicateVideo(
       reference_video_count: referenceVideoUrls.length,
       has_audio_ref: referenceAudioUrls.length > 0,
       reference_audio_count: referenceAudioUrls.length,
+    },
+  };
+}
+
+function normalizeReplicateImageAspectRatio(params: Record<string, unknown>, family: "gpt-image-2" | "banana-pro" | "banana-2"): string {
+  const raw = String(params.aspect_ratio ?? params.ratio ?? "").trim();
+  const size = String(params.size ?? params.image_size ?? "").trim().toLowerCase();
+  if (family === "gpt-image-2") {
+    if (["1:1", "3:2", "2:3"].includes(raw)) return raw;
+    if (size === "1536x1024" || size === "3:2") return "3:2";
+    if (size === "1024x1536" || size === "2:3") return "2:3";
+    return "1:1";
+  }
+  const allowed = ["match_input_image", "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"];
+  if (allowed.includes(raw)) return raw;
+  if (raw && raw !== "Auto") return "1:1";
+  return "match_input_image";
+}
+
+function normalizeReplicateBananaResolution(value: unknown): "1K" | "2K" | "4K" {
+  const raw = String(value ?? "2K").trim().toUpperCase();
+  if (raw === "1K" || raw === "2K" || raw === "4K") return raw;
+  return "2K";
+}
+
+async function executeReplicateImage(
+  params: Record<string, unknown>,
+): Promise<ProviderResult> {
+  const modelSlug = String(params.model_name ?? params.model ?? "replicate-gpt-image-2");
+  const entry = REPLICATE_IMAGE_MODELS[modelSlug];
+  if (!entry) throw new Error(`Unknown Replicate image model: ${modelSlug}`);
+
+  const prompt = String(params.prompt ?? "").trim();
+  if (!prompt) {
+    throw new Error(`Replicate ${entry.providerModelId} requires a prompt.`);
+  }
+  const imageInputs = collectStringUrls(
+    params,
+    ["mention_image_urls", "image_input", "input_images", "image_url", "image", "ref_image", "reference_image_urls"],
+    entry.family === "banana-pro" ? 14 : 10,
+  );
+
+  const outputFormatRaw = String(params.output_format ?? (entry.family === "gpt-image-2" ? "webp" : "jpg")).toLowerCase();
+  const outputFormat =
+    entry.family === "gpt-image-2"
+      ? (["png", "jpeg", "webp"].includes(outputFormatRaw) ? outputFormatRaw : "webp")
+      : (outputFormatRaw === "png" ? "png" : "jpg");
+
+  const input: Record<string, unknown> = { prompt };
+  if (entry.family === "gpt-image-2") {
+    const qualityRaw = String(params.quality ?? "auto").toLowerCase();
+    input.quality = ["low", "medium", "high", "auto"].includes(qualityRaw) ? qualityRaw : "auto";
+    input.aspect_ratio = normalizeReplicateImageAspectRatio(params, entry.family);
+    input.input_images = imageInputs;
+    input.number_of_images = 1;
+    input.output_format = outputFormat;
+    const backgroundRaw = String(params.background ?? "auto").toLowerCase();
+    input.background = ["auto", "transparent", "opaque"].includes(backgroundRaw) ? backgroundRaw : "auto";
+    const moderationRaw = String(params.moderation ?? "auto").toLowerCase();
+    input.moderation = moderationRaw === "low" ? "low" : "auto";
+    const compression = Number(params.output_compression ?? 90);
+    input.output_compression = Number.isFinite(compression)
+      ? Math.max(0, Math.min(100, Math.round(compression)))
+      : 90;
+  } else {
+    input.image_input = imageInputs;
+    const bananaAspectRatio = normalizeReplicateImageAspectRatio(params, entry.family);
+    input.aspect_ratio = bananaAspectRatio === "match_input_image" && imageInputs.length === 0
+      ? "1:1"
+      : bananaAspectRatio;
+    input.output_format = outputFormat;
+    if (entry.family === "banana-pro") {
+      input.resolution = normalizeReplicateBananaResolution(params.image_size ?? params.resolution);
+      const safetyRaw = String(params.safety_filter_level ?? "block_only_high");
+      input.safety_filter_level = [
+        "block_low_and_above",
+        "block_medium_and_above",
+        "block_only_high",
+      ].includes(safetyRaw) ? safetyRaw : "block_only_high";
+      // Keep model semantics explicit. Replicate's schema can fall back to
+      // Seedream 5 when Pro is at capacity; we disable it so our own route
+      // plan remains the only fallback decision-maker.
+      input.allow_fallback_model = false;
+    }
+  }
+
+  console.log(
+    `[replicate-image] submit model=${entry.providerModelId} refs=${imageInputs.length} ` +
+      `format=${outputFormat} aspect=${input.aspect_ratio ?? "default"}`,
+  );
+
+  const predictionId = await submitReplicatePrediction(
+    entry.providerModelId,
+    input,
+    `Replicate image ${modelSlug}`,
+  );
+
+  return {
+    task_id: predictionId,
+    outputs: { output_image: "" },
+    output_type: "image_url",
+    provider_meta: {
+      provider: "replicate_image",
+      source_provider: "replicate",
+      model: modelSlug,
+      fallback_for: entry.sourceModel,
+      provider_model_id: entry.providerModelId,
+      poll_endpoint: REPLICATE_PREDICTIONS_ENDPOINT,
+      reference_image_count: imageInputs.length,
+      output_format: outputFormat,
+      aspect_ratio: input.aspect_ratio ?? null,
+      quality: input.quality ?? null,
+      resolution: input.resolution ?? null,
     },
   };
 }
@@ -4866,8 +5216,12 @@ async function executeOneStep(
         return await executeKling(stepParams);
       case "veo":
         return await executeVeo(stepParams, supabase);
+      case "replicate_veo":
+        return await executeReplicateVeo(stepParams);
       case "replicate_video":
         return await executeReplicateVideo(stepParams);
+      case "replicate_image":
+        return await executeReplicateImage(stepParams);
       case "banana":
         return await executeBanana(stepParams, SUPABASE_URL, token);
       case "chat_ai":
@@ -5333,11 +5687,14 @@ function getProviderForNodeType(
   const m = String(modelName ?? "").toLowerCase();
 
   if (nodeType === "bananaProNode" || nodeType === "imageGenNode") {
+    if (m.startsWith("replicate-gpt-image") || m.startsWith("replicate-nano-banana")) return "replicate_image";
     if (m.startsWith("seedream")) return "seedream";
     if (m.startsWith("gpt-image") || m.startsWith("dall-e")) return "openai";
     return "banana";
   }
   if (nodeType === "klingVideoNode" || nodeType === "videoGenNode") {
+    if (m.startsWith("replicate-veo")) return "replicate_veo";
+    if (m.startsWith("replicate-kling")) return "replicate_video";
     if (m.startsWith("replicate-seedance")) return "replicate_video";
     if (m.startsWith("seedance") || m.startsWith("dreamina-seedance")) return "seedance";
     if (m.startsWith("veo-")) return "veo";
@@ -5377,7 +5734,7 @@ function workspaceProviderDef(
 ): ProviderDef {
   const p = provider as ProviderKey;
   const output: ProviderDef["output_type"] =
-    p === "kling" || p === "seedance" || p === "veo" || p === "replicate_video" || p === "merge_audio"
+    p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "merge_audio"
       ? "video_url"
       : p === "tripo3d" || p === "hyper3d"
         ? "model_3d"
@@ -5389,9 +5746,10 @@ function workspaceProviderDef(
           : "image_url";
   const feature =
     p === "openai" ? "generate_openai_image" :
+    p === "replicate_image" ? "generate_openai_image" :
     p === "seedream" ? "generate_seedream_image" :
     p === "banana" ? "generate_freepik_image" :
-    p === "kling" || p === "seedance" || p === "veo" || p === "replicate_video" ? "generate_freepik_video" :
+    p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" ? "generate_freepik_video" :
     p === "remove_bg" ? "remove_background" :
     p === "merge_audio" ? "merge_audio_video" :
     p === "chat_ai" ? "chat_ai" :
@@ -5403,7 +5761,7 @@ function workspaceProviderDef(
     provider: p,
     feature,
     output_type: output,
-    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "replicate_video" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio",
+    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "replicate_image" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio",
   };
 }
 
@@ -5428,9 +5786,12 @@ function workspaceMultiplierForProvider(
     case "kling":
     case "seedance":
     case "veo":
+    case "replicate_veo":
     case "replicate_video":
     case "merge_audio":
       return multipliers.video;
+    case "replicate_image":
+      return multipliers.image;
     case "chat_ai":
     case "video_understanding":
       return multipliers.chat;
@@ -5442,6 +5803,14 @@ function workspaceMultiplierForProvider(
     default:
       return multipliers.chat;
   }
+}
+
+function workspaceCreditFeature(def: ProviderDef, params: Record<string, unknown>): string {
+  if (def.provider !== "replicate_image") return def.feature;
+  const model = String(params.model_name ?? params.model ?? "").toLowerCase();
+  return model.startsWith("replicate-gpt-image")
+    ? "generate_openai_image"
+    : "generate_freepik_image";
 }
 
 type WorkspaceCreditCharge = {
@@ -5861,6 +6230,7 @@ async function consumeWorkspaceCredits(args: {
   const discountPercent = await lookupModelDiscountPercent(args.supabase, def, args.params);
   const amount = applyModelDiscountToCredits(fullAmount, discountPercent);
   if (amount <= 0) return null;
+  const feature = workspaceCreditFeature(def, args.params);
 
   const teamId = await resolveWorkspaceTeamId(args.supabase, args.body.workspace_id ?? null);
   const referenceId = String(
@@ -5897,7 +6267,7 @@ async function consumeWorkspaceCredits(args: {
       p_user_id: args.userId,
       p_workspace_id: args.body.workspace_id,
       p_amount: amount,
-      p_feature: def.feature,
+      p_feature: feature,
       p_description: description,
       p_reference_id: referenceId,
       p_canvas_id: args.body.canvas_id ?? null,
@@ -5920,7 +6290,7 @@ async function consumeWorkspaceCredits(args: {
       classId: creditOwner.classId,
       creditUserId: args.userId,
       referenceId,
-      feature: def.feature,
+      feature,
     };
   }
 
@@ -5929,7 +6299,7 @@ async function consumeWorkspaceCredits(args: {
       p_user_id: args.userId,
       p_organization_id: creditOwner.organizationId,
       p_amount: amount,
-      p_feature: def.feature,
+      p_feature: feature,
       p_description: description,
       p_reference_id: referenceId,
       p_workspace_id: args.body.workspace_id ?? null,
@@ -5954,7 +6324,7 @@ async function consumeWorkspaceCredits(args: {
         classId: creditOwner.classId ?? null,
         creditUserId: null,
         referenceId,
-        feature: def.feature,
+        feature,
       };
     }
   }
@@ -5969,7 +6339,7 @@ async function consumeWorkspaceCredits(args: {
     p_user_id: creditUserId,
     p_team_id: teamId,
     p_amount: amount,
-    p_feature: def.feature,
+    p_feature: feature,
     p_description: description,
     p_reference_id: referenceId,
     p_workspace_id: args.body.workspace_id ?? null,
@@ -5983,7 +6353,7 @@ async function consumeWorkspaceCredits(args: {
       const fallback = await args.supabase.rpc("consume_credits", {
         p_user_id: creditUserId,
         p_amount: amount,
-        p_feature: def.feature,
+        p_feature: feature,
         p_description: description,
         p_reference_id: referenceId,
       });
@@ -6011,7 +6381,7 @@ async function consumeWorkspaceCredits(args: {
     classId: creditOwner.scope === "user" ? creditOwner.classId ?? null : null,
     creditUserId,
     referenceId,
-    feature: def.feature,
+    feature,
   };
 }
 
@@ -6283,7 +6653,7 @@ function appendMentionContext(
  *   - Surfaces OpenAI's verbatim error message — they're the most
  *     useful diagnostic for billing / safety / quota issues.
  */
-const OPENAI_IMAGE_2_ATTEMPT_TIMEOUT_MS = 118_000;
+const OPENAI_IMAGE_2_ATTEMPT_TIMEOUT_MS = 145_000;
 
 async function executeOpenAIImage2(
   params: Record<string, unknown>,
@@ -6420,7 +6790,7 @@ async function executeOpenAIImage2(
     if (status >= 500) {
       throw new Error(`OpenAI ${status}: temporary upstream error${errorMsg ? ` - ${errorMsg}` : ""}`);
     }
-    throw new Error(`GPT Image 2 failed: ${errorMsg}`);
+    throw new Error(`GPT Image 2 failed (HTTP ${status}): ${errorMsg}`);
   }
 
   const result = (await response.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
@@ -6500,6 +6870,7 @@ interface WorkspaceRunBody {
     | "poll_veo"
     | "poll_replicate_veo"
     | "poll_replicate_video"
+    | "poll_replicate_image"
     | "poll_freepik_veo"
     | "poll_freepik_video"
     | "poll_freepik_image"
@@ -6537,6 +6908,12 @@ interface WorkspaceRunBody {
   credit_scope?: "user" | "organization" | "team" | "education_space";
   credit_organization_id?: string | null;
   credit_class_id?: string | null;
+  provider_fallback?: {
+    original_provider?: string;
+    original_model?: string;
+    route_index?: number;
+    history?: Array<Record<string, unknown>>;
+  };
 }
 
 const WORKSPACE_JOB_MAX_MS = 60 * 60_000;
@@ -6550,11 +6927,35 @@ const WORKSPACE_JOB_WORKER_BATCH_SIZE = 8;
 const WORKSPACE_JOB_LOCK_SEC = 360;
 const WORKSPACE_JOB_HEARTBEAT_MS = 45_000;
 const WORKSPACE_JOB_EXPIRE_SWEEP_LIMIT = 25;
+const DIRECT_REPLICATE_PRIMARY_MODELS: Record<string, string> = {
+  "replicate-seedance-2-0": "seedance-2-0-pro",
+  "replicate-kling-v3-pro": "kling-v3-pro",
+  "replicate-kling-v3-motion-pro": "kling-v3-motion-pro",
+  "replicate-kling-v3-omni": "kling-v3-omni",
+  "replicate-veo-3-1": "veo-3.1-generate-001",
+  "replicate-nano-banana-2": "nano-banana-2",
+  "replicate-nano-banana-pro": "nano-banana-pro",
+  "replicate-gpt-image-2": "gpt-image-2",
+};
 
 function workspaceJobMaxAttempts(provider: string): number {
-  // Gemini image sync calls consume request quota on every retry because there
-  // is no task id to resume. Keep Banana conservative until it moves to Batch.
-  return provider === "banana" ? 6 : 18;
+  // Sync image calls consume request/compute on every retry because there is no
+  // task id to resume. Keep them conservative and hand off to fallback routes
+  // instead of letting users stare at a running row for half an hour.
+  if (provider === "banana") return 6;
+  if (provider === "openai") return 3;
+  return 18;
+}
+
+function normalizeDirectReplicateModelForPrimary(body: WorkspaceRunBody): string | null {
+  const params = body.params;
+  if (!params || body.provider_fallback) return null;
+  const rawModel = String(params.model_name ?? params.model ?? "").trim().toLowerCase();
+  const primaryModel = DIRECT_REPLICATE_PRIMARY_MODELS[rawModel];
+  if (!primaryModel) return null;
+  params.model_name = primaryModel;
+  if (params.model != null) params.model = primaryModel;
+  return primaryModel;
 }
 
 type WorkspaceJobStatus =
@@ -6600,6 +7001,175 @@ type WorkspaceJobRow = {
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+type WorkspaceFallbackRoute = {
+  provider: string;
+  model: string;
+  reason: string;
+  params?: Record<string, unknown>;
+};
+
+function fallbackOriginalModel(job: WorkspaceJobRow): string {
+  return String(
+    job.request?.provider_fallback?.original_model ??
+      job.model ??
+      job.request?.params?.model_name ??
+      job.request?.params?.model ??
+      "",
+  ).toLowerCase();
+}
+
+function routeForReplicateKling(originalModel: string): WorkspaceFallbackRoute | null {
+  if (originalModel === "kling-v3-omni") {
+    return {
+      provider: "replicate_video",
+      model: "replicate-kling-v3-omni",
+      reason: "kling_3_omni_replicate_capacity",
+    };
+  }
+  if (originalModel === "kling-v3-motion-pro") {
+    return {
+      provider: "replicate_video",
+      model: "replicate-kling-v3-motion-pro",
+      reason: "kling_3_motion_replicate_capacity",
+    };
+  }
+  if (originalModel === "kling-v3-pro") {
+    return {
+      provider: "replicate_video",
+      model: "replicate-kling-v3-pro",
+      reason: "kling_3_pro_replicate_capacity",
+    };
+  }
+  return null;
+}
+
+function buildWorkspaceFallbackRoutes(job: WorkspaceJobRow): WorkspaceFallbackRoute[] {
+  if (!canUseReplicate()) return [];
+  const originalProvider = String(job.request?.provider_fallback?.original_provider ?? job.provider ?? "").toLowerCase();
+  const originalModel = fallbackOriginalModel(job);
+  const routes: WorkspaceFallbackRoute[] = [];
+
+  if (originalProvider === "veo" || originalModel.startsWith("veo-")) {
+    routes.push({
+      provider: "replicate_veo",
+      model: REPLICATE_VEO_MODEL_SLUG,
+      reason: "veo_3_1_replicate_capacity",
+    });
+  } else if (
+    originalProvider === "seedance" ||
+    originalModel.startsWith("seedance-2-0") ||
+    originalModel.startsWith("dreamina-seedance-2-0")
+  ) {
+    routes.push({
+      provider: "replicate_video",
+      model: REPLICATE_SEEDANCE_MODEL_SLUG,
+      reason: "seedance_2_0_replicate_capacity",
+    });
+  } else if (originalProvider === "kling" || originalModel.startsWith("kling-v3")) {
+    const klingRoute = routeForReplicateKling(originalModel);
+    if (klingRoute) routes.push(klingRoute);
+  } else if (originalProvider === "banana" || originalModel.startsWith("nano-banana")) {
+    routes.push({
+      provider: "replicate_image",
+      model: originalModel === "nano-banana-2" ? "replicate-nano-banana-2" : "replicate-nano-banana-pro",
+      reason: "gemini_image_replicate_capacity",
+    });
+  } else if (originalProvider === "openai" || originalModel.startsWith("gpt-image-2")) {
+    routes.push({
+      provider: "replicate_image",
+      model: "replicate-gpt-image-2",
+      reason: "gpt_image_2_replicate_capacity",
+    });
+  }
+
+  return routes.filter((route) => route.model && route.model !== String(job.model ?? "").toLowerCase());
+}
+
+async function advanceWorkspaceJobFallbackRoute(args: {
+  supabase: ReturnType<typeof createClient>;
+  job: WorkspaceJobRow;
+  workerId?: string;
+  error: string;
+  trigger: "fast_fallback" | "attempts_exhausted" | "async_failed" | "deadline";
+}): Promise<WorkspaceFallbackRoute | null> {
+  const routes = buildWorkspaceFallbackRoutes(args.job);
+  const meta = args.job.request?.provider_fallback ?? {};
+  const currentIndex = Math.max(0, Number(meta.route_index ?? 0) || 0);
+  const nextRoute = routes[currentIndex];
+  if (!nextRoute) return null;
+
+  const originalProvider = String(meta.original_provider ?? args.job.provider ?? "");
+  const originalModel = String(
+    meta.original_model ??
+      args.job.model ??
+      args.job.request?.params?.model_name ??
+      args.job.request?.params?.model ??
+      "",
+  );
+  const nextParams = {
+    ...(args.job.request?.params ?? {}),
+    ...(nextRoute.params ?? {}),
+    model_name: nextRoute.model,
+    model: nextRoute.model,
+    fallback_from_provider: args.job.provider ?? originalProvider,
+    fallback_from_model: args.job.model ?? originalModel,
+  };
+  const history = Array.isArray(meta.history) ? meta.history : [];
+  const nextRequest: WorkspaceRunBody = {
+    ...args.job.request,
+    params: nextParams,
+    provider_fallback: {
+      original_provider: originalProvider,
+      original_model: originalModel,
+      route_index: currentIndex + 1,
+      history: [
+        ...history,
+        {
+          at: new Date().toISOString(),
+          trigger: args.trigger,
+          from_provider: args.job.provider,
+          from_model: args.job.model,
+          to_provider: nextRoute.provider,
+          to_model: nextRoute.model,
+          reason: nextRoute.reason,
+          error: args.error.substring(0, 500),
+        },
+      ],
+    },
+  };
+
+  const message =
+    `Fallback route ${currentIndex + 1}/${routes.length}: ` +
+    `${args.job.provider ?? originalProvider}/${args.job.model ?? originalModel} -> ` +
+    `${nextRoute.provider}/${nextRoute.model} (${nextRoute.reason}). ` +
+    `Previous error: ${args.error}`;
+
+  const { error } = await args.supabase
+    .from("workspace_generation_jobs")
+    .update({
+      status: "running",
+      provider: nextRoute.provider,
+      model: nextRoute.model,
+      request: nextRequest,
+      result: null,
+      attempts: 0,
+      max_attempts: workspaceJobMaxAttempts(nextRoute.provider),
+      error: null,
+      last_error: message,
+      locked_by: null,
+      lock_expires_at: null,
+      worker_heartbeat_at: new Date().toISOString(),
+      run_after: new Date(Date.now() + 1000).toISOString(),
+    })
+    .eq("id", args.job.id);
+  if (error) {
+    console.error("[workspace-fallback] failed to advance route", args.job.id, error.message);
+    return null;
+  }
+  console.warn(`[workspace-fallback] job=${args.job.id} ${message.substring(0, 700)}`);
+  return nextRoute;
+}
 
 function hasRecoverableAsyncResult(job: WorkspaceJobRow): boolean {
   const result =
@@ -6768,6 +7338,8 @@ async function pollWorkspaceAsyncResult(args: {
         ? "poll_replicate_veo"
       : provider === "replicate_video"
         ? "poll_replicate_video"
+      : provider === "replicate_image"
+        ? "poll_replicate_image"
       : provider === "freepik_veo" || provider === "freepik_seedance"
         ? "poll_freepik_video"
       : provider === "freepik_image"
@@ -6873,6 +7445,8 @@ async function pollWorkspaceAsyncResultOnce(args: {
         ? "poll_replicate_veo"
       : provider === "replicate_video"
         ? "poll_replicate_video"
+      : provider === "replicate_image"
+        ? "poll_replicate_image"
       : provider === "freepik_veo" || provider === "freepik_seedance"
         ? "poll_freepik_video"
       : provider === "freepik_image"
@@ -6977,7 +7551,9 @@ function inferAsyncPollProvider(
   }
   if (endpoint.includes("api.replicate.com")) {
     const model = String(providerMeta.model ?? providerMeta.provider_model_id ?? "").toLowerCase();
-    return model.includes("seedance") ? "replicate_video" : "replicate_veo";
+    if (model.includes("gpt-image") || model.includes("nano-banana")) return "replicate_image";
+    if (model.includes("veo")) return "replicate_veo";
+    return "replicate_video";
   }
   if (
     endpoint.includes("generativelanguage.googleapis.com") ||
@@ -7275,6 +7851,31 @@ async function scheduleWorkspaceJobRetry(args: {
   });
 }
 
+async function scheduleWorkspaceJobProviderResubmit(args: {
+  supabase: ReturnType<typeof createClient>;
+  job: WorkspaceJobRow;
+  workerId: string;
+  message: string;
+  delaySeconds: number;
+}): Promise<void> {
+  await args.supabase
+    .from("workspace_generation_jobs")
+    .update({
+      status: "running",
+      result: null,
+      error: null,
+      last_error: args.message,
+      worker_heartbeat_at: new Date().toISOString(),
+    })
+    .eq("id", args.job.id);
+  await releaseWorkspaceJobLock({
+    supabase: args.supabase,
+    jobId: args.job.id,
+    workerId: args.workerId,
+    runAfterSeconds: args.delaySeconds,
+  });
+}
+
 async function processWorkspaceGenerationJobTick(args: {
   supabase: ReturnType<typeof createClient>;
   job: WorkspaceJobRow;
@@ -7288,6 +7889,16 @@ async function processWorkspaceGenerationJobTick(args: {
   const deadlineMs = workspaceJobDeadlineMs(job);
   if (now >= deadlineMs) {
     const msg = `Provider queue was busy for ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes. Generation timed out and credits were refunded.`;
+    const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+      supabase: args.supabase,
+      job,
+      workerId: args.workerId,
+      error: msg,
+      trigger: "deadline",
+    });
+    if (fallbackRoute) {
+      return { job_id: job.id, status: "running", detail: `fallback_${fallbackRoute.provider}` };
+    }
     await failWorkspaceJob({
       supabase: args.supabase,
       job,
@@ -7307,11 +7918,37 @@ async function processWorkspaceGenerationJobTick(args: {
       : null;
   const currentAttempts = Math.max(0, Number(job.attempts ?? 0) || 0);
   const maxAttempts = Math.max(1, Number(job.max_attempts ?? TOTAL_MAX_RETRIES) || TOTAL_MAX_RETRIES);
+  if (
+    !currentResult?.task_id &&
+    job.last_error &&
+    shouldFastFallbackProviderError(job.last_error)
+  ) {
+    const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+      supabase: args.supabase,
+      job,
+      workerId: args.workerId,
+      error: job.last_error,
+      trigger: "fast_fallback",
+    });
+    if (fallbackRoute) {
+      return { job_id: job.id, status: "running", detail: `fallback_${fallbackRoute.provider}` };
+    }
+  }
 
   if (!currentResult?.task_id && currentAttempts >= maxAttempts) {
     const msg =
       `${workspaceJobProviderLabel(job)} could not finish after ${maxAttempts} attempts. ` +
       `${job.last_error ? `Last provider error: ${job.last_error}` : "Credits were refunded."}`;
+    const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+      supabase: args.supabase,
+      job,
+      workerId: args.workerId,
+      error: msg,
+      trigger: "attempts_exhausted",
+    });
+    if (fallbackRoute) {
+      return { job_id: job.id, status: "running", detail: `fallback_${fallbackRoute.provider}` };
+    }
     await failWorkspaceJob({
       supabase: args.supabase,
       job,
@@ -7337,6 +7974,41 @@ async function processWorkspaceGenerationJobTick(args: {
       }
       if (outcome.state === "failed") {
         const msg = outcome.message || `${job.provider ?? "provider"} task failed`;
+        const failure = classifyProviderError(msg);
+        if (failure.fast_fallback) {
+          const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+            supabase: args.supabase,
+            job,
+            workerId: args.workerId,
+            error: msg,
+            trigger: "fast_fallback",
+          });
+          if (fallbackRoute) {
+            return { job_id: job.id, status: "running", detail: `fallback_${fallbackRoute.provider}` };
+          }
+        }
+        if (!failure.permanent && currentAttempts < maxAttempts) {
+          await scheduleWorkspaceJobProviderResubmit({
+            supabase: args.supabase,
+            job,
+            workerId: args.workerId,
+            message: msg,
+            delaySeconds: workspaceJobBackoffSeconds(currentAttempts + 1, job.provider),
+          });
+          return { job_id: job.id, status: "running", detail: "provider_resubmit" };
+        }
+        if (!failure.permanent) {
+          const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+            supabase: args.supabase,
+            job,
+            workerId: args.workerId,
+            error: msg,
+            trigger: "async_failed",
+          });
+          if (fallbackRoute) {
+            return { job_id: job.id, status: "running", detail: `fallback_${fallbackRoute.provider}` };
+          }
+        }
         await failWorkspaceJob({
           supabase: args.supabase,
           job,
@@ -7360,6 +8032,18 @@ async function processWorkspaceGenerationJobTick(args: {
       return { job_id: job.id, status: "running", detail: "provider_pending" };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (shouldFastFallbackProviderError(msg)) {
+        const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+          supabase: args.supabase,
+          job,
+          workerId: args.workerId,
+          error: msg,
+          trigger: "fast_fallback",
+        });
+        if (fallbackRoute) {
+          return { job_id: job.id, status: "running", detail: `fallback_${fallbackRoute.provider}` };
+        }
+      }
       const permanent = isPermanentWorkspaceJobError(msg);
       if (permanent) {
         await failWorkspaceJob({
@@ -7439,6 +8123,18 @@ async function processWorkspaceGenerationJobTick(args: {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const permanent = isPermanentWorkspaceJobError(msg);
+    if (shouldFastFallbackProviderError(msg)) {
+      const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+        supabase: args.supabase,
+        job: { ...job, attempts: attempt, last_error: msg },
+        workerId: args.workerId,
+        error: msg,
+        trigger: "fast_fallback",
+      });
+      if (fallbackRoute) {
+        return { job_id: job.id, status: "running", detail: `fallback_${fallbackRoute.provider}` };
+      }
+    }
     if (permanent) {
       await failWorkspaceJob({
         supabase: args.supabase,
@@ -7453,6 +8149,16 @@ async function processWorkspaceGenerationJobTick(args: {
       const finalMsg =
         `${workspaceJobProviderLabel(job)} could not finish after ${maxAttempts} attempts. ` +
         `Last provider error: ${msg}`;
+      const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+        supabase: args.supabase,
+        job: { ...job, attempts: attempt, last_error: msg },
+        workerId: args.workerId,
+        error: finalMsg,
+        trigger: "attempts_exhausted",
+      });
+      if (fallbackRoute) {
+        return { job_id: job.id, status: "running", detail: `fallback_${fallbackRoute.provider}` };
+      }
       await failWorkspaceJob({
         supabase: args.supabase,
         job: { ...job, attempts: attempt, last_error: msg },
@@ -7503,6 +8209,18 @@ async function expireWorkspaceGenerationJobs(args: {
   for (const job of jobs) {
     const msg = `Provider queue was busy for ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes. Generation timed out and credits were refunded.`;
     try {
+      const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+        supabase: args.supabase,
+        job,
+        error: msg,
+        trigger: "deadline",
+      });
+      if (fallbackRoute) {
+        console.warn(
+          `[workspace-job-worker] expired job=${job.id} advanced to fallback provider=${fallbackRoute.provider}`,
+        );
+        continue;
+      }
       await failWorkspaceJob({
         supabase: args.supabase,
         job,
@@ -7678,6 +8396,15 @@ async function processWorkspaceGenerationJob(args: {
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
       const permanent = isPermanentWorkspaceJobError(lastError);
+      if (shouldFastFallbackProviderError(lastError)) {
+        const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+          supabase: args.supabase,
+          job: { ...job, attempts: attempt, last_error: lastError },
+          error: lastError,
+          trigger: "fast_fallback",
+        });
+        if (fallbackRoute) return;
+      }
       await args.supabase
         .from("workspace_generation_jobs")
         .update({
@@ -7719,6 +8446,16 @@ async function processWorkspaceGenerationJob(args: {
       await sleep(backoff);
     }
   }
+
+  const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+    supabase: args.supabase,
+    job: { ...job, attempts: attempt, last_error: lastError },
+    error:
+      lastError ||
+      `Generation timed out after ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes`,
+    trigger: "attempts_exhausted",
+  });
+  if (fallbackRoute) return;
 
   await args.supabase
     .from("workspace_generation_jobs")
@@ -7857,6 +8594,7 @@ serve(async (req) => {
     const body = (await req.json()) as WorkspaceRunBody;
     activeBody = body;
     const workerSecret = await verifyWorkspaceWorkerSecret(supabase, req);
+    const workerUserId = req.headers.get("x-workspace-worker-user-id") ?? "";
 
     if (body.action === "run_workspace_job_worker") {
       if (!workerSecret) {
@@ -7879,7 +8617,6 @@ serve(async (req) => {
     }
 
     let user: { id: string; email?: string | null } | null = null;
-    const workerUserId = req.headers.get("x-workspace-worker-user-id") ?? "";
     if (workerSecret && workerUserId) {
       user = await loadWorkspaceWorkerUser(supabase, workerUserId);
       authHeader = authHeader || `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`;
@@ -7901,6 +8638,15 @@ serve(async (req) => {
       );
     }
     activeUserId = user.id;
+    const isInternalWorkerReplay = Boolean(workerSecret && workerUserId);
+    if (!isInternalWorkerReplay) {
+      delete body.skip_credit_charge;
+      delete body.precharged_credits;
+      delete body.credit_scope;
+      delete body.credit_organization_id;
+      delete body.credit_class_id;
+      delete body.provider_fallback;
+    }
 
     /* ─── Parse body ───────────────────────────────────────── */
     if (body.action === "delete_workspace_asset") {
@@ -8131,13 +8877,21 @@ serve(async (req) => {
         Date.now() >= workspaceJobDeadlineMs(job)
       ) {
         const msg = `Provider queue was busy for ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes. Generation timed out and credits were refunded.`;
-        await failWorkspaceJob({
+        const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
           supabase,
           job,
-          status: "failed",
           error: msg,
-          refundReason: `workspace job timed out after ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes`,
+          trigger: "deadline",
         });
+        if (!fallbackRoute) {
+          await failWorkspaceJob({
+            supabase,
+            job,
+            status: "failed",
+            error: msg,
+            refundReason: `workspace job timed out after ${Math.round(WORKSPACE_JOB_MAX_MS / 60_000)} minutes`,
+          });
+        }
         job = await loadJob();
         if (!job) {
           return new Response(
@@ -8184,13 +8938,49 @@ serve(async (req) => {
           });
         } else if (outcome.state === "failed") {
           const msg = outcome.message;
-          await failWorkspaceJob({
-            supabase,
-            job,
-            status: "failed",
-            error: msg,
-            refundReason: `workspace async task failed: ${msg.substring(0, 160)}`,
-          });
+          const failure = classifyProviderError(msg);
+          let handedOff = false;
+          if (failure.fast_fallback) {
+            const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+              supabase,
+              job,
+              error: msg,
+              trigger: "fast_fallback",
+            });
+            handedOff = Boolean(fallbackRoute);
+          }
+          if (!handedOff && !failure.permanent) {
+            if (Number(job.attempts ?? 0) < Math.max(1, Number(job.max_attempts ?? TOTAL_MAX_RETRIES) || TOTAL_MAX_RETRIES)) {
+              await supabase
+                .from("workspace_generation_jobs")
+                .update({
+                  status: "running",
+                  result: null,
+                  error: null,
+                  last_error: msg.substring(0, 1000),
+                  run_after: new Date().toISOString(),
+                })
+                .eq("id", job.id);
+              handedOff = true;
+            } else {
+              const fallbackRoute = await advanceWorkspaceJobFallbackRoute({
+                supabase,
+                job,
+                error: msg,
+                trigger: "async_failed",
+              });
+              handedOff = Boolean(fallbackRoute);
+            }
+          }
+          if (!handedOff) {
+            await failWorkspaceJob({
+              supabase,
+              job,
+              status: failure.permanent ? "permanent_failed" : "failed",
+              error: msg,
+              refundReason: `workspace async task failed: ${msg.substring(0, 160)}`,
+            });
+          }
         } else if (outcome.state === "pending") {
           await supabase
             .from("workspace_generation_jobs")
@@ -8246,6 +9036,12 @@ serve(async (req) => {
       // Tier-2 follow-ups list.
 
       const { action: _action, job_id: _jobId, ...runRequest } = body;
+      const normalizedReplicateModel = normalizeDirectReplicateModelForPrimary(runRequest);
+      if (normalizedReplicateModel) {
+        console.warn(
+          `[workspace-job] direct Replicate model normalized to primary model=${normalizedReplicateModel}`,
+        );
+      }
       const provider = getProviderForNodeType(
         nodeType,
         runRequest.params?.model_name as string | undefined,
@@ -8733,11 +9529,16 @@ serve(async (req) => {
      * exhausted. Magnific returns { data: { status, generated[] } }; on
      * terminal success we mirror the provider URL into Supabase storage so
      * the browser sees the same signed-URL shape as direct Veo. */
-    if (body.action === "poll_replicate_veo" || body.action === "poll_replicate_video") {
+    if (body.action === "poll_replicate_veo" || body.action === "poll_replicate_video" || body.action === "poll_replicate_image") {
       const taskId = String(body.task_id ?? "").trim();
       const pollEndpoint = String(body.poll_endpoint ?? "").trim();
       const isReplicateVeoPoll = body.action === "poll_replicate_veo";
-      const replicateLabel = isReplicateVeoPoll ? "Replicate Veo" : "Replicate video";
+      const isReplicateImagePoll = body.action === "poll_replicate_image";
+      const replicateLabel = isReplicateImagePoll
+        ? "Replicate image"
+        : isReplicateVeoPoll
+          ? "Replicate Veo"
+          : "Replicate video";
       if (!taskId || !pollEndpoint) {
         return new Response(
           JSON.stringify({ error: "task_id and poll_endpoint required for Replicate polling" }),
@@ -8799,9 +9600,9 @@ serve(async (req) => {
       }
 
       const rawStatus = String(payload.status ?? "").toLowerCase();
-      const providerVideoUrl = extractReplicateOutputUrl(payload.output);
+      const providerOutputUrl = extractReplicateOutputUrl(payload.output);
       const normalised =
-        rawStatus === "succeeded" || providerVideoUrl
+        rawStatus === "succeeded" || providerOutputUrl
           ? "succeed"
           : rawStatus === "failed" || rawStatus === "canceled" || rawStatus === "cancelled"
             ? "failed"
@@ -8809,24 +9610,36 @@ serve(async (req) => {
       const errorMessage = String(payload.error ?? "");
 
       let publicUrl = "";
-      if (normalised === "succeed" && providerVideoUrl) {
+      if (normalised === "succeed" && providerOutputUrl) {
         try {
-          const videoRes = await fetch(providerVideoUrl);
-          if (!videoRes.ok) {
-            throw new Error(`download HTTP ${videoRes.status}`);
+          const outputRes = await fetch(providerOutputUrl);
+          if (!outputRes.ok) {
+            throw new Error(`download HTTP ${outputRes.status}`);
           }
-          const bytes = new Uint8Array(await videoRes.arrayBuffer());
-          const contentType = videoRes.headers.get("content-type")?.split(";")[0]?.trim() || "video/mp4";
+          const bytes = new Uint8Array(await outputRes.arrayBuffer());
+          const contentType = outputRes.headers.get("content-type")?.split(";")[0]?.trim() ||
+            (isReplicateImagePoll ? "image/png" : "video/mp4");
           const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
-          const folder = isReplicateVeoPoll ? "veo-renders" : "replicate-video-renders";
-          const path = `${user.id}/${folder}/replicate_${safeTaskId}.mp4`;
+          const ext =
+            contentType.includes("webp") ? "webp" :
+            contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" :
+            contentType.includes("png") ? "png" :
+            contentType.includes("gif") ? "gif" :
+            "mp4";
+          const bucket = isReplicateImagePoll ? "ai-media" : "user_assets";
+          const folder = isReplicateImagePoll
+            ? "pipeline"
+            : isReplicateVeoPoll
+              ? `${user.id}/veo-renders`
+              : `${user.id}/replicate-video-renders`;
+          const path = `${folder}/replicate_${safeTaskId}.${ext}`;
           const upload = await supabase.storage
-            .from("user_assets")
+            .from(bucket)
             .upload(path, bytes, { contentType, upsert: true });
           if (upload.error) throw upload.error;
           const signed = await supabase.storage
-            .from("user_assets")
-            .createSignedUrl(path, 60 * 60 * 24 * 365);
+            .from(bucket)
+            .createSignedUrl(path, isReplicateImagePoll ? 60 * 60 * 24 * 7 : 60 * 60 * 24 * 365);
           if (signed.error || !signed.data?.signedUrl) {
             throw signed.error ?? new Error("no signed URL");
           }
@@ -8838,7 +9651,7 @@ serve(async (req) => {
               status: "failed",
               task_id: taskId,
               url: "",
-              message: `${replicateLabel} finished but the video couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
+              message: `${replicateLabel} finished but the output couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
             }),
             { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
           );
@@ -9588,6 +10401,13 @@ serve(async (req) => {
       );
     }
 
+    const normalizedReplicateModel = normalizeDirectReplicateModelForPrimary(body);
+    if (normalizedReplicateModel) {
+      console.warn(
+        `[workspace-run] direct Replicate model normalized to primary model=${normalizedReplicateModel}`,
+      );
+    }
+
     const nodeType = String(body.node_type ?? "");
     const rawParams = body.params ?? {};
     const inputs = body.inputs ?? {};
@@ -9746,7 +10566,7 @@ serve(async (req) => {
       )
       .map((m) => m.url as string);
     if (provider !== "kling" && (mentionImageUrls.length > 0 || edgeImageUrls.length > 0)) {
-      if (provider === "banana" || provider === "openai") {
+      if (provider === "banana" || provider === "openai" || provider === "replicate_image") {
         const merged = Array.from(new Set([
           ...((params.mention_image_urls as string[] | undefined) ?? []),
           ...mentionImageUrls,
@@ -9852,6 +10672,9 @@ serve(async (req) => {
       case "openai":
         result = await executeOpenAIImage2(params, supabase);
         break;
+      case "replicate_image":
+        result = await executeReplicateImage(params);
+        break;
       case "video_understanding":
         result = await executeVideoToPrompt(params);
         break;
@@ -9886,6 +10709,9 @@ serve(async (req) => {
         break;
       case "replicate_video":
         result = await executeReplicateVideo(params);
+        break;
+      case "replicate_veo":
+        result = await executeReplicateVeo(params);
         break;
       case "veo":
         result = await executeVeo(params, supabase);

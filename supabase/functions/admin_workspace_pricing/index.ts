@@ -65,7 +65,7 @@ const USD_TO_THB = 35;
 const FLOW_CREDITS_PER_THB = 125;
 const WORKSPACE_CREDITS_PER_THB = 50;
 const FLOW_TO_WORKSPACE_RATIO = WORKSPACE_CREDITS_PER_THB / FLOW_CREDITS_PER_THB;
-const REPLICATE_PRICE_FACTOR = 0.9;
+const REPLICATE_PRICE_FACTOR = 1;
 type CreditCostWriteRow = {
   feature: string;
   model: string | null;
@@ -143,11 +143,11 @@ const GPT_IMAGE_2_ROWS: CreditCostWriteRow[] = ([
     price_key: `gpt-image-2:${tier}:${quality}`,
     resolution: tier.toUpperCase(),
     quality,
-    source: "replicate_docs_minus_10_percent",
+    source: "replicate_docs",
     source_url: "https://replicate.com/openai/gpt-image-2",
     source_ratio: REPLICATE_PRICE_FACTOR,
     provider_unit: "per image",
-    notes: `Replicate openai/gpt-image-2 ${quality} is $${GPT_IMAGE_2_REPLICATE_USD[quality]}/image. Workspace charges 90% of that Replicate price, converted at ${USD_TO_THB} THB/USD and ${WORKSPACE_CREDITS_PER_THB} credits/THB. Resolution tier ${width}x${height} is retained for runtime matching; Replicate bills this model by quality, not resolution.`,
+    notes: `Replicate openai/gpt-image-2 ${quality} is $${GPT_IMAGE_2_REPLICATE_USD[quality]}/image, converted at ${USD_TO_THB} THB/USD and ${WORKSPACE_CREDITS_PER_THB} credits/THB. Resolution tier ${width}x${height} is retained for runtime matching; Replicate bills this model by quality, not resolution.`,
   }))
 );
 
@@ -190,6 +190,30 @@ const NANO_BANANA_FALLBACK_ROWS: CreditCostWriteRow[] = [
   notes: "Runtime fallback row when the image node does not pass an explicit resolution.",
 }));
 
+const REPLICATE_BANANA_ROWS: CreditCostWriteRow[] = [
+  { model: "replicate-nano-banana-2", label: "Nano Banana 2 (Replicate)", usd: 0.039, resolution: null, sourceUrl: "https://replicate.com/google/nano-banana" },
+  { model: "replicate-nano-banana-2:1k", label: "Nano Banana 2 (Replicate) legacy 1K", usd: 0.039, resolution: "1K", sourceUrl: "https://replicate.com/google/nano-banana" },
+  { model: "replicate-nano-banana-2:2k", label: "Nano Banana 2 (Replicate) legacy 2K", usd: 0.039, resolution: "2K", sourceUrl: "https://replicate.com/google/nano-banana" },
+  { model: "replicate-nano-banana-pro", label: "Nano Banana Pro (Replicate) fallback", usd: 0.15, resolution: "2K", sourceUrl: "https://replicate.com/google/nano-banana-pro" },
+  { model: "replicate-nano-banana-pro:1k", label: "Nano Banana Pro (Replicate) 1K", usd: 0.15, resolution: "1K", sourceUrl: "https://replicate.com/google/nano-banana-pro" },
+  { model: "replicate-nano-banana-pro:2k", label: "Nano Banana Pro (Replicate) 2K", usd: 0.15, resolution: "2K", sourceUrl: "https://replicate.com/google/nano-banana-pro" },
+  { model: "replicate-nano-banana-pro:4k", label: "Nano Banana Pro (Replicate) 4K", usd: 0.30, resolution: "4K", sourceUrl: "https://replicate.com/google/nano-banana-pro" },
+].map((row) => ({
+  feature: "generate_freepik_image",
+  model: row.model,
+  label: row.label,
+  cost: creditsFromReplicateUsd(row.usd),
+  pricing_type: "per_operation",
+  provider: "replicate",
+  price_key: row.model,
+  resolution: row.resolution,
+  source: "replicate_docs",
+  source_url: row.sourceUrl,
+  source_ratio: REPLICATE_PRICE_FACTOR,
+  provider_unit: "per image",
+  notes: `Replicate ${row.model.startsWith("replicate-nano-banana-pro") ? "google/nano-banana-pro" : "google/nano-banana"} costs $${row.usd}/image.`,
+}));
+
 const KLING_ROWS: CreditCostWriteRow[] = [
   { model: "kling-v2-6-pro", label: "Kling 2.6 Pro", cost: creditsFromThb(10), audio: false, source: "flow_erp_converted", notes: "Existing Flow ERP cost is 10 THB/second. Converted from 125 credits/THB to Workspace 50 credits/THB." },
   { model: "kling-v2-6-pro", label: "Kling 2.6 Pro + audio", cost: creditsFromThb(20), audio: true, source: "flow_erp_converted", notes: "Audio SKU uses the existing Flow convention of 2x video-only cost, converted to Workspace ratio." },
@@ -218,6 +242,52 @@ const KLING_ROWS: CreditCostWriteRow[] = [
     notes: row.notes,
 }));
 
+const KLING_REPLICATE_PARITY_ROWS: CreditCostWriteRow[] = [
+  { model: "kling-v3-pro:720p", label: "Kling 3 Pro 720p", usd: 0.168, audio: false, provider: "kling", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-video" },
+  { model: "kling-v3-pro:720p", label: "Kling 3 Pro 720p + audio", usd: 0.252, audio: true, provider: "kling", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-video" },
+  { model: "kling-v3-pro:1080p", label: "Kling 3 Pro 1080p", usd: 0.224, audio: false, provider: "kling", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-video" },
+  { model: "kling-v3-pro:1080p", label: "Kling 3 Pro 1080p + audio", usd: 0.336, audio: true, provider: "kling", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-video" },
+  { model: "kling-v3-omni:720p", label: "Kling 3 Omni 720p", usd: 0.168, audio: false, provider: "kling", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-omni-video" },
+  { model: "kling-v3-omni:720p", label: "Kling 3 Omni 720p + audio", usd: 0.224, audio: true, provider: "kling", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-omni-video" },
+  { model: "kling-v3-omni:1080p", label: "Kling 3 Omni 1080p", usd: 0.224, audio: false, provider: "kling", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-omni-video" },
+  { model: "kling-v3-omni:1080p", label: "Kling 3 Omni 1080p + audio", usd: 0.28, audio: true, provider: "kling", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-omni-video" },
+  { model: "kling-v3-motion-pro:720p", label: "Kling 3 Motion 720p", usd: 0.07, audio: false, provider: "kling", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-motion-control" },
+  { model: "kling-v3-motion-pro:1080p", label: "Kling 3 Motion 1080p", usd: 0.12, audio: false, provider: "kling", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-motion-control" },
+  { model: "replicate-kling-v3-pro:standard", label: "Kling 3 Pro Replicate 720p", usd: 0.168, audio: false, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-video" },
+  { model: "replicate-kling-v3-pro:standard", label: "Kling 3 Pro Replicate 720p + audio", usd: 0.252, audio: true, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-video" },
+  { model: "replicate-kling-v3-pro:pro", label: "Kling 3 Pro Replicate 1080p", usd: 0.224, audio: false, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-video" },
+  { model: "replicate-kling-v3-pro:pro", label: "Kling 3 Pro Replicate 1080p + audio", usd: 0.336, audio: true, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-video" },
+  { model: "replicate-kling-v3-pro:4k", label: "Kling 3 Pro Replicate 4K", usd: 0.42, audio: false, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-video" },
+  { model: "replicate-kling-v3-pro:4k", label: "Kling 3 Pro Replicate 4K + audio", usd: 0.42, audio: true, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-video" },
+  { model: "replicate-kling-v3-omni:standard", label: "Kling 3 Omni Replicate 720p", usd: 0.168, audio: false, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-omni-video" },
+  { model: "replicate-kling-v3-omni:standard", label: "Kling 3 Omni Replicate 720p + audio", usd: 0.224, audio: true, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-omni-video" },
+  { model: "replicate-kling-v3-omni:pro", label: "Kling 3 Omni Replicate 1080p", usd: 0.224, audio: false, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-omni-video" },
+  { model: "replicate-kling-v3-omni:pro", label: "Kling 3 Omni Replicate 1080p + audio", usd: 0.28, audio: true, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-omni-video" },
+  { model: "replicate-kling-v3-omni:4k", label: "Kling 3 Omni Replicate 4K", usd: 0.42, audio: false, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-omni-video" },
+  { model: "replicate-kling-v3-omni:4k", label: "Kling 3 Omni Replicate 4K + audio", usd: 0.42, audio: true, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-omni-video" },
+  { model: "replicate-kling-v3-motion-pro:std", label: "Kling 3 Motion Replicate 720p", usd: 0.07, audio: false, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-motion-control" },
+  { model: "replicate-kling-v3-motion-pro:pro", label: "Kling 3 Motion Replicate 1080p", usd: 0.12, audio: false, provider: "replicate", sourceUrl: "https://replicate.com/kwaivgi/kling-v3-motion-control" },
+].map((row) => ({
+  feature: "generate_freepik_video",
+  model: row.model,
+  label: row.label,
+  cost: creditsFromReplicateUsd(row.usd),
+  pricing_type: "per_second",
+  has_audio: row.audio,
+  provider: row.provider,
+  price_key: `${row.model}:${row.audio ? "audio" : "video"}`,
+  resolution: row.model.endsWith(":4k")
+    ? "4K"
+    : row.model.endsWith(":standard") || row.model.endsWith(":std") || row.model.endsWith(":720p")
+      ? "720p"
+      : "1080p",
+  source: "replicate_docs",
+  source_url: row.sourceUrl,
+  source_ratio: REPLICATE_PRICE_FACTOR,
+  provider_unit: "per second",
+  notes: `${row.label} uses Replicate parity pricing at $${row.usd}/sec.`,
+}));
+
 const SEEDANCE_ROWS: CreditCostWriteRow[] = [
   { model: "seedance-1-0-pro-250528", label: "Seedance 1.0 Pro 720p", cost: 90, resolution: "720p", audio: false, notes: "Master Pricing Sheet: 720p approx 90 credits/sec." },
   { model: "seedance-1-0-pro-250528", label: "Seedance 1.0 Pro 1080p", cost: 200, resolution: "1080p", audio: false, notes: "Master Pricing Sheet: 1080p approx 200 credits/sec." },
@@ -231,15 +301,15 @@ const SEEDANCE_ROWS: CreditCostWriteRow[] = [
   { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro 1080p + audio", cost: 200, resolution: "1080p", audio: true, notes: "Master Pricing Sheet: 1080p with audio approx 200 credits/sec." },
   { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro fallback", cost: 100, resolution: null, audio: false, notes: "Fallback when runtime receives no resolution; uses no-audio base rate." },
   { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro + audio fallback", cost: 200, resolution: null, audio: true, notes: "Fallback when runtime receives audio without a resolution split." },
-  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast 480p", cost: creditsFromReplicateUsd(0.08), resolution: "480p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 480p costs $0.08/sec; Workspace charges 90% of the Replicate price." },
-  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast 720p", cost: creditsFromReplicateUsd(0.18), resolution: "720p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 720p costs $0.18/sec; Workspace charges 90% of the Replicate price." },
-  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast fallback", cost: creditsFromReplicateUsd(0.18), resolution: null, audio: false, replicate: true, notes: "Fallback when runtime receives no resolution; uses discounted Replicate 720p non-video-input rate." },
-  { model: "dreamina-seedance-2-0-fast-260128", label: "Seedance 2.0 Fast direct-id fallback", cost: creditsFromReplicateUsd(0.18), resolution: null, audio: false, replicate: true, notes: "Direct BytePlus model id alias for Seedance 2.0 Fast; uses discounted Replicate 720p non-video-input rate." },
-  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 480p", cost: creditsFromReplicateUsd(0.08), resolution: "480p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 480p costs $0.08/sec; Workspace charges 90% of the Replicate price." },
-  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 720p", cost: creditsFromReplicateUsd(0.18), resolution: "720p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 720p costs $0.18/sec; Workspace charges 90% of the Replicate price." },
-  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 1080p", cost: creditsFromReplicateUsd(0.45), resolution: "1080p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 1080p costs $0.45/sec; Workspace charges 90% of the Replicate price." },
-  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro fallback", cost: creditsFromReplicateUsd(0.18), resolution: null, audio: false, replicate: true, notes: "Fallback when runtime receives no resolution; uses discounted Replicate 720p non-video-input rate." },
-  { model: "dreamina-seedance-2-0-260128", label: "Seedance 2.0 Pro direct-id fallback", cost: creditsFromReplicateUsd(0.18), resolution: null, audio: false, replicate: true, notes: "Direct BytePlus model id alias for Seedance 2.0 Pro; uses discounted Replicate 720p non-video-input rate." },
+  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast 480p", cost: creditsFromReplicateUsd(0.08), resolution: "480p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 480p costs $0.08/sec; Workspace uses the Replicate price." },
+  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast 720p", cost: creditsFromReplicateUsd(0.18), resolution: "720p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 720p costs $0.18/sec; Workspace uses the Replicate price." },
+  { model: "seedance-2-0-lite", label: "Seedance 2.0 Fast fallback", cost: creditsFromReplicateUsd(0.18), resolution: null, audio: false, replicate: true, notes: "Fallback when runtime receives no resolution; uses the Replicate 720p non-video-input rate." },
+  { model: "dreamina-seedance-2-0-fast-260128", label: "Seedance 2.0 Fast direct-id fallback", cost: creditsFromReplicateUsd(0.18), resolution: null, audio: false, replicate: true, notes: "Direct BytePlus model id alias for Seedance 2.0 Fast; uses the Replicate 720p non-video-input rate." },
+  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 480p", cost: creditsFromReplicateUsd(0.08), resolution: "480p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 480p costs $0.08/sec; Workspace uses the Replicate price." },
+  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 720p", cost: creditsFromReplicateUsd(0.18), resolution: "720p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 720p costs $0.18/sec; Workspace uses the Replicate price." },
+  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro 1080p", cost: creditsFromReplicateUsd(0.45), resolution: "1080p", audio: false, replicate: true, notes: "Replicate bytedance/seedance-2.0 non-video input 1080p costs $0.45/sec; Workspace uses the Replicate price." },
+  { model: "seedance-2-0-pro", label: "Seedance 2.0 Pro fallback", cost: creditsFromReplicateUsd(0.18), resolution: null, audio: false, replicate: true, notes: "Fallback when runtime receives no resolution; uses the Replicate 720p non-video-input rate." },
+  { model: "dreamina-seedance-2-0-260128", label: "Seedance 2.0 Pro direct-id fallback", cost: creditsFromReplicateUsd(0.18), resolution: null, audio: false, replicate: true, notes: "Direct BytePlus model id alias for Seedance 2.0 Pro; uses the Replicate 720p non-video-input rate." },
 ].map((row) => ({
   feature: "generate_freepik_video",
   model: row.resolution ? `${row.model}:${row.resolution}` : row.model,
@@ -250,7 +320,7 @@ const SEEDANCE_ROWS: CreditCostWriteRow[] = [
   provider: "seedance",
   price_key: `${row.model}:${row.resolution ?? "default"}:${row.audio ? "audio" : "video"}`,
   resolution: row.resolution,
-  source: row.replicate ? "replicate_docs_minus_10_percent" : "master_pricing_sheet",
+  source: row.replicate ? "replicate_docs" : "master_pricing_sheet",
   source_url: row.replicate ? "https://replicate.com/bytedance/seedance-2.0" : null,
   source_ratio: row.replicate ? REPLICATE_PRICE_FACTOR : null,
   provider_unit: "per second",
@@ -277,11 +347,11 @@ const REPLICATE_SEEDANCE_2_ROWS: CreditCostWriteRow[] = ([
     provider: "replicate",
     price_key: `${row.model}:${row.resolution ?? "default"}:${row.videoInput ? "video_in" : "non_video_in"}:${audio ? "audio" : "silent"}`,
     resolution: row.resolution,
-    source: "replicate_docs_minus_10_percent",
+    source: "replicate_docs",
     source_url: "https://replicate.com/bytedance/seedance-2.0",
     source_ratio: REPLICATE_PRICE_FACTOR,
     provider_unit: "per second",
-    notes: `Replicate bytedance/seedance-2.0 ${row.videoInput ? "video input" : "non-video input"} ${row.resolution ?? "default 720p"} costs $${row.usdPerSecond}/sec. Workspace charges 90% of the Replicate price; audio toggle does not change Replicate pricing, duplicate audio rows keep runtime cost lookup strict.`,
+    notes: `Replicate bytedance/seedance-2.0 ${row.videoInput ? "video input" : "non-video input"} ${row.resolution ?? "default 720p"} costs $${row.usdPerSecond}/sec. Workspace uses the Replicate price; audio toggle does not change Replicate pricing, duplicate audio rows keep runtime cost lookup strict.`,
   }))
 );
 
@@ -358,7 +428,9 @@ const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   ...GPT_IMAGE_2_ROWS,
   ...NANO_BANANA_ROWS,
   ...NANO_BANANA_FALLBACK_ROWS,
+  ...REPLICATE_BANANA_ROWS,
   ...KLING_ROWS,
+  ...KLING_REPLICATE_PARITY_ROWS,
   ...SEEDANCE_ROWS,
   ...REPLICATE_SEEDANCE_2_ROWS,
   ...VEO_ROWS,
