@@ -434,7 +434,10 @@ async function executeKlingStandard(
     resolvedAspect = rawAspect;
   }
 
-  const initialMode = String((params.mode as string) ?? mapping.mode).toLowerCase() === "std" ? "std" : "pro";
+  // Honour only the mapping default — every Kling slug in this map is
+  // `pro`, and reading `params.mode` from the canvas was a silent
+  // downgrade path on legacy nodes whose UI still exposed a std toggle.
+  const initialMode = String(mapping.mode).toLowerCase() === "std" ? "std" : "pro";
 
   const body: Record<string, unknown> = {
     model_name: mapping.model,

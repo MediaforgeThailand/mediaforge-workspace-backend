@@ -389,11 +389,18 @@ function findClosestAspectRatio(width: number, height: number): string {
 function formatKlingApiError(label: string, status: number, errText: string): string {
   try {
     const parsed = JSON.parse(errText) as { code?: number; message?: string };
-    if (parsed?.code === 1201 && typeof parsed.message === "string") {
-      return `${label}: ${parsed.message}. The Kling API limits prompts to 2500 characters — please shorten your prompt and try again.`;
-    }
     if (typeof parsed?.message === "string" && parsed.message) {
-      return `${label} (HTTP ${status}): ${parsed.message}`;
+      const base = `${label} (HTTP ${status}): ${parsed.message}`;
+      // Code 1201 is Kling's generic "request parameter error" — it covers
+      // mode/model mismatches, missing fields, and prompt-length issues
+      // alike. Only append the prompt-shortening hint when the message
+      // actually looks length-related; otherwise it misleads users with
+      // 100-character prompts who hit a different parameter problem.
+      const looksLengthRelated = /character|length|too long|exceed|2500/i.test(parsed.message);
+      if (parsed.code === 1201 && looksLengthRelated) {
+        return `${base} (Kling caps prompts at 2500 characters — try shortening.)`;
+      }
+      return base;
     }
   } catch {
     // not JSON — fall through to the raw substring fallback
@@ -711,14 +718,18 @@ async function executeKling(
 }
 
 function normalizeDirectKlingMode(
-  params: Record<string, unknown>,
+  _params: Record<string, unknown>,
   fallbackMode: string,
 ): "std" | "pro" {
-  const raw = String(
-    params.mode ?? params.quality_mode ?? params.resolution ?? fallbackMode,
-  ).toLowerCase();
-  if (raw === "std" || raw === "standard" || raw === "720p") return "std";
-  return "pro";
+  // The function used to read `params.mode` / `quality_mode` / `resolution`
+  // from the caller, but every workspace-app entry point already encodes
+  // the correct mode in the slug → KLING_MODEL_MAP mapping (every current
+  // entry is `pro`), and the param channels were a silent downgrade path:
+  // a stale `resolution: "720p"` left on the canvas after switching from
+  // Seedance turned a Pro selection into Standard, then Kling rejected
+  // image_tail with a confusing 1201. Honour only the mapping default.
+  const raw = String(fallbackMode).toLowerCase();
+  return raw === "std" || raw === "standard" ? "std" : "pro";
 }
 
 /**
@@ -1020,6 +1031,16 @@ async function executeKlingStandard(
   }
 
   const initialMode = normalizeDirectKlingMode(params, mapping.mode);
+  // image_tail (end-frame) is only valid in pro mode on Kling v2.6+. The
+  // mode normalizer above already forces pro when a tail is present, so
+  // landing on std here means the mapping itself was std (no current
+  // KLING_MODEL_MAP entry maps to std, but guard anyway). Fail fast with
+  // a clear message — letting Kling reject loses the user the wait time.
+  if (rawTailUrl && initialMode !== "pro") {
+    throw new Error(
+      "Validation: End frame requires Kling Pro mode — pick a Pro model variant or remove the end frame.",
+    );
+  }
   let durationValue = parseInt(String(params.duration ?? 5), 10) || 5;
   if (mapping.model === "kling-v3") {
     durationValue = Math.max(3, Math.min(durationValue, 15));
@@ -7335,6 +7356,10 @@ function isPermanentWorkspaceJobError(err: unknown): boolean {
     /HTTP (?:400|401|403|404|422)\b/i.test(msg) ||
     /Veo: failed to fetch start\/end frame \((?:400|401|403|404|410)\)/i.test(msg) ||
     /(prompt|input|argument).*required|Validation/i.test(msg) ||
+    // Kling parameter errors (mode/model mismatch, unsupported feature
+    // combinations, etc.) are deterministic — retrying just re-burns
+    // wall-clock and leaves the job stuck in "running".
+    /Kling.*API error.*(?:not supported|is not supported|model\/mode)/i.test(msg) ||
     /Seedance reference video is invalid|reference videos?.*(?:must|duration|invalid)|video duration.*(?:must|invalid|exceed)|total reference video duration|total duration of all videos/i.test(msg)
   );
 }
