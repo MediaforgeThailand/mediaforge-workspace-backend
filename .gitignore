@@ -18,6 +18,10 @@ Thumbs.db
 # Node (edge function deps)
 node_modules
 
+# Stray Deno lockfile created when running `deno test` from repo root.
+# Canonical lockfile lives in supabase/functions/deno.lock.
+/deno.lock
+
 # Credentials
 SUPABASE_CREDENTIALS.md
 

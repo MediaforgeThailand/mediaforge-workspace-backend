@@ -89,7 +89,11 @@ Deno.test("run-flow-status: invalid token returns 401", async () => {
   assertEquals(hasError, true, "Response should contain an error/msg field");
 });
 
-Deno.test("run-flow-status: non-existent run_id returns 404", async () => {
+// LEGACY (skipped): the four tests below need a real test user
+// (`test-runner@test.local`) and live banana flow runs against the legacy
+// run-flow-init function. Workspace product doesn't use this code path —
+// see the LEGACY block in run-flow-init/index.test.ts for revival steps.
+Deno.test.ignore("run-flow-status: non-existent run_id returns 404", async () => {
   const token = await getTestUserToken();
   const res = await fetch(FUNCTION_URL, {
     method: "POST",
@@ -118,7 +122,7 @@ Deno.test("run-flow-status: error messages never leak credentials", async () => 
 // Banana Background Execution — Polling via DB
 // ═══════════════════════════════════════════════════════════
 
-Deno.test("run-flow-status: polling banana background task returns processing while task runs", async () => {
+Deno.test.ignore("run-flow-status: polling banana background task returns processing while task runs", async () => {
   const token = await getTestUserToken();
   const flowId = await getTestFlowId(token);
 
@@ -175,7 +179,7 @@ Deno.test("run-flow-status: polling banana background task returns processing wh
   }
 });
 
-Deno.test("run-flow-status: completed banana run returns succeed with result_url", async () => {
+Deno.test.ignore("run-flow-status: completed banana run returns succeed with result_url", async () => {
   const token = await getTestUserToken();
 
   // Manually insert a completed flow_run to simulate background task completion
@@ -231,7 +235,7 @@ Deno.test("run-flow-status: completed banana run returns succeed with result_url
   assertEquals(pollData.output_type, "image_url");
 });
 
-Deno.test("run-flow-status: failed_refunded banana run returns failure with refunded flag", async () => {
+Deno.test.ignore("run-flow-status: failed_refunded banana run returns failure with refunded flag", async () => {
   const token = await getTestUserToken();
   const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const userId = "b64059e0-bfad-4001-8fda-bbe1ec377ccd";

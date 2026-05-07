@@ -76,53 +76,49 @@ RETURNING
 ROLLBACK;
 
 -- ─────────────────────────────────────────────────────────────
--- TEST 4: NULL api_cost → all 3 derived fields NULL
--- Note: schema default for api_cost is 0, so we must explicitly NULL it
+-- TEST 4: api_cost NOT NULL constraint rejects null inserts
+-- (Schema migrated to NOT NULL; the original "NULL → NULL derived"
+-- branch is now structurally unreachable, so this test instead
+-- confirms the constraint is in force.)
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO public.flows (user_id, name, api_cost)
+    VALUES (
+      (SELECT user_id FROM public.user_credits LIMIT 1),
+      'TEST_trigger_null', NULL
+    );
+    RAISE NOTICE '❌ TEST 4 FAIL: NULL api_cost was allowed';
+  EXCEPTION WHEN not_null_violation THEN
+    RAISE NOTICE '✅ TEST 4 PASS: NULL api_cost rejected by NOT NULL constraint';
+  END;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 5: UPDATE re-fires trigger
+-- (Must be two separate statements — chained data-modifying CTEs all
+--  observe the same pre-statement snapshot, so the UPDATE wouldn't
+--  find the row the INSERT just produced.)
 -- ─────────────────────────────────────────────────────────────
 BEGIN;
 INSERT INTO public.flows (user_id, name, api_cost)
 VALUES (
   (SELECT user_id FROM public.user_credits LIMIT 1),
-  'TEST_trigger_null', NULL
-)
+  'TEST_trigger_update', 10
+);
+UPDATE public.flows
+SET api_cost = 50
+WHERE name = 'TEST_trigger_update'
 RETURNING
-  api_cost,
-  selling_price,
-  contribution_margin,
-  creator_payout,
-  CASE
-    WHEN api_cost IS NULL AND selling_price IS NULL AND contribution_margin IS NULL AND creator_payout IS NULL
-    THEN '✅ TEST 4 PASS: NULL api_cost → NULL derived'
-    ELSE '❌ TEST 4 FAIL'
-  END AS result;
-ROLLBACK;
-
--- ─────────────────────────────────────────────────────────────
--- TEST 5: UPDATE re-fires trigger
--- ─────────────────────────────────────────────────────────────
-BEGIN;
-WITH inserted AS (
-  INSERT INTO public.flows (user_id, name, api_cost)
-  VALUES (
-    (SELECT user_id FROM public.user_credits LIMIT 1),
-    'TEST_trigger_update', 10
-  )
-  RETURNING id
-),
-updated AS (
-  UPDATE public.flows
-  SET api_cost = 50
-  WHERE id = (SELECT id FROM inserted)
-  RETURNING selling_price, contribution_margin, creator_payout
-)
-SELECT
   selling_price, contribution_margin, creator_payout,
   CASE
     WHEN selling_price = 200 AND contribution_margin = 150 AND creator_payout = 30
     THEN '✅ TEST 5 PASS: UPDATE re-fires trigger'
     ELSE '❌ TEST 5 FAIL'
-  END AS result
-FROM updated;
+  END AS result;
 ROLLBACK;
 
 -- ─────────────────────────────────────────────────────────────

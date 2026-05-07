@@ -155,10 +155,20 @@ Deno.test("execute-pipeline-step: error messages never leak credentials", async 
 // ═══════════════════════════════════════════════════════════
 // E2E: Multi-node pipeline → execute-pipeline-step
 // ═══════════════════════════════════════════════════════════
+//
+// LEGACY (skipped): the three e2e tests below need:
+//   1. Test user `test-runner@test.local` in Supabase Auth.
+//   2. Seed flow "Test Food Promo" in `public.flows`.
+//   3. The hardcoded TEST_USER_ID below to match that user's auth.uid().
+//   4. Real Banana / Gemini calls — every run consumes credits.
+//
+// execute-pipeline-step is part of the legacy consumer flow runner.
+// Workspace product orchestrates nodes through workspace-run-node.
+// See the LEGACY block in run-flow-init/index.test.ts for revival steps.
 
 const TEST_USER_ID = "b64059e0-bfad-4001-8fda-bbe1ec377ccd";
 
-Deno.test("e2e: run-flow-init creates pipeline, execute-pipeline-step runs chat_ai step", async () => {
+Deno.test.ignore("e2e: run-flow-init creates pipeline, execute-pipeline-step runs chat_ai step", async () => {
   const token = await getTestUserToken();
   const flowId = await getTestFlowId(token);
   await topUpCredits(TEST_USER_ID, 50000);
@@ -223,7 +233,7 @@ Deno.test("e2e: run-flow-init creates pipeline, execute-pipeline-step runs chat_
   console.log(`[e2e] Chat AI output: "${(outcome.outputs?.output_text ?? "").substring(0, 100)}"`);
 });
 
-Deno.test("e2e: execute-pipeline-step runs banana step with image generation", async () => {
+Deno.test.ignore("e2e: execute-pipeline-step runs banana step with image generation", async () => {
   const token = await getTestUserToken();
   const flowId = await getTestFlowId(token);
   await topUpCredits(TEST_USER_ID, 50000);
@@ -284,7 +294,7 @@ Deno.test("e2e: execute-pipeline-step runs banana step with image generation", a
   console.log(`[e2e] Banana image URL: ${outcome.result_url.substring(0, 100)}...`);
 });
 
-Deno.test("e2e: execute-pipeline-step handles step_indices (parallel execution)", async () => {
+Deno.test.ignore("e2e: execute-pipeline-step handles step_indices (parallel execution)", async () => {
   const token = await getTestUserToken();
   const flowId = await getTestFlowId(token);
   await topUpCredits(TEST_USER_ID, 50000);

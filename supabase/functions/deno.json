@@ -1,7 +1,6 @@
 {
   "test": {
-    "include": ["."],
-    "exclude": ["_shared"]
+    "include": ["."]
   },
   "compilerOptions": {
     "strict": true,
