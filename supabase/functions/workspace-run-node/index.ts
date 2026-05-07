@@ -71,7 +71,7 @@ import {
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type, x-cron-secret, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
+    "authorization, x-client-info, apikey, content-type, x-cron-secret, x-workspace-worker-secret, x-workspace-worker-user-id, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
 /* ═══════════════════════════════════════════════════════════
@@ -7349,6 +7349,42 @@ async function readJsonSafe(res: Response): Promise<Record<string, unknown>> {
   }
 }
 
+function firstSupabaseGatewayKey(): string {
+  const names = [
+    "SUPABASE_SECRET_KEY",
+    "SUPABASE_SECRET_KEYS",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "SUPABASE_PUBLISHABLE_KEY",
+    "SUPABASE_PUBLISHABLE_KEYS",
+    "SUPABASE_ANON_KEY",
+  ];
+  const extract = (raw: string): string => {
+    const value = raw.trim();
+    if (!value) return "";
+    if (value.startsWith("[") || value.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(value);
+        const values = Array.isArray(parsed)
+          ? parsed
+          : parsed && typeof parsed === "object"
+            ? Object.values(parsed)
+            : [];
+        const found = values.find((item) => typeof item === "string" && item.trim());
+        return typeof found === "string" ? found.trim() : "";
+      } catch {
+        // Fall through to comma/plain parsing.
+      }
+    }
+    return value.split(",").map((part) => part.trim()).find(Boolean) ?? "";
+  };
+
+  for (const name of names) {
+    const key = extract(Deno.env.get(name) ?? "");
+    if (key) return key;
+  }
+  return "";
+}
+
 function safeJsonSnippet(value: unknown, maxLength = 1200): string {
   try {
     const text = JSON.stringify(value);
@@ -7389,15 +7425,12 @@ async function invokeWorkspaceRunOnce(args: {
 }): Promise<Record<string, unknown>> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS);
-  const gatewayApiKey =
-    Deno.env.get("SUPABASE_ANON_KEY") ??
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ??
-    "";
+  const gatewayApiKey = firstSupabaseGatewayKey();
   try {
     const res = await fetch(args.functionUrl, {
       method: "POST",
       headers: {
-        authorization: args.authHeader,
+        Authorization: args.authHeader,
         ...(gatewayApiKey ? { apikey: gatewayApiKey } : {}),
         ...(args.extraHeaders ?? {}),
         "content-type": "application/json",
@@ -7407,7 +7440,7 @@ async function invokeWorkspaceRunOnce(args: {
     });
     const payload = await readJsonSafe(res);
     if (!res.ok || payload.error) {
-      throw new Error(String(payload.error ?? `workspace-run-node HTTP ${res.status}`));
+      throw new Error(String(payload.error ?? payload.message ?? `workspace-run-node HTTP ${res.status}`));
     }
     return payload;
   } finally {
@@ -7768,6 +7801,7 @@ function workspaceJobPollDelaySeconds(result: Record<string, unknown>): number {
 function workspaceWorkerHeaders(secret: string, userId: string): Record<string, string> {
   return {
     "x-cron-secret": secret,
+    "x-workspace-worker-secret": secret,
     "x-workspace-worker-user-id": userId,
   };
 }
