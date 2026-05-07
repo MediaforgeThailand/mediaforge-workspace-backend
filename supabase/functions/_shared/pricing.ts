@@ -154,6 +154,15 @@ function replicateVideoPricingVariant(model: string, params: Record<string, unkn
   return null;
 }
 
+function primaryModelForReplicatePricing(model: string): string {
+  if (model === "replicate-veo-3-1") return "veo-3.1-generate-001";
+  if (model === "replicate-kling-v3-pro") return "kling-v3-pro";
+  if (model === "replicate-kling-v3-motion-pro") return "kling-v3-motion-pro";
+  if (model === "replicate-kling-v3-omni") return "kling-v3-omni";
+  if (model.startsWith("replicate-seedance-2-0")) return "seedance-2-0-pro";
+  return model;
+}
+
 function googleModelPriceKeys(rawModel: unknown): string[] {
   const model = String(rawModel ?? "").trim();
   if (!model) return [];
@@ -309,25 +318,16 @@ export async function lookupModelDiscountPercent(
     params._has_ref_video === "true" ||
     (Array.isArray(params.reference_video_urls) && params.reference_video_urls.length > 0) ||
     Boolean(params.reference_video_url || params.video_url || params.ref_video);
-  const isSeedanceV2PricingModel =
-    model.startsWith("seedance-2-0") ||
-    model.startsWith("dreamina-seedance-2-0") ||
-    model.startsWith("replicate-seedance-2-0");
-  const seedanceV2VideoRefPricingModel =
-    isSeedanceV2PricingModel && hasRefVideoInput
-      ? "replicate-seedance-2-0-video-ref"
-      : model;
-  const replicateVariant = replicateVideoPricingVariant(model, params);
+  const pricingBaseModel = primaryModelForReplicatePricing(model);
+  const replicateVariant = replicateVideoPricingVariant(pricingBaseModel, params);
   const modelAliases =
-    model === "veo-3.1-generate-001" || model === "veo-3.1-generate-preview"
-      ? Array.from(new Set([model, "veo-3.1-generate-preview", "veo-3.1-generate-001"]))
+    pricingBaseModel === "veo-3.1-generate-001" || pricingBaseModel === "veo-3.1-generate-preview"
+      ? Array.from(new Set([pricingBaseModel, "veo-3.1-generate-preview", "veo-3.1-generate-001"]))
       : replicateVariant
-        ? [`${model}:${replicateVariant}`, model]
-      : seedanceV2VideoRefPricingModel !== model
-        ? [seedanceV2VideoRefPricingModel, model]
-        : [model];
+        ? [`${pricingBaseModel}:${replicateVariant}`, pricingBaseModel]
+        : [pricingBaseModel];
   const resolution = String(params.resolution ?? "").trim().toLowerCase();
-  const pricingModel = model === "kling-v3-omni" && hasRefVideoInput ? `${model}-video-ref` : model;
+  const pricingModel = pricingBaseModel === "kling-v3-omni" && hasRefVideoInput ? `${pricingBaseModel}-video-ref` : pricingBaseModel;
   const keys = [
     pricingModel,
     ...modelAliases,
@@ -522,25 +522,16 @@ export async function lookupBaseCost(
     params._has_ref_video === "true" ||
     (Array.isArray(params.reference_video_urls) && params.reference_video_urls.length > 0) ||
     Boolean(params.reference_video_url || params.video_url || params.ref_video);
-  const isSeedanceV2PricingModel =
-    model.startsWith("seedance-2-0") ||
-    model.startsWith("dreamina-seedance-2-0") ||
-    model.startsWith("replicate-seedance-2-0");
-  const seedanceV2VideoRefPricingModel =
-    isSeedanceV2PricingModel && hasRefVideoInput
-      ? "replicate-seedance-2-0-video-ref"
-      : model;
-  const replicateVariant = replicateVideoPricingVariant(model, params);
+  const pricingBaseModel = primaryModelForReplicatePricing(model);
+  const replicateVariant = replicateVideoPricingVariant(pricingBaseModel, params);
   const modelAliases =
-    model === "veo-3.1-generate-001" || model === "veo-3.1-generate-preview"
-      ? Array.from(new Set([model, "veo-3.1-generate-preview", "veo-3.1-generate-001"]))
+    pricingBaseModel === "veo-3.1-generate-001" || pricingBaseModel === "veo-3.1-generate-preview"
+      ? Array.from(new Set([pricingBaseModel, "veo-3.1-generate-preview", "veo-3.1-generate-001"]))
       : replicateVariant
-        ? [`${model}:${replicateVariant}`, model]
-      : seedanceV2VideoRefPricingModel !== model
-        ? [seedanceV2VideoRefPricingModel, model]
-        : [model];
-  const isMotion = model.includes("motion");
-  const isOmni = model === "kling-v3-omni";
+        ? [`${pricingBaseModel}:${replicateVariant}`, pricingBaseModel]
+        : [pricingBaseModel];
+  const isMotion = pricingBaseModel.includes("motion");
+  const isOmni = pricingBaseModel === "kling-v3-omni";
 
   // For motion models, duration comes from ref_video (passed as ref_video_duration).
   // For Omni models, duration comes from the slider (3-15s).
@@ -562,7 +553,7 @@ export async function lookupBaseCost(
   // ── Omni: check for video-ref tier pricing ──
   if (isOmni) {
     const hasRefVideo = params._has_ref_video === true || params._has_ref_video === "true";
-    const pricingModel = hasRefVideo ? `${model}-video-ref` : model;
+    const pricingModel = hasRefVideo ? `${pricingBaseModel}-video-ref` : pricingBaseModel;
     const pricingModels = resolution
       ? [`${pricingModel}:${resolution}`, pricingModel]
       : [pricingModel];
@@ -596,7 +587,7 @@ export async function lookupBaseCost(
 
     // Fallback to standard model if video-ref row doesn't exist
     if (hasRefVideo) {
-      const standardModels = resolution ? [`${model}:${resolution}`, model] : [model];
+      const standardModels = resolution ? [`${pricingBaseModel}:${resolution}`, pricingBaseModel] : [pricingBaseModel];
       let stdRow = await findOmniRow(standardModels, effectiveAudio);
 
       if (!stdRow && effectiveAudio) {
