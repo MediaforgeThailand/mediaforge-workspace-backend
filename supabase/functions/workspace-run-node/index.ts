@@ -364,6 +364,34 @@ function findClosestAspectRatio(width: number, height: number): string {
   return bestLabel;
 }
 
+/**
+ * Format a Kling API error body into a user-friendly message.
+ *
+ * Kling validation failures arrive as JSON like:
+ *   { code: 1201, message: "prompt: size must be between 0 and 2500", request_id: "..." }
+ * Surfacing the raw payload (with JSON braces and request_id) in the
+ * UI toast makes the error unreadable. Map known codes to clean
+ * messages and otherwise extract `message` from the JSON when present.
+ *
+ * Code 1201 = prompt-size violation. We DO want this to reach the
+ * client (it's an actionable user error, not a transient provider
+ * fault), so do NOT classify it as PROVIDER_BILLING_ERROR.
+ */
+function formatKlingApiError(label: string, status: number, errText: string): string {
+  try {
+    const parsed = JSON.parse(errText) as { code?: number; message?: string };
+    if (parsed?.code === 1201 && typeof parsed.message === "string") {
+      return `${label}: ${parsed.message}. The Kling API limits prompts to 2500 characters — please shorten your prompt and try again.`;
+    }
+    if (typeof parsed?.message === "string" && parsed.message) {
+      return `${label} (HTTP ${status}): ${parsed.message}`;
+    }
+  } catch {
+    // not JSON — fall through to the raw substring fallback
+  }
+  return `${label} (HTTP ${status}): ${errText.substring(0, 200)}`;
+}
+
 async function generateKlingJWT(accessKeyId: string, secretKey: string): Promise<string> {
   const header = { alg: "HS256", typ: "JWT" };
   const now = Math.floor(Date.now() / 1000);
@@ -865,7 +893,7 @@ async function executeKlingMotionControl(
     if (isProviderBillingLike(res.status, errText)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
-    throw new Error(`Kling Motion API error (HTTP ${res.status}): ${errText.substring(0, 200)}`);
+    throw new Error(formatKlingApiError("Kling Motion API error", res.status, errText));
   }
 
   let result: Record<string, unknown>;
@@ -1140,7 +1168,7 @@ async function executeKlingStandard(
     if (isProviderBillingLike(res.status, errText)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
-    throw new Error(`Kling API error (HTTP ${res.status}): ${errText.substring(0, 200)}`);
+    throw new Error(formatKlingApiError("Kling API error", res.status, errText));
   }
 
   let result: Record<string, unknown>;
@@ -1590,7 +1618,7 @@ async function executeKlingOmni(
     if (isProviderBillingLike(res.status, errText)) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
-    throw new Error(`Kling Omni API error (HTTP ${res.status}): ${errText.substring(0, 200)}`);
+    throw new Error(formatKlingApiError("Kling Omni API error", res.status, errText));
   }
 
   let result: Record<string, unknown>;
