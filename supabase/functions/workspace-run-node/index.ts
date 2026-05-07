@@ -28,6 +28,7 @@ import {
   SEEDANCE_TASKS_PATH,
   SEEDANCE_MODEL_MAP,
   buildSeedanceContent,
+  humanizeSeedanceErrorMessage,
   loadSeedanceCredentials,
   pollSeedanceOnce,
   submitSeedanceTask,
@@ -8704,8 +8705,14 @@ serve(async (req) => {
               : rawStatus || "submitted";
       const videoUrl =
         normalised === "succeed" ? String(statusObj.content?.video_url ?? "") : "";
-      const message =
+      const rawMessage =
         statusObj.error?.message ?? (normalised === "failed" ? "Task failed" : "");
+      // Replace cryptic provider strings (e.g. "The request failed because
+      // the output audio may contain sensitive information") with an
+      // actionable message before the frontend writes it to
+      // workspace_generation_jobs.error_message and surfaces it as a
+      // toast.
+      const message = humanizeSeedanceErrorMessage(rawMessage);
       return new Response(
         JSON.stringify({
           status: normalised,

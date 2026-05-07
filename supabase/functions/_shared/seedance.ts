@@ -401,6 +401,40 @@ export async function submitSeedanceTask(
 }
 
 /**
+ * Map a raw Seedance / BytePlus error string to a user-actionable
+ * message. Returns the input unchanged when no known pattern matches.
+ *
+ * The patterns covered here come from Seedance's polling response
+ * (`status.error.message`) — i.e. failures detected AFTER the model
+ * has run. Submit-time validation errors are humanised inline in
+ * submitSeedanceTask (see the `SensitiveContentDetected` branch).
+ *
+ * Why this lives here: the error string is what populates
+ * `workspace_generation_jobs.error_message` and the toast the user
+ * actually sees, so the friendly text needs to land before either of
+ * those is written. Keeping the map next to the API client means new
+ * patterns can be added without chasing down every consumer.
+ */
+export function humanizeSeedanceErrorMessage(raw: string | null | undefined): string {
+  const msg = (raw ?? "").trim();
+  if (!msg) return msg;
+  // Output content moderation — Seedance's safety filter ran on the
+  // *generated* media (audio/video) and rejected it. Common on
+  // seedance-2-0-* with audio enabled when the prompt produces speech
+  // the filter classifies as sensitive.
+  if (/output\s+audio.*sensitive/i.test(msg)) {
+    return "Seedance's safety filter blocked the generated audio. Try turning off 'Generate audio' on the node or simplifying the prompt, then run again. Credits refund automatically.";
+  }
+  if (/output\s+video.*sensitive/i.test(msg)) {
+    return "Seedance's safety filter blocked the generated video. Try simplifying the prompt or removing references to public figures, then run again. Credits refund automatically.";
+  }
+  if (/output.*may\s+contain\s+sensitive/i.test(msg)) {
+    return "Seedance's safety filter blocked the generated output. Try simplifying the prompt or disabling audio, then run again. Credits refund automatically.";
+  }
+  return msg;
+}
+
+/**
  * Single poll for a Seedance task. Returns the parsed status object —
  * the caller decides whether to keep polling. Used by:
  *   - workspace-run-node `poll_seedance` action (frontend repeatedly hits)
@@ -476,7 +510,7 @@ export async function pollSeedanceVideo(
       return { url: videoUrl, raw: status };
     }
     if (s === "failed" || s === "fail" || s === "cancelled") {
-      const msg = status.error?.message ?? "no detail";
+      const msg = humanizeSeedanceErrorMessage(status.error?.message) || "no detail";
       throw new Error(`[${label}] Task ${s}: ${msg} (task_id=${taskId})`);
     }
 
