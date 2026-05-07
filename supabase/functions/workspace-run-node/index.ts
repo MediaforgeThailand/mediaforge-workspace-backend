@@ -5853,6 +5853,128 @@ type WorkspaceCreditOwner =
       classRole?: string | null;
     };
 
+function normalizeWorkspaceDiscountPercent(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.min(100, Math.max(0, parsed));
+}
+
+function applyWorkspacePackageDiscount(amount: number, discountPercent: number): number {
+  const fullAmount = Math.max(0, Math.ceil(Number(amount) || 0));
+  const pct = normalizeWorkspaceDiscountPercent(discountPercent);
+  if (fullAmount <= 0 || pct <= 0) return fullAmount;
+  return Math.max(1, Math.floor(fullAmount * (100 - pct) / 100));
+}
+
+function workspacePackageDiscountForOwner(owner: WorkspaceCreditOwner): number {
+  if (owner.scope !== "organization") return 0;
+  const orgType = String(owner.organizationType ?? "").toLowerCase();
+  return orgType === "enterprise" ? 20 : 0;
+}
+
+async function resolveTeamPackageDiscountPercent(
+  supabase: ReturnType<typeof createClient>,
+  teamId: string,
+): Promise<number> {
+  let teamPlanId: string | null = null;
+  try {
+    const { data } = await supabase
+      .from("teams")
+      .select("subscription_plan_id")
+      .eq("id", teamId)
+      .maybeSingle();
+    teamPlanId = typeof (data as any)?.subscription_plan_id === "string"
+      ? String((data as any).subscription_plan_id)
+      : null;
+  } catch {
+    teamPlanId = null;
+  }
+
+  try {
+    if (!teamPlanId) {
+      const { data } = await supabase
+        .from("subscription_plans")
+        .select("id")
+        .eq("target", "team")
+        .eq("is_active", true)
+        .order("sort_order", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+      teamPlanId = typeof (data as any)?.id === "string" ? String((data as any).id) : null;
+    }
+    if (!teamPlanId) return 0;
+    const { data } = await supabase
+      .from("subscription_plans")
+      .select("credit_discount_percent")
+      .eq("id", teamPlanId)
+      .maybeSingle();
+    return normalizeWorkspaceDiscountPercent((data as any)?.credit_discount_percent);
+  } catch (err) {
+    console.warn(
+      "[workspace-credits] team package discount lookup skipped:",
+      err instanceof Error ? err.message : String(err),
+    );
+    return 0;
+  }
+}
+
+async function resolveEffectiveWorkspaceChargeAmount(args: {
+  supabase: ReturnType<typeof createClient>;
+  scope: "user" | "team";
+  fallbackAmount: number;
+  referenceId: string;
+  userId: string;
+  teamId?: string | null;
+  workspaceId?: string | null;
+  canvasId?: string | null;
+}): Promise<number> {
+  const fallbackAmount = Math.max(1, Math.ceil(Number(args.fallbackAmount) || 0));
+  try {
+    if (args.scope === "user") {
+      const { data, error } = await args.supabase
+        .from("credit_transactions")
+        .select("amount,effective_amount,discount_percent")
+        .eq("user_id", args.userId)
+        .eq("reference_id", args.referenceId)
+        .eq("type", "usage")
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      const effective = Number((data as any)?.effective_amount ?? (data as any)?.amount);
+      return Number.isFinite(effective) && effective !== 0 ? Math.abs(Math.trunc(effective)) : fallbackAmount;
+    }
+
+    if (args.scope === "team" && args.teamId) {
+      const packageDiscountPercent = await resolveTeamPackageDiscountPercent(args.supabase, args.teamId);
+      if (packageDiscountPercent > 0) {
+        return applyWorkspacePackageDiscount(fallbackAmount, packageDiscountPercent);
+      }
+      let query = args.supabase
+        .from("team_credit_transactions")
+        .select("amount,effective_amount,discount_percent")
+        .eq("team_id", args.teamId)
+        .eq("triggered_by", args.userId)
+        .eq("reason", "node_run");
+      query = args.workspaceId ? query.eq("workspace_id", args.workspaceId) : query.is("workspace_id", null);
+      query = args.canvasId ? query.eq("canvas_id", args.canvasId) : query.is("canvas_id", null);
+      const { data, error } = await query
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      const effective = Number((data as any)?.effective_amount ?? (data as any)?.amount);
+      return Number.isFinite(effective) && effective !== 0 ? Math.abs(Math.trunc(effective)) : fallbackAmount;
+    }
+  } catch (err) {
+    console.warn(
+      "[workspace-credits] effective charge lookup skipped:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+  return fallbackAmount;
+}
+
 async function resolveWorkspaceEducationCreditScope(
   supabase: ReturnType<typeof createClient>,
   userId: string,
@@ -6295,10 +6417,12 @@ async function consumeWorkspaceCredits(args: {
   }
 
   if (!teamId && creditOwner.scope === "organization") {
+    const packageDiscountPercent = workspacePackageDiscountForOwner(creditOwner);
+    const chargedAmount = applyWorkspacePackageDiscount(amount, packageDiscountPercent);
     const { data, error } = await args.supabase.rpc("consume_workspace_org_credits", {
       p_user_id: args.userId,
       p_organization_id: creditOwner.organizationId,
-      p_amount: amount,
+      p_amount: chargedAmount,
       p_feature: feature,
       p_description: description,
       p_reference_id: referenceId,
@@ -6314,10 +6438,10 @@ async function consumeWorkspaceCredits(args: {
         throw new Error("INSUFFICIENT_CREDITS");
       }
       console.log(
-        `[workspace-credits] charged ${amount} credits user=${args.userId} org=${creditOwner.organizationId} ref=${referenceId} full=${fullAmount} discount=${discountPercent}%`,
+        `[workspace-credits] charged ${chargedAmount} credits user=${args.userId} org=${creditOwner.organizationId} ref=${referenceId} full=${fullAmount} model_discount=${discountPercent}% package_discount=${packageDiscountPercent}% model_price=${amount}`,
       );
       return {
-        amount,
+        amount: chargedAmount,
         scope: "organization",
         teamId: null,
         organizationId: creditOwner.organizationId,
@@ -6370,11 +6494,22 @@ async function consumeWorkspaceCredits(args: {
     throw new Error("INSUFFICIENT_CREDITS");
   }
 
+  const chargedAmount = await resolveEffectiveWorkspaceChargeAmount({
+    supabase: args.supabase,
+    scope: teamId ? "team" : "user",
+    fallbackAmount: amount,
+    referenceId,
+    userId: creditUserId,
+    teamId,
+    workspaceId: args.body.workspace_id ?? null,
+    canvasId: args.body.canvas_id ?? null,
+  });
+
   console.log(
-    `[workspace-credits] charged ${amount} credits user=${args.userId} credit_user=${creditUserId} team=${teamId ?? "personal"} ref=${referenceId} full=${fullAmount} discount=${discountPercent}%`,
+    `[workspace-credits] charged ${chargedAmount} credits user=${args.userId} credit_user=${creditUserId} team=${teamId ?? "personal"} ref=${referenceId} full=${fullAmount} model_discount=${discountPercent}% model_price=${amount}`,
   );
   return {
-    amount,
+    amount: chargedAmount,
     scope: teamId ? "team" : "user",
     teamId,
     organizationId: creditOwner.scope === "user" ? creditOwner.organizationId ?? null : null,

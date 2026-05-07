@@ -66,6 +66,7 @@ const FLOW_CREDITS_PER_THB = 125;
 const WORKSPACE_CREDITS_PER_THB = 50;
 const FLOW_TO_WORKSPACE_RATIO = WORKSPACE_CREDITS_PER_THB / FLOW_CREDITS_PER_THB;
 const REPLICATE_PRICE_FACTOR = 1;
+const TEAM_ENTERPRISE_CREDIT_DISCOUNT_PERCENT = 20;
 type CreditCostWriteRow = {
   feature: string;
   model: string | null;
@@ -85,6 +86,19 @@ type CreditCostWriteRow = {
   notes?: string | null;
   discount_percent?: number | null;
 };
+
+function normalizeDiscountPercent(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.min(100, Math.max(0, parsed));
+}
+
+function orgPackageDiscountPercent(orgType: unknown, scope: "organization" | "team"): number {
+  const type = String(orgType ?? "").toLowerCase();
+  return type === "enterprise" || scope === "team"
+    ? TEAM_ENTERPRISE_CREDIT_DISCOUNT_PERCENT
+    : 0;
+}
 
 function creditsFromUsd(usd: number): number {
   return Math.max(1, Math.ceil((usd * USD_TO_THB * WORKSPACE_CREDITS_PER_THB) - 1e-9));
@@ -627,6 +641,8 @@ async function getWorkspaceCreditBalance(
     shared_balance?: number | null;
     shared_total?: number | null;
     shared_used?: number | null;
+    package_discount_percent?: number;
+    package_discount_label?: string | null;
   };
 }> {
   const token = String(authHeader ?? "").replace(/^Bearer\s+/i, "").trim();
@@ -656,6 +672,35 @@ async function getWorkspaceCreditBalance(
   const personalBalance = Number((personalCredits as { balance?: number } | null)?.balance ?? 0);
   const personalTotalPurchased = Number((personalCredits as { total_purchased?: number } | null)?.total_purchased ?? 0);
   const personalTotalUsed = Number((personalCredits as { total_used?: number } | null)?.total_used ?? 0);
+  let personalPackageDiscountPercent = 0;
+  let personalPackageDiscountLabel: string | null = null;
+  try {
+    const { data: profile } = await client
+      .from("profiles")
+      .select("subscription_plan_id")
+      .eq("user_id", creditUserId)
+      .maybeSingle();
+    const planId = (profile as { subscription_plan_id?: string | null } | null)?.subscription_plan_id;
+    if (planId) {
+      const { data: plan } = await client
+        .from("subscription_plans")
+        .select("name, target, credit_discount_percent")
+        .eq("id", planId)
+        .maybeSingle();
+      personalPackageDiscountPercent = normalizeDiscountPercent(
+        (plan as { credit_discount_percent?: number | null } | null)?.credit_discount_percent,
+      );
+      personalPackageDiscountLabel =
+        (plan as { name?: string | null; target?: string | null } | null)?.name ??
+        (plan as { target?: string | null } | null)?.target ??
+        null;
+    }
+  } catch (err) {
+    console.warn(
+      "admin_workspace_pricing: package discount lookup skipped:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
   const requestedWorkspaceId = String(body.workspace_id ?? body.space_id ?? "").trim();
 
   if (requestedWorkspaceId) {
@@ -709,6 +754,8 @@ async function getWorkspaceCreditBalance(
             shared_balance: educationBalance,
             shared_total: educationReceived,
             shared_used: educationUsed,
+            package_discount_percent: 0,
+            package_discount_label: null,
           },
         };
       }
@@ -825,6 +872,8 @@ async function getWorkspaceCreditBalance(
           shared_balance: team ? Number((team as any).credit_available ?? 0) : balance,
           shared_total: team ? Number((team as any).credit_pool ?? 0) : balance + orgUsed,
           shared_used: team ? Number((team as any).credit_pool_consumed ?? 0) : orgUsed,
+          package_discount_percent: orgPackageDiscountPercent(orgRow.organization_type, team ? "team" : "organization"),
+          package_discount_label: team ? "Team" : String(orgRow.organization_type ?? "Enterprise"),
         },
       };
     }
@@ -859,6 +908,8 @@ async function getWorkspaceCreditBalance(
         shared_balance: educationBalance,
         shared_total: educationReceived,
         shared_used: educationUsed,
+        package_discount_percent: 0,
+        package_discount_label: null,
       },
     };
   }
@@ -883,6 +934,8 @@ async function getWorkspaceCreditBalance(
       shared_balance: null,
       shared_total: null,
       shared_used: null,
+      package_discount_percent: personalPackageDiscountPercent,
+      package_discount_label: personalPackageDiscountLabel,
     },
   };
 }
