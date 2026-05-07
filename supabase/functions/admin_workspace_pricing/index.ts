@@ -83,6 +83,7 @@ type CreditCostWriteRow = {
   source_ratio?: number | null;
   provider_unit?: string | null;
   notes?: string | null;
+  discount_percent?: number | null;
 };
 
 function creditsFromUsd(usd: number): number {
@@ -212,8 +213,9 @@ const KLING_ROWS: CreditCostWriteRow[] = [
   source: row.source,
   source_url: row.source === "flow_erp_converted" ? "Flow ERP" : null,
   source_ratio: row.source === "flow_erp_converted" ? FLOW_TO_WORKSPACE_RATIO : null,
-  provider_unit: "per second",
-  notes: row.notes,
+    provider_unit: "per second",
+    discount_percent: 20,
+    notes: row.notes,
 }));
 
 const SEEDANCE_ROWS: CreditCostWriteRow[] = [
@@ -399,6 +401,15 @@ function pricingRowKey(row: Pick<CreditCostWriteRow, "feature" | "model" | "dura
     row.duration_seconds ?? "",
     row.has_audio ? "audio" : "video",
   ].join("::");
+}
+
+function isKlingPricingRow(row: Pick<CreditCostWriteRow, "feature" | "model" | "label" | "provider" | "price_key">): boolean {
+  if (row.feature !== "generate_freepik_video") return false;
+  const raw = [row.provider, row.model, row.label, row.price_key]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return raw.includes("kling");
 }
 
 const RECOMMENDED_WORKSPACE_PRICING_KEYS = new Set(
@@ -838,7 +849,7 @@ async function saveCreditCostRow(
   const hasAudio = row.has_audio ?? false;
   let query = client
     .from("credit_costs")
-    .select("id")
+    .select("id, discount_percent")
     .eq("feature", row.feature)
     .limit(1);
   query = hasAudio
@@ -868,6 +879,9 @@ async function saveCreditCostRow(
     source_ratio: row.source_ratio ?? null,
     provider_unit: row.provider_unit ?? null,
     notes: row.notes ?? null,
+    discount_percent:
+      row.discount_percent ??
+      (isKlingPricingRow(row) ? 20 : (existing as { discount_percent?: number | null } | null)?.discount_percent ?? 0),
     updated_at: new Date().toISOString(),
   };
 
@@ -1071,6 +1085,10 @@ async function upsertCreditCost(
     body.source_ratio === null || body.source_ratio === undefined
       ? null
       : Number(body.source_ratio);
+  const discount_percent =
+    body.discount_percent === null || body.discount_percent === undefined
+      ? 0
+      : Number(body.discount_percent);
 
   if (!feature) throw new Error("`feature` is required");
   if (!label) throw new Error("`label` is required");
@@ -1082,6 +1100,9 @@ async function upsertCreditCost(
     (!Number.isFinite(duration_seconds) || duration_seconds < 0)
   ) {
     throw new Error("`duration_seconds` must be a non-negative number");
+  }
+  if (!Number.isFinite(discount_percent) || discount_percent < 0 || discount_percent > 100) {
+    throw new Error("`discount_percent` must be a number between 0 and 100");
   }
 
   let existingQuery = client
@@ -1119,6 +1140,7 @@ async function upsertCreditCost(
     source_ratio: source_ratio !== null && Number.isFinite(source_ratio) ? source_ratio : null,
     provider_unit: optionalText("provider_unit"),
     notes: optionalText("notes"),
+    discount_percent,
     updated_at: new Date().toISOString(),
   };
 

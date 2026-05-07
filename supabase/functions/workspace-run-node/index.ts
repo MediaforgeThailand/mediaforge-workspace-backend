@@ -3,8 +3,10 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
+  applyModelDiscountToCredits,
   fetchFeatureMultipliers,
   lookupBaseCost,
+  lookupModelDiscountPercent,
   PricingConfigError,
   refundCreditsAtomic,
   type FeatureMultipliers,
@@ -5855,7 +5857,9 @@ async function consumeWorkspaceCredits(args: {
   const def = workspaceProviderDef(args.nodeType, args.provider);
   const baseAmount = await lookupBaseCost(args.supabase, def, args.params);
   const multipliers = await fetchFeatureMultipliers(args.supabase);
-  const amount = Math.max(1, Math.ceil(baseAmount * workspaceMultiplierForProvider(def, multipliers)));
+  const fullAmount = Math.max(1, Math.ceil(baseAmount * workspaceMultiplierForProvider(def, multipliers)));
+  const discountPercent = await lookupModelDiscountPercent(args.supabase, def, args.params);
+  const amount = applyModelDiscountToCredits(fullAmount, discountPercent);
   if (amount <= 0) return null;
 
   const teamId = await resolveWorkspaceTeamId(args.supabase, args.body.workspace_id ?? null);
@@ -5906,7 +5910,7 @@ async function consumeWorkspaceCredits(args: {
       throw new Error("INSUFFICIENT_CREDITS");
     }
     console.log(
-      `[workspace-credits] charged ${amount} education-space credits user=${args.userId} class=${creditOwner.classId} workspace=${args.body.workspace_id} ref=${referenceId}`,
+      `[workspace-credits] charged ${amount} education-space credits user=${args.userId} class=${creditOwner.classId} workspace=${args.body.workspace_id} ref=${referenceId} full=${fullAmount} discount=${discountPercent}%`,
     );
     return {
       amount,
@@ -5940,7 +5944,7 @@ async function consumeWorkspaceCredits(args: {
         throw new Error("INSUFFICIENT_CREDITS");
       }
       console.log(
-        `[workspace-credits] charged ${amount} credits user=${args.userId} org=${creditOwner.organizationId} ref=${referenceId}`,
+        `[workspace-credits] charged ${amount} credits user=${args.userId} org=${creditOwner.organizationId} ref=${referenceId} full=${fullAmount} discount=${discountPercent}%`,
       );
       return {
         amount,
@@ -5997,7 +6001,7 @@ async function consumeWorkspaceCredits(args: {
   }
 
   console.log(
-    `[workspace-credits] charged ${amount} credits user=${args.userId} credit_user=${creditUserId} team=${teamId ?? "personal"} ref=${referenceId}`,
+    `[workspace-credits] charged ${amount} credits user=${args.userId} credit_user=${creditUserId} team=${teamId ?? "personal"} ref=${referenceId} full=${fullAmount} discount=${discountPercent}%`,
   );
   return {
     amount,

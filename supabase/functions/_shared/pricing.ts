@@ -158,6 +158,138 @@ async function firstCostByModelKeys(
   return null;
 }
 
+function normaliseDiscountPercent(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.min(100, Math.max(0, parsed));
+}
+
+export function applyModelDiscountToCredits(amount: number, discountPercent: number): number {
+  const fullAmount = Math.max(0, Math.ceil(Number(amount) || 0));
+  const pct = normaliseDiscountPercent(discountPercent);
+  if (fullAmount <= 0 || pct <= 0) return fullAmount;
+  return Math.max(1, Math.ceil(fullAmount * (1 - pct / 100)));
+}
+
+async function maxDiscountByModelKeys(
+  supabase: ReturnType<typeof createClient>,
+  feature: string,
+  keys: string[],
+): Promise<number> {
+  const uniqueKeys = Array.from(new Set(keys.map((key) => String(key ?? "").trim()).filter(Boolean)));
+  if (uniqueKeys.length === 0) return 0;
+  const { data, error } = await supabase
+    .from("credit_costs")
+    .select("discount_percent, model")
+    .eq("feature", feature)
+    .in("model", uniqueKeys);
+  if (error) throw new PricingConfigError(`Pricing discount read failed for ${feature}: ${error.message}`);
+  return Math.max(
+    0,
+    ...((data ?? []) as Array<{ discount_percent?: number | null }>)
+      .map((row) => normaliseDiscountPercent(row.discount_percent)),
+  );
+}
+
+export async function lookupModelDiscountPercent(
+  supabase: ReturnType<typeof createClient>,
+  providerDef: ProviderDef,
+  params: Record<string, unknown>,
+): Promise<number> {
+  if (providerDef.provider === "mp3_input") return 0;
+
+  if (providerDef.provider === "banana") {
+    const model = String(params.model_name ?? params.model ?? DEFAULT_IMAGE_MODEL);
+    const imageSize = String(params.image_size ?? params.resolution ?? "").toLowerCase();
+    const keys = imageSize ? [`${model}:${imageSize}`, model] : [model];
+    return maxDiscountByModelKeys(supabase, "generate_freepik_image", keys);
+  }
+
+  if (providerDef.provider === "replicate_image") {
+    const { feature, keys } = replicateImagePriceKeys(params);
+    return maxDiscountByModelKeys(supabase, feature, keys);
+  }
+
+  if (providerDef.provider === "openai") {
+    return maxDiscountByModelKeys(supabase, "generate_openai_image", openAiImagePriceKeys(params));
+  }
+
+  if (providerDef.provider === "seedream") {
+    const model = String(params.model_name ?? params.model ?? "seedream-5-0-260128");
+    const size = String(params.size ?? params.resolution ?? "2K").toLowerCase();
+    return maxDiscountByModelKeys(supabase, "generate_seedream_image", [`${model}:${size}`, model]);
+  }
+
+  if (providerDef.provider === "tripo3d" || providerDef.provider === "hyper3d") {
+    const model = String(params.model_name ?? params.model ?? "tripo3d-v3.1");
+    return maxDiscountByModelKeys(supabase, "model_3d", [model]);
+  }
+
+  if (
+    providerDef.provider === "google_tts" ||
+    providerDef.provider === "gemini_tts" ||
+    providerDef.provider === "elevenlabs_tts"
+  ) {
+    const fallbackModel = providerDef.provider === "elevenlabs_tts"
+      ? "elevenlabs-multilingual-v2"
+      : "google-tts-studio";
+    const model = String(params.model_name ?? params.model ?? fallbackModel);
+    return maxDiscountByModelKeys(supabase, "text_to_speech", textToSpeechModelPriceKeys(model));
+  }
+
+  if (providerDef.provider === "video_understanding") {
+    const model = String(params.model_name ?? params.model ?? "gemini-video-understanding");
+    return maxDiscountByModelKeys(supabase, "video_to_prompt", [model]);
+  }
+
+  if (providerDef.provider === "merge_audio") {
+    const model = String(params.model_name ?? params.model ?? "shotstack");
+    return maxDiscountByModelKeys(supabase, "merge_audio_video", [model]);
+  }
+
+  if (providerDef.provider === "remove_bg") {
+    const model = String(params.model_name ?? params.model ?? "replicate-birefnet");
+    return maxDiscountByModelKeys(supabase, "remove_background", [model]);
+  }
+
+  if (providerDef.provider === "chat_ai") {
+    const model = String(params.model_name ?? params.model ?? DEFAULT_CHAT_MODEL);
+    return maxDiscountByModelKeys(supabase, "chat_ai", googleModelPriceKeys(model));
+  }
+
+  const model = String(params.model_name ?? params.model ?? DEFAULT_VIDEO_MODEL);
+  const hasRefVideoInput =
+    params._has_ref_video === true ||
+    params._has_ref_video === "true" ||
+    (Array.isArray(params.reference_video_urls) && params.reference_video_urls.length > 0) ||
+    Boolean(params.reference_video_url || params.video_url || params.ref_video);
+  const isSeedanceV2PricingModel =
+    model.startsWith("seedance-2-0") ||
+    model.startsWith("dreamina-seedance-2-0") ||
+    model.startsWith("replicate-seedance-2-0");
+  const seedanceV2VideoRefPricingModel =
+    isSeedanceV2PricingModel && hasRefVideoInput
+      ? "replicate-seedance-2-0-video-ref"
+      : model;
+  const replicateVariant = replicateVideoPricingVariant(model, params);
+  const modelAliases =
+    model === "veo-3.1-generate-001" || model === "veo-3.1-generate-preview"
+      ? Array.from(new Set([model, "veo-3.1-generate-preview", "veo-3.1-generate-001"]))
+      : replicateVariant
+        ? [`${model}:${replicateVariant}`, model]
+      : seedanceV2VideoRefPricingModel !== model
+        ? [seedanceV2VideoRefPricingModel, model]
+        : [model];
+  const resolution = String(params.resolution ?? "").trim().toLowerCase();
+  const pricingModel = model === "kling-v3-omni" && hasRefVideoInput ? `${model}-video-ref` : model;
+  const keys = [
+    pricingModel,
+    ...modelAliases,
+    ...(resolution ? modelAliases.map((alias) => `${alias}:${resolution}`) : []),
+  ];
+  return maxDiscountByModelKeys(supabase, "generate_freepik_video", keys);
+}
+
 /* ─── Base cost lookup from credit_costs table — STRICT, no fallbacks ─── */
 
 export async function lookupBaseCost(
