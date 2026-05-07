@@ -1,5 +1,11 @@
 {
   "type": "module",
+  "scripts": {
+    "test": "deno test supabase/functions/_shared --allow-env --no-check",
+    "test:edge": "deno test supabase/functions/ --allow-net --allow-env --allow-read --env-file=.env.local --no-check",
+    "test:edge:watch": "deno test supabase/functions/ --allow-net --allow-env --allow-read --env-file=.env.local --watch --no-check",
+    "test:sql": "psql -f supabase/tests/flows-pricing-trigger.test.sql && psql -f supabase/tests/workspace-canvas-ownership.test.sql"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.104.0",
     "dotenv": "^17.4.2",

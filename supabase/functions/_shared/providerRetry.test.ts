@@ -4,6 +4,9 @@ import {
   classifyError,
   classifyProviderError,
   shouldFastFallbackProviderError,
+  PRIMARY_RETRIES,
+  EXTENDED_RETRIES,
+  TOTAL_MAX_RETRIES,
 } from "./providerRetry.ts";
 
 Deno.test("provider retry classifier: quota and billing fast-fallback", () => {
@@ -58,4 +61,43 @@ Deno.test("provider retry classifier: validation and auth are permanent", () => 
     "validation",
   );
   assertEquals(classifyProviderError("HTTP 401 invalid api key").permanent, true);
+});
+
+/* ─── Legacy classifyError bucket coverage ───────────────────────────
+ * These exercise classifyError's regex buckets directly. classifyError
+ * is still consumed inside the retry loop, so even though
+ * classifyProviderError is the richer API, we want regression coverage
+ * on every bucket of the simpler one. */
+
+Deno.test("retry budget constants are consistent (TOTAL = PRIMARY + EXTENDED)", () => {
+  assertEquals(TOTAL_MAX_RETRIES, PRIMARY_RETRIES + EXTENDED_RETRIES);
+});
+
+Deno.test("classifyError — safety / blocked-prompt messages are permanent", () => {
+  assertEquals(classifyError("Prompt blocked by safety filter"), "permanent");
+  assertEquals(classifyError("invalid_argument: prompt"), "permanent");
+  assertEquals(classifyError("Invalid input received"), "permanent");
+});
+
+Deno.test("classifyError — programming errors must not be retried", () => {
+  assertEquals(classifyError("foo is not defined"), "permanent");
+  assertEquals(classifyError("bar is not a function"), "permanent");
+  // Modern V8 phrasing — "properties of undefined" (no interpolated key in between)
+  assertEquals(classifyError("Cannot read properties of undefined"), "permanent");
+  assertEquals(classifyError("Cannot read properties of null"), "permanent");
+  assertEquals(classifyError("ReferenceError: X is missing"), "permanent");
+  assertEquals(classifyError("TypeError: not a fn"), "permanent");
+  assertEquals(classifyError("SyntaxError: bad token"), "permanent");
+});
+
+Deno.test("classifyError — wiring / missing-input errors are permanent", () => {
+  assertEquals(classifyError("Node requires an image input"), "permanent");
+  assertEquals(classifyError("missing required parameter prompt"), "permanent");
+  assertEquals(classifyError("input prompt is required"), "permanent");
+  assertEquals(classifyError("prompt cannot be empty"), "permanent");
+});
+
+Deno.test("classifyError — unrecognized errors fall back to 'unknown' (still retried)", () => {
+  assertEquals(classifyError("something weird happened"), "unknown");
+  assertEquals(classifyError(""), "unknown");
 });
