@@ -266,6 +266,27 @@ function shouldFallbackVeoQuota(errMsg: string): boolean {
   );
 }
 
+/**
+ * True when Google rejects the request because Veo 3.1 isn't available
+ * for this account / region — typically:
+ *   { error: { code: 400, message: "Your use case is currently not
+ *     supported. Please refer to Gemini API documentation...",
+ *     status: "INVALID_ARGUMENT" }}
+ *
+ * This is a provider-availability error (allowlist / billing tier /
+ * region), NOT a user input error or content moderation. Replicate
+ * hosts Veo 3.1 with its own Google API access, so retrying through
+ * Replicate frequently succeeds where direct Google rejects.
+ *
+ * The pattern is intentionally narrow — INVALID_ARGUMENT alone covers
+ * many other failures (malformed payload, bad params) where Replicate
+ * would also reject. We only fallback on Google's exact "use case ...
+ * not supported" phrasing.
+ */
+function shouldFallbackVeoUseCase(errMsg: string): boolean {
+  return /use case is (?:currently )?not supported/i.test(errMsg);
+}
+
 function summarizeProviderErrorText(raw: string, maxLength = 500): string {
   const title = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1];
   const source = title ?? raw;
@@ -2244,6 +2265,38 @@ async function executeVeo(
     }
     if (!recoveredFromSubmitError && shouldFallbackVeoQuota(firstMessage) && canUseReplicateVeo()) {
       return await submitReplicateFallback(`primary_quota: ${firstMessage.slice(0, 160)}`);
+    }
+    // Veo 3.1 access fallback — Google sometimes rejects requests with
+    // "Your use case is currently not supported" because the project
+    // isn't allowlisted for Veo 3.1, the billing tier is too low, or
+    // the region is restricted. Replicate's Google API access is
+    // independent and usually accepts the same request. If Replicate
+    // is configured, route there; otherwise throw a message that
+    // tells the user this is an account-level issue and which models
+    // they CAN use.
+    if (!recoveredFromSubmitError && shouldFallbackVeoUseCase(firstMessage)) {
+      if (canUseReplicateVeo()) {
+        console.warn(
+          `[veo] Google rejected use case ("not supported"); trying Replicate fallback`,
+        );
+        try {
+          return await submitReplicateFallback(
+            `primary_use_case_unsupported: ${firstMessage.slice(0, 160)}`,
+          );
+        } catch (replicateErr) {
+          const replicateMessage =
+            replicateErr instanceof Error ? replicateErr.message : String(replicateErr);
+          throw new Error(
+            `Veo 3.1 is unavailable for this account or region — Google rejected the request and the Replicate fallback also failed. ` +
+              `Try a different video model (Seedance or Kling) or contact support to enable Veo access. ` +
+              `Replicate detail: ${replicateMessage.slice(0, 200)}`,
+          );
+        }
+      }
+      throw new Error(
+        `Veo 3.1 is unavailable for this Google account or region (\"Your use case is currently not supported\"). ` +
+          `Try a different video model (Seedance or Kling), or ask the workspace admin to configure REPLICATE_API_TOKEN so Veo can fall back to Replicate.`,
+      );
     }
     if (!recoveredFromSubmitError && (startFrame || endFrame) && firstMessage.includes("`bytesBase64Encoded` isn't supported")) {
       console.warn("[veo] bytesBase64Encoded rejected; retrying inlineData payload");
