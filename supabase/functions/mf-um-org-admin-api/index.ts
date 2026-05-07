@@ -266,6 +266,22 @@ async function userEmailMap(ids: string[]): Promise<Map<string, any>> {
   return byId;
 }
 
+async function findAuthUserByEmail(email: string): Promise<any | null> {
+  const normalized = email.trim().toLowerCase();
+  if (!normalized) return null;
+
+  const a = admin();
+  for (let page = 1; page <= 10; page += 1) {
+    const { data } = await a.auth.admin.listUsers({ page, perPage: 1000 });
+    const found = (data?.users ?? []).find(
+      (user: any) => String(user.email ?? "").trim().toLowerCase() === normalized,
+    );
+    if (found) return found;
+    if (!data?.users || data.users.length < 1000) break;
+  }
+  return null;
+}
+
 async function listEducationSpacesForClass(classId: string): Promise<any[]> {
   const a = admin();
   const spaces = await safeData<any[]>("class_spaces.education_student_spaces", () =>
@@ -1088,6 +1104,52 @@ Deno.serve(async (req) => {
           model_uses_30d: activityCount.get(row.user_id) ?? 0,
         }));
         return json({ members: enriched });
+      }
+
+      if (method === "POST") {
+        const auth = await requireOrgWriter(req, orgId);
+        if (auth instanceof Response) return auth;
+
+        let userId = String(body?.user_id ?? "").trim();
+        const email = String(body?.email ?? body?.user_email ?? "").trim().toLowerCase();
+        const role = String(body?.role ?? "org_admin");
+        if (!["org_admin", "member"].includes(role)) {
+          return json({ error: "invalid_role" }, 400);
+        }
+
+        if (!userId && email) {
+          const found = await findAuthUserByEmail(email);
+          if (!found) {
+            return json({
+              error: "user_not_found",
+              message: `No user found with email ${email}. They must sign up first.`,
+            }, 404);
+          }
+          userId = found.id;
+        }
+        if (!userId) return json({ error: "user_id_or_email_required" }, 400);
+
+        const a = admin();
+        const { data: member, error } = await a.from("organization_memberships").upsert({
+          organization_id: orgId,
+          user_id: userId,
+          role,
+          status: "active",
+          approved_at: new Date().toISOString(),
+          approved_by: auth.userId,
+          source: role === "org_admin" ? "admin_console" : "manual",
+          joined_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        }, { onConflict: "organization_id,user_id" }).select().single();
+        if (error) return json({ error: error.message }, 400);
+
+        await a.from("profiles").update({
+          organization_id: orgId,
+          account_type: "org_user",
+          updated_at: new Date().toISOString(),
+        }).eq("user_id", userId);
+
+        return json({ member }, 201);
       }
 
     }

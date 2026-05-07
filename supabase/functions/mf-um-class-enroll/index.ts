@@ -65,6 +65,48 @@ Deno.serve(async (req) => {
     : null;
 
   const admin = createClient(SUPABASE_URL, SERVICE_KEY);
+  const { data: codeRow, error: codeLookupError } = await admin
+    .from("class_enrollment_codes")
+    .select("class_id, classes(organization_id)")
+    .eq("code", code)
+    .is("revoked_at", null)
+    .maybeSingle();
+  if (codeLookupError) {
+    console.error("[mf-um-class-enroll] code lookup error:", codeLookupError.message);
+    return json({ ok: false, error: "internal_error", detail: codeLookupError.message }, 500);
+  }
+
+  const classId = String((codeRow as any)?.class_id ?? "");
+  const orgId = String((codeRow as any)?.classes?.organization_id ?? "");
+  if (classId && orgId) {
+    const { data: existingMember } = await admin
+      .from("class_members")
+      .select("id")
+      .eq("class_id", classId)
+      .eq("user_id", userData.user.id)
+      .eq("role", "student")
+      .maybeSingle();
+
+    const emailDomain = String(userData.user.email ?? "").split("@").pop()?.toLowerCase() ?? "";
+    const { data: allowedDomain } = emailDomain
+      ? await admin
+          .from("organization_domains")
+          .select("id")
+          .eq("organization_id", orgId)
+          .eq("domain", emailDomain)
+          .not("verified_at", "is", null)
+          .maybeSingle()
+      : { data: null };
+
+    if (!existingMember && !allowedDomain) {
+      return json({
+        ok: false,
+        error: "email_domain_not_allowed",
+        message: "Use your college email account to join this class.",
+      }, 403);
+    }
+  }
+
   const { data, error } = await admin.rpc("redeem_enrollment_code", {
     p_code: code,
     p_user_id: userData.user.id,
