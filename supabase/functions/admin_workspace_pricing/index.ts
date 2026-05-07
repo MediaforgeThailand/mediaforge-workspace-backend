@@ -1085,9 +1085,9 @@ async function upsertCreditCost(
     body.source_ratio === null || body.source_ratio === undefined
       ? null
       : Number(body.source_ratio);
-  const discount_percent =
+  const explicitDiscountPercent =
     body.discount_percent === null || body.discount_percent === undefined
-      ? 0
+      ? null
       : Number(body.discount_percent);
 
   if (!feature) throw new Error("`feature` is required");
@@ -1101,13 +1101,16 @@ async function upsertCreditCost(
   ) {
     throw new Error("`duration_seconds` must be a non-negative number");
   }
-  if (!Number.isFinite(discount_percent) || discount_percent < 0 || discount_percent > 100) {
+  if (
+    explicitDiscountPercent !== null &&
+    (!Number.isFinite(explicitDiscountPercent) || explicitDiscountPercent < 0 || explicitDiscountPercent > 100)
+  ) {
     throw new Error("`discount_percent` must be a number between 0 and 100");
   }
 
   let existingQuery = client
     .from("credit_costs")
-    .select("id")
+    .select("id, discount_percent")
     .eq("feature", feature)
     .limit(1);
   existingQuery = model === null ? existingQuery.is("model", null) : existingQuery.eq("model", model);
@@ -1123,6 +1126,14 @@ async function upsertCreditCost(
     throw new Error(`credit_costs lookup failed: ${existingForNaturalKeyErr.message}`);
   }
 
+  const provider = optionalText("provider");
+  const price_key = optionalText("price_key");
+  const rowDiscountPercent =
+    explicitDiscountPercent ??
+    (isKlingPricingRow({ feature, model, label, provider, price_key })
+      ? 20
+      : Number((existingForNaturalKey as { discount_percent?: number | null } | null)?.discount_percent ?? 0));
+
   const row = {
     feature,
     model,
@@ -1131,8 +1142,8 @@ async function upsertCreditCost(
     pricing_type,
     duration_seconds,
     has_audio,
-    provider: optionalText("provider"),
-    price_key: optionalText("price_key"),
+    provider,
+    price_key,
     resolution: optionalText("resolution"),
     quality: optionalText("quality"),
     source: optionalText("source"),
@@ -1140,7 +1151,7 @@ async function upsertCreditCost(
     source_ratio: source_ratio !== null && Number.isFinite(source_ratio) ? source_ratio : null,
     provider_unit: optionalText("provider_unit"),
     notes: optionalText("notes"),
-    discount_percent,
+    discount_percent: rowDiscountPercent,
     updated_at: new Date().toISOString(),
   };
 
