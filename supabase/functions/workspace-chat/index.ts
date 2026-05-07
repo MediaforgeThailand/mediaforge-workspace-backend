@@ -6,7 +6,7 @@
  *
  * Routing is by model slug prefix:
  *   - `gemini-*`  → Google Generative Language API
- *   - else (`gpt-*`, etc.) → OpenAI Chat Completions
+ *   - else (`gpt-*`, etc.) → OpenAI Responses API
  *
  * Body shape:
  *   {
@@ -80,6 +80,10 @@ interface ChatBody {
     attachments?: ChatAttachment[];
   }>;
   canvas_context?: {
+    project_id?: string;
+    project_name?: string;
+    workspace_id?: string;
+    workspace_name?: string;
     canvas_id?: string;
     canvas_name?: string;
     nodes?: Array<Record<string, unknown>>;
@@ -89,15 +93,15 @@ interface ChatBody {
 
 const DEFAULT_SYSTEM_FALLBACK = `You are a helpful assistant inside the MediaForge workspace. Help the user write good prompts for image and video generation.`;
 
-/** GPT-5 family rejects custom temperature — must use the default. */
-function modelExpectsDefaultTemperature(model: string): boolean {
-  return /^gpt-5(?:[.\-]|$)/i.test(model);
-}
-
 type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
   attachments?: ChatAttachment[];
+};
+
+type OpenAIResponseInput = {
+  role: "user" | "assistant" | "developer";
+  content: string | Array<Record<string, unknown>>;
 };
 
 /** Strip the `data:<mime>;base64,` prefix from a data URL, returning
@@ -108,7 +112,32 @@ function dataUrlToBase64(dataUrl: string): string | null {
   return m ? m[1] : null;
 }
 
-/* ── OpenAI Chat Completions ──────────────────────────────── */
+/* ── OpenAI Responses API ─────────────────────────────────── */
+
+function extractOpenAIResponseText(data: unknown): string {
+  const response = data as {
+    output_text?: string;
+    output?: Array<{
+      type?: string;
+      content?: Array<{ type?: string; text?: string }>;
+    }>;
+  };
+
+  if (typeof response.output_text === "string") {
+    return response.output_text;
+  }
+
+  const chunks: string[] = [];
+  for (const item of response.output ?? []) {
+    if (item.type !== "message") continue;
+    for (const part of item.content ?? []) {
+      if (part.type === "output_text" && typeof part.text === "string") {
+        chunks.push(part.text);
+      }
+    }
+  }
+  return chunks.join("");
+}
 
 async function callOpenAI({
   model,
@@ -126,41 +155,36 @@ async function callOpenAI({
     );
   }
 
-  /* Translate `attachments` → OpenAI's multipart content array. When
-   * a message has no attachments we keep the simple `content: string`
-   * form; when it does, content becomes
-   *   [{ type: "text", text }, { type: "image_url", image_url: { url } }]
-   * which is the documented vision input shape (works for gpt-4o,
-   * gpt-5, gpt-5.5, etc.). */
-  const translatedMessages = messages.map((m) => {
+  /* Translate `attachments` to Responses API content parts. The
+   * current OpenAI docs show `input_text` + `input_image` for
+   * multimodal Responses requests. Keep plain strings for text-only
+   * messages so legacy chat history stays compatible. */
+  const translatedMessages: OpenAIResponseInput[] = messages.map((m) => {
+    const role = m.role === "system" ? "developer" : m.role;
     if (!m.attachments || m.attachments.length === 0) {
-      return { role: m.role, content: m.content };
+      return { role, content: m.content };
     }
     const parts: Array<Record<string, unknown>> = [];
-    if (m.content) parts.push({ type: "text", text: m.content });
+    if (m.content) parts.push({ type: "input_text", text: m.content });
     for (const att of m.attachments) {
       parts.push({
-        type: "image_url",
-        image_url: { url: att.dataUrl },
+        type: "input_image",
+        image_url: att.dataUrl,
       });
     }
-    return { role: m.role, content: parts };
+    return { role, content: parts };
   });
 
   const openaiBody: Record<string, unknown> = {
     model,
-    messages: [
-      { role: "system" as const, content: systemPrompt },
-      ...translatedMessages,
-    ],
+    instructions: systemPrompt,
+    input: translatedMessages,
+    reasoning: { effort: "low" },
+    text: { verbosity: "low" },
+    store: false,
   };
-  // GPT-5 family requires the default temperature; older / GPT-4o
-  // family is happier with explicit 0.7 for chat-style replies.
-  if (!modelExpectsDefaultTemperature(model)) {
-    openaiBody.temperature = 0.7;
-  }
 
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+  const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -179,13 +203,11 @@ async function callOpenAI({
     } catch {
       /* not JSON, keep raw */
     }
-    throw new Error(`OpenAI API error (HTTP ${res.status}): ${detail}`);
+    throw new Error(`OpenAI Responses API error (HTTP ${res.status}): ${detail}`);
   }
 
-  const data = (await res.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  return data.choices?.[0]?.message?.content ?? "";
+  const data = await res.json();
+  return extractOpenAIResponseText(data);
 }
 
 /* ── Google Gemini ────────────────────────────────────────── */
@@ -352,6 +374,12 @@ serve(async (req) => {
     if (body.canvas_context) {
       const ctx = body.canvas_context;
       const lines: string[] = [];
+      if (ctx.project_name || ctx.project_id) {
+        lines.push(`Project: "${ctx.project_name ?? ctx.project_id}"`);
+      }
+      if (ctx.workspace_name || ctx.workspace_id) {
+        lines.push(`Space: "${ctx.workspace_name ?? ctx.workspace_id}"`);
+      }
       lines.push(`Canvas: "${ctx.canvas_name ?? "Untitled"}"`);
       const nodes = Array.isArray(ctx.nodes) ? ctx.nodes : [];
       if (nodes.length > 0) {
