@@ -3263,7 +3263,22 @@ function collectTripoImageUrls(params: Record<string, unknown>): string[] {
 }
 
 /**
- * executeRemoveBg — calls our remove-background edge function (Replicate BiRefNet).
+ * executeRemoveBg — calls Freepik's Remove Background endpoint (Magnific API).
+ *
+ * Swap-in for the legacy Replicate BiRefNet path (kept below as
+ * `executeRemoveBgReplicate_legacy` for fast rollback if Freepik QA fails).
+ *
+ * Reuses the same FREEPIK_API_KEY / MAGNIFIC_API_KEY env vars as our other
+ * Freepik integrations (loadMagnificApiKey).
+ *
+ * Endpoint: POST {MAGNIFIC_BASE}/ai/beta/remove-background
+ *   - Auth header: x-freepik-api-key (or x-magnific-api-key for magnific.com)
+ *   - Body: JSON { image: <base64-image> }
+ *   - Response: { data: { ... } } — defensively extract URL or base64 PNG.
+ *
+ * TODO(freepik): verify exact response field name. Public docs vary between
+ *   `data.high_resolution`, `data.url`, and `data.base64` depending on the
+ *   beta vs sync endpoint. We try all of them and fall back to deep-search.
  */
 async function executeRemoveBg(
   params: Record<string, unknown>,
@@ -3278,7 +3293,139 @@ async function executeRemoveBg(
     throw new Error("Remove Background service credentials are not configured.");
   }
 
-  console.log(`[remove-bg-pipeline] Calling remove-background edge fn`);
+  const apiKey = loadMagnificApiKey();
+  const endpoint = `${MAGNIFIC_BASE}/ai/beta/remove-background`;
+  const endpointHost = new URL(endpoint).hostname;
+  const authHeaderName = endpointHost.includes("magnific.com")
+    ? "x-magnific-api-key"
+    : "x-freepik-api-key";
+
+  console.log(`[remove-bg-pipeline] Calling Freepik remove-background (${endpoint})`);
+
+  // Freepik's image-input endpoints expect base64 in JSON; convert URL → base64.
+  let imageB64: string;
+  try {
+    imageB64 = bytesToBase64(await fetchImageBuffer(imageUrl));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to load source image for Remove Background: ${msg}`);
+  }
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      [authHeaderName]: apiKey,
+    },
+    body: JSON.stringify({ image: imageB64 }),
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    if (res.status === 402 || /billing|payment|insufficient|quota/i.test(text)) {
+      throw new Error("PROVIDER_BILLING_ERROR");
+    }
+    throw new Error(
+      `Freepik remove-background failed (HTTP ${res.status}): ${text.slice(0, 500)}`,
+    );
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  } catch {
+    throw new Error(
+      `Freepik remove-background returned non-JSON: ${text.slice(0, 200)}`,
+    );
+  }
+
+  const data = parsed.data && typeof parsed.data === "object"
+    ? (parsed.data as Record<string, unknown>)
+    : parsed;
+
+  // Try common Freepik response shapes:
+  //   1) { data: { high_resolution: <base64> } }   (beta sync)
+  //   2) { data: { url: "https://..." } }           (signed URL)
+  //   3) { data: { base64: <base64> } }             (alt sync)
+  //   4) deep search via extractProviderMediaUrl    (URL anywhere)
+  const directUrl = extractProviderMediaUrl(data);
+  const candidateB64 = String(
+    (data.high_resolution as string | undefined) ??
+      (data.base64 as string | undefined) ??
+      (data.image as string | undefined) ??
+      "",
+  );
+
+  let publicUrl = directUrl;
+
+  // If we got base64, upload it to ai-media and return a signed URL.
+  if (!publicUrl && candidateB64) {
+    try {
+      const cleaned = candidateB64.replace(/^data:image\/\w+;base64,/, "");
+      const bin = atob(cleaned);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+
+      const supabase = createClient(supabaseUrl, serviceRoleKey);
+      const fileName = `pipeline/mediaforge_nobg_${Date.now()}.png`;
+      const { error: uploadError } = await supabase.storage
+        .from("ai-media")
+        .upload(fileName, bytes, { contentType: "image/png", upsert: true });
+      if (!uploadError) {
+        const { data: urlData, error: signError } = await supabase.storage
+          .from("ai-media")
+          .createSignedUrl(fileName, 60 * 60 * 24 * 7);
+        if (!signError && urlData?.signedUrl) {
+          publicUrl = urlData.signedUrl;
+        } else {
+          const { data: pubData } = supabase.storage
+            .from("ai-media")
+            .getPublicUrl(fileName);
+          publicUrl = pubData.publicUrl;
+        }
+      } else {
+        console.error("[remove-bg-pipeline] Upload error:", uploadError);
+      }
+    } catch (err) {
+      console.error("[remove-bg-pipeline] base64 decode/upload failed:", err);
+    }
+  }
+
+  if (!publicUrl) {
+    throw new Error(
+      "Freepik remove-background returned no usable image URL or base64",
+    );
+  }
+
+  return {
+    result_url: publicUrl,
+    outputs: { output_image: publicUrl },
+    output_type: "image_url" as const,
+    provider_meta: { provider: "freepik", model: "freepik-remove-bg", endpoint },
+  };
+}
+
+/**
+ * executeRemoveBgReplicate_legacy — original Replicate BiRefNet path.
+ * Kept available for rollback. Not wired in the dispatcher.
+ *
+ * To re-enable: change the `case "remove_bg":` branches below to call
+ * executeRemoveBgReplicate_legacy(params, ...) instead of executeRemoveBg.
+ */
+async function executeRemoveBgReplicate_legacy(
+  params: Record<string, unknown>,
+  supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "",
+  serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+): Promise<ProviderResult> {
+  const imageUrl = String(params.image_url ?? "");
+  if (!imageUrl) {
+    throw new Error("Remove Background requires an image input.");
+  }
+  if (!supabaseUrl || !serviceRoleKey) {
+    throw new Error("Remove Background service credentials are not configured.");
+  }
+
+  console.log(`[remove-bg-pipeline] (legacy) Calling remove-background edge fn`);
 
   const res = await fetch(`${supabaseUrl}/functions/v1/remove-background`, {
     method: "POST",
