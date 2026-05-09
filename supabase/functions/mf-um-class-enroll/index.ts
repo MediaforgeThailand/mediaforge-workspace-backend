@@ -88,21 +88,33 @@ Deno.serve(async (req) => {
       .maybeSingle();
 
     const emailDomain = String(userData.user.email ?? "").split("@").pop()?.toLowerCase() ?? "";
-    const { data: allowedDomain } = emailDomain
-      ? await admin
-          .from("organization_domains")
-          .select("id")
-          .eq("organization_id", orgId)
-          .eq("domain", emailDomain)
-          .not("verified_at", "is", null)
-          .maybeSingle()
-      : { data: null };
+    const { data: domainRows, error: domainError } = await admin
+      .from("organization_domains")
+      .select("domain, verified_at")
+      .eq("organization_id", orgId);
+    if (domainError) {
+      console.error("[mf-um-class-enroll] domain lookup error:", domainError.message);
+      return json({ ok: false, error: "internal_error", detail: domainError.message }, 500);
+    }
+    const verifiedDomains = (domainRows ?? [])
+      .filter((row: any) => row?.verified_at)
+      .map((row: any) => String(row.domain ?? "").toLowerCase())
+      .filter(Boolean);
+    const allowedDomain = emailDomain ? verifiedDomains.includes(emailDomain) : false;
 
     if (!existingMember && !allowedDomain) {
+      if (verifiedDomains.length === 0) {
+        return json({
+          ok: false,
+          error: "school_domain_not_configured",
+          message: "This class's institution does not have a verified email domain yet.",
+        }, 403);
+      }
       return json({
         ok: false,
         error: "email_domain_not_allowed",
         message: "Use your college email account to join this class.",
+        expected_domains: verifiedDomains,
       }, 403);
     }
   }
