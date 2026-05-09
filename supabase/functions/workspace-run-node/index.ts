@@ -107,6 +107,45 @@ async function imageUrlToBase64(url: string): Promise<string> {
   return bytesToBase64(await fetchImageBuffer(url));
 }
 
+const OPENAI_IMAGE_MAX_BYTES = 50 * 1024 * 1024;
+
+function detectOpenAIImageFile(bytes: Uint8Array): { mime: string; ext: "png" | "jpg" | "webp" } | null {
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4E &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0D &&
+    bytes[5] === 0x0A &&
+    bytes[6] === 0x1A &&
+    bytes[7] === 0x0A
+  ) {
+    return { mime: "image/png", ext: "png" };
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) {
+    return { mime: "image/jpeg", ext: "jpg" };
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return { mime: "image/webp", ext: "webp" };
+  }
+  return null;
+}
+
+function openAIReferenceImageError(index: number, message: string): Error {
+  return new Error(`Reference image ${index + 1} is invalid for GPT Image 2: ${message}`);
+}
+
 function isProviderBillingLike(status: number, text: string): boolean {
   // 429 ALWAYS stays transient — even when the body claims "exceeded your
   // current quota" or "check your plan and billing details". Google's
@@ -7020,20 +7059,34 @@ async function executeOpenAIImage2(
     for (let i = 0; i < refUrls.length; i++) {
       try {
         const bytes = await fetchImageBuffer(refUrls[i]);
-        let mime = "image/png";
-        let ext = "png";
-        if (bytes[0] === 0xFF && bytes[1] === 0xD8) { mime = "image/jpeg"; ext = "jpg"; }
-        else if (bytes[0] === 0x52 && bytes[1] === 0x49) { mime = "image/webp"; ext = "webp"; }
+        if (bytes.byteLength > OPENAI_IMAGE_MAX_BYTES) {
+          throw openAIReferenceImageError(i, "file is larger than 50MB. Please upload a smaller PNG, JPG, or WEBP image.");
+        }
+        const detected = detectOpenAIImageFile(bytes);
+        if (!detected) {
+          throw openAIReferenceImageError(
+            i,
+            "file is not a supported PNG, JPG, or WEBP image. It may be a video, GIF, AVIF/HEIC, SVG, expired HTML response, or a corrupt image.",
+          );
+        }
+        const { mime, ext } = detected;
         const blob = new Blob([bytes], { type: mime });
         form.append(fieldName, blob, `ref_${i}.${ext}`);
         loaded++;
       } catch (err) {
-        console.warn(`[openai-image-2] Failed to load ref ${i}:`, err);
+        if (err instanceof Error && err.message.startsWith("Reference image ")) {
+          throw err;
+        }
+        throw openAIReferenceImageError(
+          i,
+          err instanceof Error ? err.message : String(err),
+        );
       }
     }
     if (loaded === 0) {
       throw new Error("All reference images failed to load");
     }
+    console.log(`[openai-image-2] edit request refs=${loaded}`);
 
     response = await fetchWithAttemptTimeout(
       "https://api.openai.com/v1/images/edits",
