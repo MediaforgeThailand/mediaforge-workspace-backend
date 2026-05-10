@@ -63,9 +63,16 @@ function rateLimitOk(userId: string): boolean {
 
 interface ChatAttachment {
   /** "image/png", "image/jpeg", … */
-  mime: string;
+  mime?: string;
   /** Full base64 `data:<mime>;base64,<…>` URL. */
-  dataUrl: string;
+  dataUrl?: string;
+  /** Fully qualified image URL, including signed Supabase Storage URLs. */
+  imageUrl?: string;
+  /** OpenAI image-detail hint. */
+  detail?: "low" | "high" | "auto";
+  /** Debug-only metadata from the canvas node that supplied the image. */
+  label?: string;
+  sourceNodeId?: string;
 }
 
 interface ChatBody {
@@ -110,6 +117,47 @@ type OpenAIResponseInput = {
 function dataUrlToBase64(dataUrl: string): string | null {
   const m = /^data:[^;]+;base64,(.+)$/.exec(dataUrl);
   return m ? m[1] : null;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+async function attachmentToGeminiInlineData(
+  att: ChatAttachment,
+): Promise<{ mime_type: string; data: string } | null> {
+  if (att.dataUrl) {
+    const b64 = dataUrlToBase64(att.dataUrl);
+    if (!b64) return null;
+    return {
+      mime_type: att.mime || "image/png",
+      data: b64,
+    };
+  }
+
+  if (!att.imageUrl) return null;
+
+  const res = await fetch(att.imageUrl);
+  if (!res.ok) {
+    throw new Error(
+      `Failed to fetch chat image attachment "${att.label ?? att.sourceNodeId ?? "image"}" (HTTP ${res.status})`,
+    );
+  }
+  const mime =
+    att.mime ||
+    res.headers.get("content-type")?.split(";")[0]?.trim() ||
+    "image/png";
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  return {
+    mime_type: mime,
+    data: bytesToBase64(bytes),
+  };
 }
 
 /* ── OpenAI Responses API ─────────────────────────────────── */
@@ -167,9 +215,12 @@ async function callOpenAI({
     const parts: Array<Record<string, unknown>> = [];
     if (m.content) parts.push({ type: "input_text", text: m.content });
     for (const att of m.attachments) {
+      const imageUrl = att.dataUrl ?? att.imageUrl;
+      if (!imageUrl) continue;
       parts.push({
         type: "input_image",
-        image_url: att.dataUrl,
+        image_url: imageUrl,
+        detail: att.detail ?? "low",
       });
     }
     return { role, content: parts };
@@ -249,19 +300,16 @@ async function callGemini({
    * as `inline_data` parts. Gemini's inline_data wants RAW base64
    * (no `data:image/…;base64,` prefix), so each attachment goes
    * through dataUrlToBase64 to strip it. */
-  const contents = messages
+  const contents = await Promise.all(messages
     .filter((m) => m.role !== "system")
-    .map((m) => {
+    .map(async (m) => {
       const parts: Array<Record<string, unknown>> = [];
       if (m.content) parts.push({ text: m.content });
       for (const att of m.attachments ?? []) {
-        const b64 = dataUrlToBase64(att.dataUrl);
-        if (!b64) continue;
+        const inline = await attachmentToGeminiInlineData(att);
+        if (!inline) continue;
         parts.push({
-          inline_data: {
-            mime_type: att.mime || "image/png",
-            data: b64,
-          },
+          inline_data: inline,
         });
       }
       // Empty parts[] is invalid in Gemini; insert a placeholder so
@@ -271,7 +319,7 @@ async function callGemini({
         role: m.role === "assistant" ? "model" : "user",
         parts,
       };
-    });
+    }));
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     model,
@@ -404,7 +452,7 @@ serve(async (req) => {
     console.log(
       `[workspace-chat] model=${model} msgs=${userMessages.length} canvas=${
         body.canvas_context ? "yes" : "no"
-      }`,
+      } attachments=${userMessages.reduce((sum, m) => sum + (m.attachments?.length ?? 0), 0)}`,
     );
 
     /* ── Provider routing ───────────────────────────────────
