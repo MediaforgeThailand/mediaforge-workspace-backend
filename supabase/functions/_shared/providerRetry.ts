@@ -131,7 +131,7 @@ export function classifyProviderError(errMsg: string): ProviderErrorClassificati
     return { kind: "rate_limit", retryable: true, fast_fallback: true, permanent: false };
   }
   if (/OpenAI Image 2 (?:edit|generation) timed out after \d+s/i.test(msg)) {
-    return { kind: "timeout", retryable: true, fast_fallback: true, permanent: false };
+    return { kind: "timeout", retryable: true, fast_fallback: false, permanent: false };
   }
   if (/DEADLINE_EXCEEDED|HTTP\s*504\b|timeout|timed out|aborted|ETIMEDOUT/i.test(msg)) {
     return { kind: "timeout", retryable: true, fast_fallback: false, permanent: false };

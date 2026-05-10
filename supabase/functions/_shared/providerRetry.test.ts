@@ -37,11 +37,11 @@ Deno.test("provider retry classifier: busy and timeout retry without fast-fallba
   assertEquals(timeout.fast_fallback, false);
 });
 
-Deno.test("provider retry classifier: OpenAI image timeout fast-fallbacks", () => {
+Deno.test("provider retry classifier: OpenAI image timeout retries without fast-fallback", () => {
   const timeout = classifyProviderError("OpenAI Image 2 edit timed out after 118s");
   assertEquals(timeout.kind, "timeout");
   assertEquals(timeout.retryable, true);
-  assertEquals(timeout.fast_fallback, true);
+  assertEquals(timeout.fast_fallback, false);
   assertEquals(timeout.permanent, false);
 });
 
