@@ -79,8 +79,10 @@ export interface SeedanceTaskCreate {
    * still use the multimodal-ref roles for 2.0 callers that wire
    * those slots.
    *
-   * Legacy 1.x omits the role entirely on image_url and still
-   * accepts trailing `--flag` tokens inline in the prompt text.
+   * Legacy 1.x still accepts trailing `--flag` tokens inline in the
+   * prompt text. Image contents must carry keyframe roles; BytePlus now
+   * rejects bare image_url items with "role must be specified for image
+   * contents".
    */
   content: Array<Record<string, unknown>>;
   /* ── Top-level generation params (Seedance 2.0 spec). ──
@@ -165,7 +167,8 @@ export interface BuiltSeedanceBody {
  * and 2.0:
  *
  *   - 1.x → inline `--flag value` tokens trailing the prompt text
- *           (BytePlus parses them server-side); image_url has no role.
+ *           (BytePlus parses them server-side); image_url uses
+ *           `first_frame` / `last_frame` roles.
  *   - 2.0 → top-level fields (`ratio`, `duration`, `generate_audio`,
  *           `watermark`, `seed`) sit beside `content`; image roles
  *           split into TWO mutually-exclusive modes:
@@ -276,12 +279,14 @@ export function buildSeedanceContent(
     content.push({
       type: "image_url",
       image_url: { url: p.startFrameUrl },
+      role: "first_frame",
     });
   }
   if (p.endFrameUrl) {
     content.push({
       type: "image_url",
       image_url: { url: p.endFrameUrl },
+      role: "last_frame",
     });
   }
 
