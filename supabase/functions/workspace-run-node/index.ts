@@ -275,12 +275,32 @@ function canUseReplicate(): boolean {
   return Boolean(Deno.env.get("REPLICATE_API_TOKEN")?.trim());
 }
 
-function truthyParam(value: unknown): boolean {
-  if (value === true) return true;
-  if (typeof value === "number") return value === 1;
-  if (typeof value !== "string") return false;
+function optionalBoolParam(value: unknown): boolean | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (value === true || value === false) return value;
+  if (typeof value === "number") {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return undefined;
+  }
+  if (typeof value !== "string") return undefined;
   const normalized = value.trim().toLowerCase();
-  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return undefined;
+}
+
+function audioPreferenceParam(
+  params: Record<string, unknown>,
+  defaultValue = false,
+): boolean {
+  const generateAudio = optionalBoolParam(params.generate_audio);
+  if (generateAudio !== undefined) return generateAudio;
+  const hasAudio = optionalBoolParam(params.has_audio);
+  if (hasAudio !== undefined) return hasAudio;
+  const replicateGenerateAudio = optionalBoolParam(params.replicate_generate_audio);
+  if (replicateGenerateAudio !== undefined) return replicateGenerateAudio;
+  return defaultValue;
 }
 
 function enforcePrimaryProviderParams(provider: string, params?: Record<string, unknown>): void {
@@ -302,11 +322,7 @@ function shouldGenerateFallbackVeoAudio(params: Record<string, unknown>): boolea
   if (envValue === "0" || envValue === "false" || envValue === "no" || envValue === "off" || envValue === "never") {
     return false;
   }
-  return (
-    truthyParam(params.replicate_generate_audio) ||
-    truthyParam(params.generate_audio) ||
-    truthyParam(params.has_audio)
-  );
+  return audioPreferenceParam(params, false);
 }
 
 function canUseGemini2Veo(): boolean {
@@ -1996,9 +2012,8 @@ async function executeSeedance(
   if (isSeedance20Fast && resolution === "1080p") {
     resolution = "720p";
   }
-  const generateAudioRaw = params.generate_audio ?? params.has_audio;
   const generateAudio = entry.supportsAudio
-    ? generateAudioRaw === true || generateAudioRaw === "true"
+    ? audioPreferenceParam(params, false)
     : undefined;
   const cameraFixedRaw = params.camera_fixed;
   const cameraFixed =
@@ -4880,10 +4895,7 @@ async function executeReplicateVideo(
     ? aspectRaw
     : "16:9";
   const duration = parseReplicateSeedanceDuration(params.duration);
-  const generateAudioRaw = params.generate_audio ?? params.has_audio;
-  const generateAudio = generateAudioRaw === undefined
-    ? true
-    : generateAudioRaw === true || generateAudioRaw === "true";
+  const generateAudio = audioPreferenceParam(params, false);
   const seedRaw = params.seed;
   const seed = seedRaw === null || seedRaw === undefined || String(seedRaw).trim() === ""
     ? undefined
@@ -7525,6 +7537,18 @@ async function advanceWorkspaceJobFallbackRoute(args: {
     fallback_from_provider: args.job.provider ?? originalProvider,
     fallback_from_model: args.job.model ?? originalModel,
   };
+  if (
+    (nextRoute.provider === "replicate_video" || nextRoute.provider === "replicate_veo") &&
+    nextParams.generate_audio === undefined &&
+    nextParams.has_audio === undefined &&
+    nextParams.replicate_generate_audio === undefined
+  ) {
+    // The workspace UI renders audio as Off by default, but older/saved
+    // nodes may not have that default persisted in params. Fallback
+    // providers must preserve the visible silent-default UX instead of
+    // silently upgrading to an audio-generating SKU.
+    nextParams.generate_audio = "false";
+  }
   const history = Array.isArray(meta.history) ? meta.history : [];
   const nextRequest: WorkspaceRunBody = {
     ...args.job.request,
