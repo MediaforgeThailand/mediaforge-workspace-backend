@@ -303,8 +303,9 @@ export async function lookupModelDiscountPercent(
   }
 
   if (providerDef.provider === "remove_bg") {
-    const model = String(params.model_name ?? params.model ?? "replicate-birefnet");
-    return maxDiscountByModelKeys(supabase, "remove_background", [model]);
+    const model = String(params.model_name ?? params.model ?? "freepik-remove-bg");
+    const keys = Array.from(new Set([model, "freepik-remove-bg", "replicate-birefnet"]));
+    return maxDiscountByModelKeys(supabase, "remove_background", keys);
   }
 
   if (providerDef.provider === "chat_ai") {
@@ -481,14 +482,11 @@ export async function lookupBaseCost(
     return data.cost;
   }
 
-  /* ── Background Removal (Replicate) ── */
+  /* ── Background Removal (Freepik/Magnific; legacy Replicate alias supported) ── */
   if (providerDef.provider === "remove_bg") {
-    const model = String(params.model_name ?? params.model ?? "replicate-birefnet");
-    const { data } = await supabase
-      .from("credit_costs").select("cost")
-      .eq("feature", "remove_background")
-      .eq("model", model)
-      .limit(1).maybeSingle();
+    const model = String(params.model_name ?? params.model ?? "freepik-remove-bg");
+    const keys = Array.from(new Set([model, "freepik-remove-bg", "replicate-birefnet"]));
+    const data = await firstCostByModelKeys(supabase, "remove_background", keys);
 
     if (!data) {
       throw new PricingConfigError(

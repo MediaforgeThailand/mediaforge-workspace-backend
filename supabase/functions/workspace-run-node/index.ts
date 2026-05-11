@@ -193,10 +193,17 @@ function summarizeProviderErrorBody(text: string, limit = 700): string {
     .slice(0, limit);
 }
 
-const MAGNIFIC_BASE =
-  Deno.env.get("FREEPIK_API_BASE")?.trim().replace(/\/+$/, "") ||
-  Deno.env.get("MAGNIFIC_API_BASE")?.trim().replace(/\/+$/, "") ||
-  "https://api.freepik.com/v1";
+function resolveMagnificBase(): string {
+  const explicitBase =
+    Deno.env.get("MAGNIFIC_API_BASE")?.trim() ||
+    Deno.env.get("FREEPIK_API_BASE")?.trim();
+  if (explicitBase) return explicitBase.replace(/\/+$/, "");
+  return (Deno.env.get("MAGNIFIC_API_KEY") ?? Deno.env.get("MAGNIFIC_KEY"))?.trim()
+    ? "https://api.magnific.com/v1"
+    : "https://api.freepik.com/v1";
+}
+
+const MAGNIFIC_BASE = resolveMagnificBase();
 
 function loadMagnificApiKey(): string {
   const rawKey =
@@ -206,7 +213,7 @@ function loadMagnificApiKey(): string {
   const key = rawKey?.trim().replace(/[\u0000-\u001F\u007F-\uFFFF]/g, "");
   if (!key) {
     throw new Error(
-      "Freepik/Magnific video fallback is not configured. Set MAGNIFIC_API_KEY or FREEPIK_API_KEY.",
+      "Freepik/Magnific API is not configured. Set MAGNIFIC_API_KEY or FREEPIK_API_KEY.",
     );
   }
   return key;
@@ -3312,12 +3319,10 @@ function collectTripoImageUrls(params: Record<string, unknown>): string[] {
  *
  * Endpoint: POST {MAGNIFIC_BASE}/ai/beta/remove-background
  *   - Auth header: x-freepik-api-key (or x-magnific-api-key for magnific.com)
- *   - Body: JSON { image: <base64-image> }
- *   - Response: { data: { ... } } — defensively extract URL or base64 PNG.
- *
- * TODO(freepik): verify exact response field name. Public docs vary between
- *   `data.high_resolution`, `data.url`, and `data.base64` depending on the
- *   beta vs sync endpoint. We try all of them and fall back to deep-search.
+ *   - Body: application/x-www-form-urlencoded { image_url: <public-image-url> }
+ *   - Response: { high_resolution, preview, original, url }.
+ *     Keep defensive extraction because old Freepik responses wrapped fields
+ *     under `data`.
  */
 async function executeRemoveBg(
   params: Record<string, unknown>,
@@ -3341,22 +3346,14 @@ async function executeRemoveBg(
 
   console.log(`[remove-bg-pipeline] Calling Freepik remove-background (${endpoint})`);
 
-  // Freepik's image-input endpoints expect base64 in JSON; convert URL → base64.
-  let imageB64: string;
-  try {
-    imageB64 = bytesToBase64(await fetchImageBuffer(imageUrl));
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`Failed to load source image for Remove Background: ${msg}`);
-  }
-
+  // Freepik remove-background expects a public image URL in form data.
   const res = await fetch(endpoint, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
       [authHeaderName]: apiKey,
     },
-    body: JSON.stringify({ image: imageB64 }),
+    body: new URLSearchParams({ image_url: imageUrl }),
   });
 
   const text = await res.text();
@@ -3382,11 +3379,11 @@ async function executeRemoveBg(
     ? (parsed.data as Record<string, unknown>)
     : parsed;
 
-  // Try common Freepik response shapes:
-  //   1) { data: { high_resolution: <base64> } }   (beta sync)
-  //   2) { data: { url: "https://..." } }           (signed URL)
-  //   3) { data: { base64: <base64> } }             (alt sync)
-  //   4) deep search via extractProviderMediaUrl    (URL anywhere)
+  // Try common Freepik/Magnific response shapes:
+  //   1) { high_resolution|url: "https://..." }      (current docs)
+  //   2) { data: { high_resolution|url: "..." } }    (legacy wrapper)
+  //   3) { data: { base64: <base64> } }              (alt sync)
+  //   4) deep search via extractProviderMediaUrl     (URL anywhere)
   const directUrl = extractProviderMediaUrl(data);
   const candidateB64 = String(
     (data.high_resolution as string | undefined) ??
@@ -7300,7 +7297,17 @@ function workspaceJobMaxAttempts(provider: string): number {
   // instead of letting users stare at a running row for half an hour.
   if (provider === "banana") return 6;
   if (provider === "openai") return 3;
+  if (provider === "remove_bg") return 4;
   return 18;
+}
+
+const REMOVE_BG_MODEL = "freepik-remove-bg";
+
+function normalizeWorkspaceProviderModel(provider: string, params: Record<string, unknown>): string | null {
+  if (provider !== "remove_bg") return null;
+  params.model_name = REMOVE_BG_MODEL;
+  if (params.model != null) params.model = REMOVE_BG_MODEL;
+  return REMOVE_BG_MODEL;
 }
 
 function normalizeDirectReplicateModelForPrimary(body: WorkspaceRunBody): string | null {
@@ -9440,6 +9447,8 @@ serve(async (req) => {
         nodeType,
         runRequest.params?.model_name as string | undefined,
       );
+      if (!runRequest.params) runRequest.params = {};
+      normalizeWorkspaceProviderModel(provider, runRequest.params);
       const model = String(
         runRequest.params?.model_name ??
           runRequest.params?.model ??
@@ -10824,6 +10833,7 @@ serve(async (req) => {
     // (mapped through HANDLE_SCHEMA so e.g. ref_image → image_url)
     // and mention URLs as a fallback ref_image / mention_image_urls.
     const params: Record<string, unknown> = { ...rawParams };
+    normalizeWorkspaceProviderModel(provider, params);
 
     // Did the caller provide a text prompt via an upstream Text edge?
     // Used to populate the response's prompt_source field.

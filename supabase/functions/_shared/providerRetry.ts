@@ -392,13 +392,12 @@ export async function defaultProbeProviderHealth(provider: string): Promise<Heal
       return { healthy: res.ok, reason: `HTTP ${res.status}` };
     }
     if (provider === "remove_bg") {
-      const REPLICATE = Deno.env.get("REPLICATE_API_TOKEN");
-      if (!REPLICATE) return { healthy: false, reason: "credentials missing" };
-      const res = await fetch("https://api.replicate.com/v1/account", {
-        headers: { Authorization: `Bearer ${REPLICATE}` },
-      });
-      await res.body?.cancel();
-      return { healthy: res.ok, reason: `HTTP ${res.status}` };
+      const key =
+        Deno.env.get("MAGNIFIC_API_KEY") ??
+        Deno.env.get("FREEPIK_API_KEY") ??
+        Deno.env.get("MAGNIFIC_KEY");
+      if (!key?.trim()) return { healthy: false, reason: "credentials missing" };
+      return { healthy: true, reason: "freepik credentials configured" };
     }
     if (provider === "merge_audio") {
       const KEY = Deno.env.get("SHOTSTACK_API_KEY");
