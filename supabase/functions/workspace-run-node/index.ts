@@ -2407,6 +2407,7 @@ async function executeVeo(
  */
 async function executeSeedream(
   params: Record<string, unknown>,
+  supabase: ReturnType<typeof createClient>,
 ): Promise<ProviderResult> {
   const { apiKey } = loadSeedanceCredentials();
 
@@ -2514,9 +2515,55 @@ async function executeSeedream(
     throw new Error("Seedream returned no URL in the first image item.");
   }
 
+  // Mirror the BytePlus-hosted image into `ai-media` so the frontend
+  // sees the same Supabase signed-URL shape every other image executor
+  // (Banana / OpenAI / Freepik) produces. BytePlus output URLs are
+  // short-lived CDN links; without mirroring, the result row points at
+  // a URL that expires within hours AND `result_url` was left
+  // undefined — which silently collapsed the downstream image-gen
+  // node body to a thin line because neither the image branch nor the
+  // empty placeholder matched.
+  let publicUrl = url;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`download HTTP ${res.status}`);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const contentType =
+      res.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
+    const ext =
+      contentType.includes("webp") ? "webp" :
+      contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" :
+      contentType.includes("gif") ? "gif" :
+      "png";
+    const fileName = `pipeline/seedream_${Date.now()}.${ext}`;
+    const { error: uploadError } = await supabase.storage
+      .from("ai-media")
+      .upload(fileName, bytes, { contentType, upsert: true });
+    if (uploadError) throw uploadError;
+    const { data: urlData, error: signError } = await supabase.storage
+      .from("ai-media")
+      .createSignedUrl(fileName, 60 * 60 * 24 * 7);
+    if (!signError && urlData?.signedUrl) {
+      publicUrl = urlData.signedUrl;
+    } else {
+      const { data: pubData } = supabase.storage
+        .from("ai-media")
+        .getPublicUrl(fileName);
+      publicUrl = pubData.publicUrl;
+    }
+    console.log(`[seedream] mirrored image to storage path=${fileName}`);
+  } catch (err) {
+    console.warn(
+      `[seedream] storage mirror failed, falling back to BytePlus URL: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+
   return {
+    result_url: publicUrl,
     outputs: {
-      output_image: url,
+      output_image: publicUrl,
     },
     output_type: "image_url",
     provider_meta: {
@@ -9822,6 +9869,42 @@ serve(async (req) => {
         const tr = (data.task_result ?? {}) as Record<string, unknown>;
         const videos = Array.isArray(tr.videos) ? (tr.videos as Array<Record<string, unknown>>) : [];
         videoUrl = videos.length > 0 ? String(videos[0]?.url ?? "") : "";
+
+        // Mirror the Kling CDN video into `user_assets` so the workspace
+        // library has a stable signed URL — Kling's hosted URLs expire
+        // within a short TTL, and without this the saved generation
+        // becomes a broken link a few hours/days later AND nothing
+        // ever lands in the user's asset library. Matches the pattern
+        // poll_veo and poll_replicate_* already use. Falls back to
+        // the raw Kling URL on mirror failure so the run still
+        // completes — the user just keeps an ephemeral link.
+        if (videoUrl) {
+          try {
+            const videoRes = await fetch(videoUrl);
+            if (!videoRes.ok) throw new Error(`download HTTP ${videoRes.status}`);
+            const bytes = new Uint8Array(await videoRes.arrayBuffer());
+            const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
+            const path = `${user.id}/kling-renders/mediaforge_${safeTaskId}.mp4`;
+            const upload = await supabase.storage
+              .from("user_assets")
+              .upload(path, bytes, { contentType: "video/mp4", upsert: true });
+            if (upload.error) throw upload.error;
+            const signed = await supabase.storage
+              .from("user_assets")
+              .createSignedUrl(path, 60 * 60 * 24 * 365);
+            if (signed.error || !signed.data?.signedUrl) {
+              throw signed.error ?? new Error("no signed URL");
+            }
+            videoUrl = signed.data.signedUrl;
+            console.log(`[poll_kling] mirrored video path=${path}`);
+          } catch (err) {
+            console.warn(
+              `[poll_kling] storage mirror failed, falling back to Kling URL: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }
+        }
       }
       return new Response(
         JSON.stringify({
@@ -9906,7 +9989,7 @@ serve(async (req) => {
             : rawStatus === "running"
               ? "processing"
               : rawStatus || "submitted";
-      const videoUrl =
+      let videoUrl =
         normalised === "succeed" ? String(statusObj.content?.video_url ?? "") : "";
       const rawMessage =
         statusObj.error?.message ?? (normalised === "failed" ? "Task failed" : "");
@@ -9916,6 +9999,39 @@ serve(async (req) => {
       // workspace_generation_jobs.error_message and surfaces it as a
       // toast.
       const message = humanizeSeedanceErrorMessage(rawMessage);
+
+      // Mirror the BytePlus CDN video into `user_assets` — same rationale
+      // as poll_kling: provider URL is short-lived and never reaches the
+      // asset library otherwise. Fallback keeps the raw URL on mirror
+      // failure.
+      if (videoUrl) {
+        try {
+          const videoRes = await fetch(videoUrl);
+          if (!videoRes.ok) throw new Error(`download HTTP ${videoRes.status}`);
+          const bytes = new Uint8Array(await videoRes.arrayBuffer());
+          const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
+          const path = `${user.id}/seedance-renders/mediaforge_${safeTaskId}.mp4`;
+          const upload = await supabase.storage
+            .from("user_assets")
+            .upload(path, bytes, { contentType: "video/mp4", upsert: true });
+          if (upload.error) throw upload.error;
+          const signed = await supabase.storage
+            .from("user_assets")
+            .createSignedUrl(path, 60 * 60 * 24 * 365);
+          if (signed.error || !signed.data?.signedUrl) {
+            throw signed.error ?? new Error("no signed URL");
+          }
+          videoUrl = signed.data.signedUrl;
+          console.log(`[poll_seedance] mirrored video path=${path}`);
+        } catch (err) {
+          console.warn(
+            `[poll_seedance] storage mirror failed, falling back to BytePlus URL: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      }
+
       return new Response(
         JSON.stringify({
           status: normalised,
@@ -10552,11 +10668,75 @@ serve(async (req) => {
             : rawStatus === "running"
               ? "processing"
               : rawStatus || "submitted";
-      const modelUrl = normalised === "succeed" ? pickHyper3dModelUrl(statusObj) : "";
-      const previewImage =
+      let modelUrl = normalised === "succeed" ? pickHyper3dModelUrl(statusObj) : "";
+      let previewImage =
         normalised === "succeed" ? String(statusObj.content?.rendered_image_url ?? "") : "";
       const message =
         statusObj.error?.message ?? (normalised === "failed" ? "Task failed" : "");
+
+      // Mirror both the GLB and the rendered preview into `ai-media`.
+      // Same rationale as poll_tripo3d (line 10755+): BytePlus URLs are
+      // short-lived and CORS-restricted, so model-viewer fails to load
+      // the GLB cross-origin AND nothing reaches the asset library.
+      // Either mirror failing falls back to the raw URL so the run
+      // still surfaces something useful.
+      if (normalised === "succeed") {
+        const mirror = async (
+          srcUrl: string,
+          ext: string,
+          contentType: string,
+        ): Promise<string | null> => {
+          try {
+            const r = await fetch(srcUrl);
+            if (!r.ok) {
+              console.warn(`[hyper3d] mirror ${ext} fetch ${r.status}`);
+              return null;
+            }
+            const buf = new Uint8Array(await r.arrayBuffer());
+            const fileName = `hyper3d/${taskId}/mediaforge_${Date.now()}.${ext}`;
+            const { error: upErr } = await supabase.storage
+              .from("ai-media")
+              .upload(fileName, buf, { contentType, upsert: true });
+            if (upErr) {
+              console.warn(`[hyper3d] mirror ${ext} upload err: ${upErr.message}`);
+              return null;
+            }
+            const { data: signed, error: signErr } = await supabase.storage
+              .from("ai-media")
+              .createSignedUrl(fileName, 60 * 60 * 24 * 365);
+            if (signErr || !signed?.signedUrl) {
+              console.warn(`[hyper3d] mirror ${ext} sign err: ${signErr?.message}`);
+              return null;
+            }
+            return signed.signedUrl;
+          } catch (err) {
+            console.warn(`[hyper3d] mirror ${ext} threw:`, err);
+            return null;
+          }
+        };
+
+        if (modelUrl) {
+          const m = modelUrl.match(/\.(glb|gltf|usdz|obj|fbx)(?=\?|#|$)/i);
+          const ext = (m?.[1] ?? "glb").toLowerCase();
+          const contentType =
+            ext === "gltf" ? "model/gltf+json"
+            : ext === "usdz" ? "model/vnd.usdz+zip"
+            : "model/gltf-binary";
+          const mirrored = await mirror(modelUrl, ext, contentType);
+          if (mirrored) modelUrl = mirrored;
+        }
+        if (previewImage) {
+          const m = previewImage.match(/\.(png|jpe?g|webp|avif)(?=\?|#|$)/i);
+          const ext = (m?.[1] ?? "png").toLowerCase();
+          const contentType =
+            ext === "jpg" || ext === "jpeg" ? "image/jpeg"
+            : ext === "webp" ? "image/webp"
+            : ext === "avif" ? "image/avif"
+            : "image/png";
+          const mirrored = await mirror(previewImage, ext, contentType);
+          if (mirrored) previewImage = mirrored;
+        }
+      }
 
       return new Response(
         JSON.stringify({
@@ -11121,7 +11301,7 @@ serve(async (req) => {
         result = await executeVeo(params, supabase);
         break;
       case "seedream":
-        result = await executeSeedream(params);
+        result = await executeSeedream(params, supabase);
         break;
       default:
         throw new Error(`No executor for provider "${provider}"`);
