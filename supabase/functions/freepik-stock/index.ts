@@ -7,7 +7,9 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-const FREEPIK_BASE = Deno.env.get("FREEPIK_API_BASE")?.trim() || "https://api.freepik.com/v1";
+const FREEPIK_BASE = Deno.env.get("MAGNIFIC_API_BASE")?.trim()
+  || Deno.env.get("FREEPIK_API_BASE")?.trim()
+  || "https://api.freepik.com/v1";
 const JSON_HEADERS = { ...corsHeaders, "Content-Type": "application/json" };
 
 function json(payload: unknown, status = 200): Response {
@@ -41,7 +43,7 @@ Deno.serve(async (req) => {
   }
 
   try {
-    const apiKey = Deno.env.get("FREEPIK_API_KEY");
+    const apiKey = Deno.env.get("MAGNIFIC_API_KEY") ?? Deno.env.get("FREEPIK_API_KEY");
     if (!apiKey) return json({ error: "Stock provider key not configured" }, 500);
 
     const authUser = await getAuthUser(req);
