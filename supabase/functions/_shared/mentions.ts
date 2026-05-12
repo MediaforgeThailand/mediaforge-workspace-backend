@@ -12,11 +12,32 @@ export interface MentionedAssetSrv {
   url?: string | null;
   fieldType?: "image" | "video" | "audio" | null;
   role?: string;
+  /** Browser-extracted end-frame JPEG URL — populated by the frontend
+   *  for video sources (uploaded AssetNode or AI-generated Video Gen
+   *  tool node). Lets image-target consumers receive a real image
+   *  while video-target consumers keep using the raw `url`. */
+  imageFrameUrl?: string | null;
   /** Element-only. */
   name?: string;
   reference_image_urls?: string[];
   frontal_image_url?: string;
   brand_element_id?: string;
+}
+
+/**
+ * Resolve a mention's image URL for downstream image models. Returns
+ * `m.url` for native image mentions, `m.imageFrameUrl` for video
+ * mentions that carry an extracted end-frame, or null otherwise. The
+ * returned URL is the value image consumers should treat as the
+ * attached ref.
+ */
+function effectiveImageRefUrl(
+  m: { url?: string | null; fieldType?: "image" | "video" | null; imageFrameUrl?: string | null } | undefined | null,
+): string | null {
+  if (!m) return null;
+  if (m.fieldType === "image" && typeof m.url === "string" && m.url) return m.url;
+  if (m.fieldType === "video" && typeof m.imageFrameUrl === "string" && m.imageFrameUrl) return m.imageFrameUrl;
+  return null;
 }
 
 /**
@@ -100,13 +121,11 @@ function getOpenAIImageRoleInstruction(role: string): string {
  */
 export function rewriteMentionsInline(
   text: string,
-  mentioned: Array<{ label?: string; nodeId?: string; url?: string | null; fieldType?: "image" | "video" | null; role?: string }>,
+  mentioned: Array<{ label?: string; nodeId?: string; url?: string | null; fieldType?: "image" | "video" | null; role?: string; imageFrameUrl?: string | null }>,
   provider: string,
 ): string {
   if (!text) return text;
-  const imageMentions = mentioned.filter(
-    (m) => m && m.fieldType === "image" && typeof m.url === "string" && m.url,
-  );
+  const imageMentions = mentioned.filter((m) => effectiveImageRefUrl(m) !== null);
   if (imageMentions.length === 0) {
     return text.replace(MENTION_REGEX, (_full, label) => label);
   }
@@ -145,12 +164,10 @@ export function rewriteMentionsInline(
  */
 export function appendMentionContext(
   text: string,
-  mentioned: Array<{ label?: string; nodeId?: string; url?: string | null; fieldType?: "image" | "video" | null; role?: string }>,
+  mentioned: Array<{ label?: string; nodeId?: string; url?: string | null; fieldType?: "image" | "video" | null; role?: string; imageFrameUrl?: string | null }>,
   provider: string,
 ): string {
-  const imageMentions = mentioned.filter(
-    (m) => m && m.fieldType === "image" && typeof m.url === "string" && m.url,
-  );
+  const imageMentions = mentioned.filter((m) => effectiveImageRefUrl(m) !== null);
   if (imageMentions.length === 0) return text;
   const lines = imageMentions.map((m, i) => {
     const role = (m.role ?? "general").toLowerCase();
