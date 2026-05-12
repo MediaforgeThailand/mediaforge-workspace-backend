@@ -21,6 +21,7 @@
  */
 
 import { loadSeedanceCredentials } from "./seedance.ts";
+import type { ProviderResult } from "./providerResult.ts";
 
 /** BytePlus ModelArk base — same gateway Seedance + Seedream use. */
 export const HYPER3D_BASE = "https://ark.ap-southeast.bytepluses.com";
@@ -235,6 +236,102 @@ export function pickHyper3dModelUrl(status: Hyper3dTaskStatus): string {
  * (it returns task_id and lets the frontend drive polling, same as
  * Seedance), but it's exported for any future inline use.
  */
+/**
+ * Hyper3D image-to-3D executor (BytePlus ModelArk, async).
+ *
+ * Submit/poll pipeline mirrors Seedance — we POST a task, return the
+ * task_id, and let the frontend drive the `poll_hyper3d` action. The
+ * provider_meta echoes the Tripo3D shape (`output_model` / `model_3d`)
+ * so the existing 3D node renderer can keep its happy path.
+ */
+export async function executeHyper3D(
+  params: Record<string, unknown>,
+): Promise<ProviderResult> {
+  const { apiKey } = loadSeedanceCredentials();
+
+  const modelSlug = String(params.model_name ?? params.model ?? "hyper3d-gen2");
+  const entry = HYPER3D_MODEL_MAP[modelSlug];
+  if (!entry) {
+    throw new Error(
+      `Unknown Hyper3D model: ${modelSlug}. ` +
+        `Available: ${Object.keys(HYPER3D_MODEL_MAP).join(", ")}`,
+    );
+  }
+
+  // Resolve the reference image (image-to-3D requires one).
+  const imageUrl =
+    (params.image_url as string | undefined) ??
+    (params.image as string | undefined) ??
+    (Array.isArray(params.mention_image_urls)
+      ? (params.mention_image_urls as string[])[0]
+      : undefined);
+  if (!imageUrl) {
+    throw new Error(
+      "Hyper3D Gen2 requires an image input — wire an asset / generation into the `image` port.",
+    );
+  }
+
+  const prompt = typeof params.prompt === "string" ? params.prompt : undefined;
+  // Output format selection isn't documented as a flag on the BytePlus
+  // path — Hyper3D Gen2 returns a single GLB regardless. Keep the
+  // `format` knob in metadata only so the UI's selector is still
+  // honoured downstream (e.g. file extension hints) without us
+  // forwarding an undocumented `--format` flag that the model would
+  // either ignore or reject.
+  const formatRaw = params.format ?? params.output_format;
+  const format =
+    formatRaw === "obj" || formatRaw === "fbx" || formatRaw === "glb"
+      ? (formatRaw as "obj" | "fbx" | "glb")
+      : "glb";
+  const textureRaw = params.texture ?? params.bake_texture;
+  const texture =
+    textureRaw === undefined ? true : textureRaw === true || textureRaw === "true";
+  const seedRaw = params.seed;
+  const seed =
+    typeof seedRaw === "number"
+      ? seedRaw
+      : seedRaw
+        ? parseInt(String(seedRaw), 10) || undefined
+        : undefined;
+
+  // buildHyper3dContent returns { content, seed? } — spread both
+  // into the wire body so `seed` lands at the top level (per the
+  // BytePlus curl example), not inside the prompt as a flag.
+  const built = buildHyper3dContent({
+    imageUrl,
+    prompt,
+    texture,
+    seed,
+  });
+
+  console.log(
+    `[hyper3d] submit model=${entry.model} texture=${texture} seed=${seed ?? "auto"}`,
+  );
+
+  const taskId = await submitHyper3dTask(
+    { model: entry.model, ...built },
+    apiKey,
+  );
+
+  return {
+    task_id: taskId,
+    outputs: {
+      output_model: "",
+      output_image: imageUrl,
+    },
+    output_type: "model_3d",
+    provider_meta: {
+      provider: "hyper3d",
+      model: modelSlug,
+      provider_model_id: entry.model,
+      tier: entry.tier,
+      format,
+      texture,
+      poll_endpoint: `${HYPER3D_BASE}${HYPER3D_TASKS_PATH}`,
+    },
+  };
+}
+
 export async function pollHyper3dToCompletion(
   taskId: string,
   apiKey: string,
