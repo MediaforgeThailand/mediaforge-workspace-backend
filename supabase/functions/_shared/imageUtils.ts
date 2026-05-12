@@ -117,6 +117,31 @@ const KLING_SUPPORTED_RATIOS: Array<{ label: string; value: number }> = [
   { label: "1:1",  value: 1 },
 ];
 
+export function extractProviderMediaUrl(value: unknown): string {
+  if (typeof value === "string") {
+    return /^https:\/\//i.test(value) ? value : "";
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = extractProviderMediaUrl(item);
+      if (found) return found;
+    }
+    return "";
+  }
+  if (value && typeof value === "object") {
+    const row = value as Record<string, unknown>;
+    for (const key of ["url", "image", "image_url", "output", "download_url"]) {
+      const found = extractProviderMediaUrl(row[key]);
+      if (found) return found;
+    }
+    for (const nested of Object.values(row)) {
+      const found = extractProviderMediaUrl(nested);
+      if (found) return found;
+    }
+  }
+  return "";
+}
+
 export function findClosestAspectRatio(width: number, height: number): string {
   const actual = width / height;
   let bestLabel = "16:9";

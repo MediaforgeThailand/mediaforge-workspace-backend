@@ -27,7 +27,9 @@
  * models). The credential loader is shared via _shared/seedance.ts.
  */
 
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { loadSeedanceCredentials } from "./seedance.ts";
+import type { ProviderResult } from "./providerResult.ts";
 
 /** BytePlus ModelArk base URL (international). Same gateway as Seedance. */
 export const SEEDREAM_BASE = "https://ark.ap-southeast.bytepluses.com";
@@ -171,4 +173,177 @@ export async function generateSeedreamSingleUrl(
     throw new Error("Seedream returned no URL in the first image item.");
   }
   return { url, raw: items };
+}
+
+export async function executeSeedream(
+  params: Record<string, unknown>,
+  supabase: ReturnType<typeof createClient>,
+): Promise<ProviderResult> {
+  const { apiKey } = loadSeedanceCredentials();
+
+  const modelSlug = String(params.model_name ?? params.model ?? "seedream-5-0");
+  const entry = SEEDREAM_MODEL_MAP[modelSlug];
+  if (!entry) {
+    throw new Error(
+      `Unknown Seedream model: ${modelSlug}. ` +
+        `Available: ${Object.keys(SEEDREAM_MODEL_MAP).join(", ")}`,
+    );
+  }
+
+  const prompt = String(params.prompt ?? "").trim();
+  if (!prompt) {
+    throw new Error("Seedream requires a prompt.");
+  }
+
+  // Size — accept either an explicit "WxH" string or a {width,height}
+  // pair the schema sometimes hands us.
+  const sizeRaw = params.size ?? params.image_size;
+  let size: string | undefined;
+  if (typeof sizeRaw === "string" && /^\d+x\d+$/i.test(sizeRaw)) {
+    size = sizeRaw;
+  } else if (typeof sizeRaw === "string" && sizeRaw.toLowerCase() === "2k") {
+    size = "2048x2048";
+  } else if (typeof sizeRaw === "string" && sizeRaw.toLowerCase() === "3k") {
+    size = "3072x3072";
+  } else if (typeof params.width === "number" && typeof params.height === "number") {
+    size = `${params.width}x${params.height}`;
+  } else {
+    size = "1024x1024";
+  }
+
+  const seedRaw = params.seed;
+  const seed =
+    typeof seedRaw === "number"
+      ? seedRaw
+      : seedRaw
+        ? parseInt(String(seedRaw), 10) || undefined
+        : undefined;
+
+  // Image-to-image / image-edit references — BytePlus ModelArk
+  // Seedream 4.5 + 5.0 take an `image_urls` ARRAY (max 14). The
+  // canvas writes wired ref-image edges into `ref_image` (single
+  // URL when one connection, array when many). Standalone tool
+  // calls historically used `image_url` (singular). Mention path
+  // hands us `mention_image_urls`. Accept all three and normalise
+  // to an array, capped at the API's 14-image limit.
+  //
+  // Until 2026-04 this executor was sending `{ image: <url> }`
+  // (singular) — the 4.5 / 5.0 endpoint silently dropped that
+  // field, so wired refs had no effect. Switching to `image_urls`
+  // matches the published BytePlus spec.
+  const collectRefUrls = (): string[] => {
+    const acc: string[] = [];
+    const push = (v: unknown) => {
+      if (typeof v === "string" && v.length > 0) acc.push(v);
+    };
+    const refRaw = params.ref_image;
+    if (Array.isArray(refRaw)) refRaw.forEach(push);
+    else push(refRaw);
+    push(params.image_url);
+    push(params.image);
+    if (Array.isArray(params.mention_image_urls)) {
+      (params.mention_image_urls as unknown[]).forEach(push);
+    }
+    // Dedupe while preserving order — BytePlus indexes references
+    // semantically ("Image 1", "Image 2" in the prompt), so the
+    // order matters and we can't union into an unordered set.
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const u of acc) {
+      if (seen.has(u)) continue;
+      seen.add(u);
+      out.push(u);
+    }
+    return out.slice(0, 14);
+  };
+  const refUrls = collectRefUrls();
+
+  const negativePrompt =
+    typeof params.negative_prompt === "string" ? params.negative_prompt : undefined;
+
+  console.log(
+    `[seedream] generate model=${entry.model} size=${size} seed=${seed ?? "auto"} ` +
+      `refs=${refUrls.length}`,
+  );
+
+  const items = await generateSeedreamImage(
+    {
+      model: entry.model,
+      prompt,
+      size,
+      response_format: "url",
+      n: 1,
+      ...(seed !== undefined ? { seed } : {}),
+      ...(refUrls.length > 0 ? { image_urls: refUrls } : {}),
+      ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
+    },
+    apiKey,
+  );
+
+  const url = items[0]?.url;
+  if (!url) {
+    throw new Error("Seedream returned no URL in the first image item.");
+  }
+
+  // Mirror the BytePlus-hosted image into `ai-media` so the frontend
+  // sees the same Supabase signed-URL shape every other image executor
+  // (Banana / OpenAI / Freepik) produces. BytePlus output URLs are
+  // short-lived CDN links; without mirroring, the result row points at
+  // a URL that expires within hours AND `result_url` was left
+  // undefined — which silently collapsed the downstream image-gen
+  // node body to a thin line because neither the image branch nor the
+  // empty placeholder matched.
+  let publicUrl = url;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`download HTTP ${res.status}`);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const contentType =
+      res.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
+    const ext =
+      contentType.includes("webp") ? "webp" :
+      contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" :
+      contentType.includes("gif") ? "gif" :
+      "png";
+    const fileName = `pipeline/seedream_${Date.now()}.${ext}`;
+    const { error: uploadError } = await supabase.storage
+      .from("ai-media")
+      .upload(fileName, bytes, { contentType, upsert: true });
+    if (uploadError) throw uploadError;
+    const { data: urlData, error: signError } = await supabase.storage
+      .from("ai-media")
+      .createSignedUrl(fileName, 60 * 60 * 24 * 7);
+    if (!signError && urlData?.signedUrl) {
+      publicUrl = urlData.signedUrl;
+    } else {
+      const { data: pubData } = supabase.storage
+        .from("ai-media")
+        .getPublicUrl(fileName);
+      publicUrl = pubData.publicUrl;
+    }
+    console.log(`[seedream] mirrored image to storage path=${fileName}`);
+  } catch (err) {
+    console.warn(
+      `[seedream] storage mirror failed, falling back to BytePlus URL: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+
+  return {
+    result_url: publicUrl,
+    outputs: {
+      output_image: publicUrl,
+    },
+    output_type: "image_url",
+    provider_meta: {
+      provider: "seedream",
+      model: modelSlug,
+      provider_model_id: entry.model,
+      tier: entry.tier,
+      size,
+      revised_prompt: items[0]?.revised_prompt,
+      reference_image_count: refUrls.length,
+    },
+  };
 }
