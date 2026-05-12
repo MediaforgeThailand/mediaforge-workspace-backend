@@ -25,11 +25,10 @@
  * we still rate-limit per user to blunt scripted abuse (20/min,
  * matches the picker grid size + a generous re-click buffer).
  *
- * Auth: verify_jwt = true. The bucket's INSERT policy requires
- *       `authenticated` so the function must run with the user's JWT
- *       to perform the upload (service_role would bypass RLS but
- *       we want to keep the audit trail in `storage.objects` keyed
- *       to a real auth.uid()).
+ * Auth: optional. The preview is free, cached, and does not touch
+ *       credits, so logged-out users can audition voices before
+ *       signing in. Authenticated users rate-limit by user id; guests
+ *       rate-limit by request IP/user-agent.
  */
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
@@ -73,6 +72,43 @@ function rateLimitOk(userId: string): boolean {
   arr.push(now);
   _userHits.set(userId, arr);
   return true;
+}
+
+function guestRateLimitKey(req: Request): string {
+  const forwardedFor =
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    req.headers.get("cf-connecting-ip")?.trim() ||
+    req.headers.get("x-real-ip")?.trim() ||
+    "unknown-ip";
+  const userAgent = req.headers.get("user-agent")?.slice(0, 80) || "unknown-ua";
+  return `guest:${forwardedFor}:${userAgent}`;
+}
+
+async function authenticatedRateLimitKey(
+  req: Request,
+  supabaseUrl: string,
+  anonKey: string | undefined,
+): Promise<string> {
+  const authHeader = req.headers.get("authorization");
+  if (!authHeader?.startsWith("Bearer ") || !anonKey) {
+    return guestRateLimitKey(req);
+  }
+
+  try {
+    const supabaseUser = createClient(supabaseUrl, anonKey, {
+      global: { headers: { Authorization: authHeader } },
+    });
+    const { data: { user } } = await supabaseUser.auth.getUser(
+      authHeader.replace("Bearer ", ""),
+    );
+    if (user?.id) return `user:${user.id}`;
+  } catch (_err) {
+    // Logged-out callers commonly arrive with only the anon key in
+    // Authorization. Preview is intentionally public, so fall back to
+    // guest rate limiting instead of failing the request.
+  }
+
+  return guestRateLimitKey(req);
 }
 
 /* ─── Provider synthesis helpers ─────────────────────────────────── */
@@ -290,30 +326,13 @@ serve(async (req) => {
       Deno.env.get("SUPABASE_ANON_KEY") ??
       Deno.env.get("SUPABASE_PUBLISHABLE_KEY");
 
-    const authHeader = req.headers.get("authorization");
-    if (!authHeader?.startsWith("Bearer ")) {
-      return new Response(JSON.stringify({ error: "Authorization required" }), {
-        status: 401,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    // Verify the user — we use the user-scoped client so the upload
-    // below is recorded against the actual auth.uid().
-    const supabaseUser = createClient(SUPABASE_URL, ANON_KEY!, {
-      global: { headers: { Authorization: authHeader } },
-    });
-    const { data: { user }, error: authErr } = await supabaseUser.auth.getUser(
-      authHeader.replace("Bearer ", ""),
+    const rateLimitKey = await authenticatedRateLimitKey(
+      req,
+      SUPABASE_URL,
+      ANON_KEY,
     );
-    if (authErr || !user) {
-      return new Response(JSON.stringify({ error: "Invalid token" }), {
-        status: 401,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
 
-    if (!rateLimitOk(user.id)) {
+    if (!rateLimitOk(rateLimitKey)) {
       return new Response(
         JSON.stringify({ error: "Rate limit exceeded. Wait a moment." }),
         {
