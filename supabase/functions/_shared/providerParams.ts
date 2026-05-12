@@ -62,3 +62,21 @@ export function shouldFallbackVeoQuota(errMsg: string): boolean {
     /HTTP 429|RESOURCE_EXHAUSTED|exceeded your current quota|rate-limits|ai\.dev\/rate-limit/i.test(errMsg)
   );
 }
+
+/** Coerce `params[key]` to a number clamped to [min,max]; falls back
+ *  to `def` for anything that isn't a finite number in range. Used by
+ *  TTS executors to keep slider knobs within each provider's documented
+ *  bounds (e.g. ElevenLabs stability 0–1, Google speakingRate 0.25–2.0). */
+export function clampNum(
+  raw: unknown,
+  min: number,
+  max: number,
+  def: number,
+): number {
+  const n =
+    typeof raw === "number" ? raw : raw === undefined || raw === null || raw === "" ? def : Number(raw);
+  if (!Number.isFinite(n)) return def;
+  if (n < min) return min;
+  if (n > max) return max;
+  return n;
+}
