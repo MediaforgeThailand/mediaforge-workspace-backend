@@ -67,6 +67,57 @@ import {
   type VeoPersonGeneration,
   type VeoResolution,
 } from "../_shared/veo.ts";
+import {
+  bytesToBase64,
+  detectOpenAIImageFile,
+  extractImageDimensions,
+  fetchImageBuffer,
+  findClosestAspectRatio,
+  imageUrlToBase64,
+  openAIReferenceImageError,
+  OPENAI_IMAGE_MAX_BYTES,
+  type ImageDimensions,
+} from "../_shared/imageUtils.ts";
+import {
+  fetchWithAttemptTimeout,
+  isProviderBillingLike,
+  summarizeProviderErrorBody,
+  summarizeProviderErrorText,
+} from "../_shared/providerErrors.ts";
+import {
+  canUseMagnificImage,
+  canUseMagnificVeo,
+  canUseMagnificVideo,
+  canUseReplicate,
+  canUseReplicateVeo,
+  loadMagnificApiKey,
+  MAGNIFIC_BASE,
+  shouldPreferMagnificVeo,
+  shouldPreferReplicateVeo,
+  shouldUseMagnificSeedanceFallback,
+} from "../_shared/magnific.ts";
+import {
+  audioPreferenceParam,
+  canUseGemini2Veo,
+  enforcePrimaryProviderParams,
+  shouldFallbackVeoQuota,
+  shouldGenerateFallbackVeoAudio,
+} from "../_shared/providerParams.ts";
+import {
+  formatKlingApiError,
+  generateKlingJWT,
+  KLING_MODEL_MAP,
+} from "../_shared/kling.ts";
+import {
+  appendUniqueStringParam,
+  HANDLE_SCHEMA,
+  isValidMediaUrl,
+  normalizeHandle,
+  normalizeHandleForModel,
+  validateEdgeValue,
+  type DataType,
+  type HandleDef,
+} from "./handleNormalization.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -74,605 +125,10 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-cron-secret, x-workspace-worker-secret, x-workspace-worker-user-id, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
-/* ═══════════════════════════════════════════════════════════
-   Helpers (duplicated from run-flow-init — shared module would be ideal)
-   ═══════════════════════════════════════════════════════════ */
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const chunkSize = 8192;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
-
-async function fetchImageBuffer(url: string): Promise<Uint8Array> {
-  if (url.startsWith("data:")) {
-    const match = url.match(/^data:[^;]+;base64,(.+)$/);
-    if (match) {
-      const bin = atob(match[1]);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      return bytes;
-    }
-    throw new Error("Invalid data URI");
-  }
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to download image: ${res.status}`);
-  return new Uint8Array(await res.arrayBuffer());
-}
-
-async function imageUrlToBase64(url: string): Promise<string> {
-  return bytesToBase64(await fetchImageBuffer(url));
-}
-
-const OPENAI_IMAGE_MAX_BYTES = 50 * 1024 * 1024;
-
-function detectOpenAIImageFile(bytes: Uint8Array): { mime: string; ext: "png" | "jpg" | "webp" } | null {
-  if (
-    bytes.length >= 8 &&
-    bytes[0] === 0x89 &&
-    bytes[1] === 0x50 &&
-    bytes[2] === 0x4E &&
-    bytes[3] === 0x47 &&
-    bytes[4] === 0x0D &&
-    bytes[5] === 0x0A &&
-    bytes[6] === 0x1A &&
-    bytes[7] === 0x0A
-  ) {
-    return { mime: "image/png", ext: "png" };
-  }
-  if (bytes.length >= 3 && bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) {
-    return { mime: "image/jpeg", ext: "jpg" };
-  }
-  if (
-    bytes.length >= 12 &&
-    bytes[0] === 0x52 &&
-    bytes[1] === 0x49 &&
-    bytes[2] === 0x46 &&
-    bytes[3] === 0x46 &&
-    bytes[8] === 0x57 &&
-    bytes[9] === 0x45 &&
-    bytes[10] === 0x42 &&
-    bytes[11] === 0x50
-  ) {
-    return { mime: "image/webp", ext: "webp" };
-  }
-  return null;
-}
-
-function openAIReferenceImageError(index: number, message: string): Error {
-  return new Error(`Reference image ${index + 1} is invalid for GPT Image 2: ${message}`);
-}
-
-function isProviderBillingLike(status: number, text: string): boolean {
-  // 429 ALWAYS stays transient — even when the body claims "exceeded your
-  // current quota" or "check your plan and billing details". Google's
-  // well-documented "ghost 429" / "free_tier_requests Limit 0" bugs return
-  // billing-flavoured bodies on Tier-1 paid keys (esp. for the Pro image
-  // models like gemini-3-pro-image-preview), and refunding the user
-  // permanently for a Google-side glitch is wrong. The durable queue will
-  // retry on its normal backoff; if it really IS exhausted the queue's
-  // dead-letter budget will eventually catch it.
-  if (status === 429) return false;
-  // 402 Payment Required is the only HTTP code Google + most providers use
-  // for genuine billing exhaustion.
-  if (status === 402) return true;
-  // Body-keyword fallback for providers that don't use 402 (Kling, Replicate,
-  // Shotstack, etc.). Keep this list TIGHT — generic words like "billing" or
-  // "quota exceeded" can appear in transient errors too. Only match phrases
-  // that unambiguously mean "the account ran out of credit".
-  return /account balance not enough|insufficient balance|payment required|prepaid|top[ -]?up/i.test(text);
-}
-
-function summarizeProviderErrorBody(text: string, limit = 700): string {
-  const raw = String(text ?? "").trim();
-  if (!raw) return "";
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const error = parsed.error as Record<string, unknown> | undefined;
-    const message = typeof error?.message === "string" ? error.message : "";
-    const status = typeof error?.status === "string" ? error.status : "";
-    const code = typeof error?.code === "number" || typeof error?.code === "string"
-      ? String(error.code)
-      : "";
-    const detail = [code ? `code ${code}` : "", status, message]
-      .filter(Boolean)
-      .join(" ");
-    if (detail) return detail.slice(0, limit);
-  } catch {
-    // Fall through to plain-text/html cleanup.
-  }
-  return raw
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, limit);
-}
-
-function resolveMagnificBase(): string {
-  const explicitBase =
-    Deno.env.get("MAGNIFIC_API_BASE")?.trim() ||
-    Deno.env.get("FREEPIK_API_BASE")?.trim();
-  if (explicitBase) return explicitBase.replace(/\/+$/, "");
-  return (Deno.env.get("MAGNIFIC_API_KEY") ?? Deno.env.get("MAGNIFIC_KEY"))?.trim()
-    ? "https://api.magnific.com/v1"
-    : "https://api.freepik.com/v1";
-}
-
-const MAGNIFIC_BASE = resolveMagnificBase();
-
-function loadMagnificApiKey(): string {
-  const rawKey =
-    Deno.env.get("MAGNIFIC_API_KEY") ??
-    Deno.env.get("FREEPIK_API_KEY") ??
-    Deno.env.get("MAGNIFIC_KEY");
-  const key = rawKey?.trim().replace(/[\u0000-\u001F\u007F-\uFFFF]/g, "");
-  if (!key) {
-    throw new Error(
-      "Freepik/Magnific API is not configured. Set MAGNIFIC_API_KEY or FREEPIK_API_KEY.",
-    );
-  }
-  return key;
-}
-
-function shouldPreferMagnificVeo(): boolean {
-  const value = String(
-    Deno.env.get("VEO_PROVIDER") ??
-      Deno.env.get("VEO_BACKEND") ??
-      Deno.env.get("VEO_FALLBACK_PROVIDER") ??
-      "",
-  ).trim().toLowerCase();
-  return value === "freepik" || value === "magnific" || value === "freepik_veo";
-}
-
-function shouldPreferReplicateVeo(): boolean {
-  const value = String(
-    Deno.env.get("VEO_PROVIDER") ??
-      Deno.env.get("VEO_BACKEND") ??
-      Deno.env.get("VEO_FALLBACK_PROVIDER") ??
-      "",
-  ).trim().toLowerCase();
-  return value === "replicate" || value === "replicate_veo";
-}
-
-function canUseMagnificVeo(): boolean {
-  return Boolean(
-    Deno.env.get("MAGNIFIC_API_KEY") ??
-      Deno.env.get("FREEPIK_API_KEY") ??
-      Deno.env.get("MAGNIFIC_KEY"),
-  );
-}
-
-function canUseMagnificImage(): boolean {
-  return canUseMagnificVeo();
-}
-
-function canUseMagnificVideo(): boolean {
-  return canUseMagnificVeo();
-}
-
-// Magnific's current public docs list Seedance Pro/Lite endpoints, not
-// Dreamina Seedance 2.0. Keep this off unless the operator explicitly accepts
-// that the fallback changes provider/model semantics.
-function shouldUseMagnificSeedanceFallback(): boolean {
-  const value = String(
-    Deno.env.get("SEEDANCE_REAL_PERSON_FALLBACK_PROVIDER") ??
-      Deno.env.get("SEEDANCE_FALLBACK_PROVIDER") ??
-      "",
-  ).trim().toLowerCase();
-  return value === "magnific" || value === "freepik" || value === "freepik_seedance";
-}
-
-function canUseReplicateVeo(): boolean {
-  return Boolean(Deno.env.get("REPLICATE_API_TOKEN"));
-}
-
-function canUseReplicate(): boolean {
-  return Boolean(Deno.env.get("REPLICATE_API_TOKEN")?.trim());
-}
-
-function optionalBoolParam(value: unknown): boolean | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
-  if (value === true || value === false) return value;
-  if (typeof value === "number") {
-    if (value === 1) return true;
-    if (value === 0) return false;
-    return undefined;
-  }
-  if (typeof value !== "string") return undefined;
-  const normalized = value.trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(normalized)) return true;
-  if (["0", "false", "no", "off"].includes(normalized)) return false;
-  return undefined;
-}
-
-function audioPreferenceParam(
-  params: Record<string, unknown>,
-  defaultValue = false,
-): boolean {
-  const generateAudio = optionalBoolParam(params.generate_audio);
-  if (generateAudio !== undefined) return generateAudio;
-  const hasAudio = optionalBoolParam(params.has_audio);
-  if (hasAudio !== undefined) return hasAudio;
-  const replicateGenerateAudio = optionalBoolParam(params.replicate_generate_audio);
-  if (replicateGenerateAudio !== undefined) return replicateGenerateAudio;
-  return defaultValue;
-}
-
-function enforcePrimaryProviderParams(provider: string, params?: Record<string, unknown>): void {
-  if (!params) return;
-  if (provider === "veo") {
-    // Google Veo 3.1 direct always returns audio and has no no-audio
-    // request parameter. Preserve the user's explicit audio preference so
-    // capability/quota fallback providers that do support silent output can
-    // honor it instead of being forced into the expensive audio tier.
-    delete params.replicate_generate_audio;
-  }
-}
-
-function shouldGenerateFallbackVeoAudio(params: Record<string, unknown>): boolean {
-  const envValue = String(Deno.env.get("REPLICATE_VEO_GENERATE_AUDIO") ?? "").trim().toLowerCase();
-  if (envValue === "1" || envValue === "true" || envValue === "yes" || envValue === "on" || envValue === "force") {
-    return true;
-  }
-  if (envValue === "0" || envValue === "false" || envValue === "no" || envValue === "off" || envValue === "never") {
-    return false;
-  }
-  return audioPreferenceParam(params, false);
-}
-
-function canUseGemini2Veo(): boolean {
-  return Boolean(Deno.env.get("GEMINI2_API_KEY"));
-}
-
-function shouldFallbackVeoQuota(errMsg: string): boolean {
-  return (
-    isNonRetryableQuotaError(errMsg) ||
-    /HTTP 429|RESOURCE_EXHAUSTED|exceeded your current quota|rate-limits|ai\.dev\/rate-limit/i.test(errMsg)
-  );
-}
-
-function summarizeProviderErrorText(raw: string, maxLength = 500): string {
-  const title = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1];
-  const source = title ?? raw;
-  return source
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, maxLength);
-}
-
-async function fetchWithAttemptTimeout(
-  input: string | URL | Request,
-  init: RequestInit,
-  timeoutMs: number,
-  label: string,
-): Promise<Response> {
-  const aborter = new AbortController();
-  const timer = setTimeout(() => aborter.abort(), timeoutMs);
-  try {
-    return await fetch(input, { ...init, signal: init.signal ?? aborter.signal });
-  } catch (err) {
-    if ((err as { name?: string })?.name === "AbortError") {
-      throw new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`);
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/* ─── Image dimension extraction (lightweight header parsing) ─── */
-
-interface ImageDimensions { width: number; height: number }
-
-function extractImageDimensions(buf: Uint8Array): ImageDimensions | null {
-  try {
-    // PNG: bytes 0-7 = signature, IHDR at byte 8
-    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) {
-      const width = (buf[16] << 24) | (buf[17] << 16) | (buf[18] << 8) | buf[19];
-      const height = (buf[20] << 24) | (buf[21] << 16) | (buf[22] << 8) | buf[23];
-      return { width, height };
-    }
-    // JPEG: scan for SOF marker
-    if (buf[0] === 0xFF && buf[1] === 0xD8) {
-      let offset = 2;
-      while (offset < buf.length - 8) {
-        if (buf[offset] !== 0xFF) { offset++; continue; }
-        const marker = buf[offset + 1];
-        if (marker >= 0xC0 && marker <= 0xC3 && marker !== 0xC1) {
-          const height = (buf[offset + 5] << 8) | buf[offset + 6];
-          const width = (buf[offset + 7] << 8) | buf[offset + 8];
-          return { width, height };
-        }
-        const segLen = (buf[offset + 2] << 8) | buf[offset + 3];
-        offset += 2 + segLen;
-      }
-    }
-    // WebP
-    if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) {
-      if (buf[12] === 0x56 && buf[13] === 0x50 && buf[14] === 0x38 && buf[15] === 0x20) {
-        const width = ((buf[26] | (buf[27] << 8)) & 0x3FFF);
-        const height = ((buf[28] | (buf[29] << 8)) & 0x3FFF);
-        return { width, height };
-      }
-      if (buf[12] === 0x56 && buf[13] === 0x50 && buf[14] === 0x38 && buf[15] === 0x4C) {
-        const b0 = buf[21], b1 = buf[22], b2 = buf[23], b3 = buf[24];
-        const width = 1 + (((b1 & 0x3F) << 8) | b0);
-        const height = 1 + (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 >> 6) & 0x03));
-        return { width, height };
-      }
-    }
-  } catch (e) {
-    console.warn("[aspect-ratio] Header parse error:", e);
-  }
-  return null;
-}
-
-/* ─── Closest aspect ratio matching ─── */
-
-const KLING_SUPPORTED_RATIOS: Array<{ label: string; value: number }> = [
-  { label: "16:9", value: 16 / 9 },
-  { label: "9:16", value: 9 / 16 },
-  { label: "1:1",  value: 1 },
-];
-
-function findClosestAspectRatio(width: number, height: number): string {
-  const actual = width / height;
-  let bestLabel = "16:9";
-  let bestDiff = Infinity;
-  for (const r of KLING_SUPPORTED_RATIOS) {
-    const diff = Math.abs(actual - r.value);
-    if (diff < bestDiff) { bestDiff = diff; bestLabel = r.label; }
-  }
-  console.log(`[aspect-ratio] Image ${width}×${height} (ratio=${actual.toFixed(4)}) → matched "${bestLabel}" (diff=${bestDiff.toFixed(4)})`);
-  return bestLabel;
-}
-
-/**
- * Format a Kling API error body into a user-friendly message.
- *
- * Kling validation failures arrive as JSON like:
- *   { code: 1201, message: "prompt: size must be between 0 and 2500", request_id: "..." }
- * Surfacing the raw payload (with JSON braces and request_id) in the
- * UI toast makes the error unreadable. Map known codes to clean
- * messages and otherwise extract `message` from the JSON when present.
- *
- * Code 1201 = prompt-size violation. We DO want this to reach the
- * client (it's an actionable user error, not a transient provider
- * fault), so do NOT classify it as PROVIDER_BILLING_ERROR.
- */
-function formatKlingApiError(label: string, status: number, errText: string): string {
-  try {
-    const parsed = JSON.parse(errText) as { code?: number; message?: string };
-    if (typeof parsed?.message === "string" && parsed.message) {
-      const base = `${label} (HTTP ${status}): ${parsed.message}`;
-      // Code 1201 is Kling's generic "request parameter error" — it covers
-      // mode/model mismatches, missing fields, and prompt-length issues
-      // alike. Only append the prompt-shortening hint when the message
-      // actually looks length-related; otherwise it misleads users with
-      // 100-character prompts who hit a different parameter problem.
-      const looksLengthRelated = /character|length|too long|exceed|2500/i.test(parsed.message);
-      if (parsed.code === 1201 && looksLengthRelated) {
-        return `${base} (Kling caps prompts at 2500 characters — try shortening.)`;
-      }
-      return base;
-    }
-  } catch {
-    // not JSON — fall through to the raw substring fallback
-  }
-  return `${label} (HTTP ${status}): ${errText.substring(0, 200)}`;
-}
-
-async function generateKlingJWT(accessKeyId: string, secretKey: string): Promise<string> {
-  const header = { alg: "HS256", typ: "JWT" };
-  const now = Math.floor(Date.now() / 1000);
-  const payload = { iss: accessKeyId, exp: now + 1800, nbf: now - 5, iat: now };
-  const encoder = new TextEncoder();
-  const headerB64 = btoa(JSON.stringify(header)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-  const payloadB64 = btoa(JSON.stringify(payload)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-  const signingInput = `${headerB64}.${payloadB64}`;
-  const key = await crypto.subtle.importKey("raw", encoder.encode(secretKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(signingInput));
-  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-  return `${signingInput}.${sigB64}`;
-}
-
-/* ─── Model mappings ─── */
-
-const KLING_MODEL_MAP: Record<string, { model: string; mode: string; isMotion?: boolean; isOmni?: boolean }> = {
-  "kling-v1-pro":             { model: "kling-v1",          mode: "pro" },
-  "kling-v1-5-pro":           { model: "kling-v1-5",        mode: "pro" },
-  "kling-v1-6-pro":           { model: "kling-v1-6",        mode: "pro" },
-  "kling-v2-master":          { model: "kling-v2-master",    mode: "pro" },
-  "kling-v2-1-pro":           { model: "kling-v2-1",        mode: "pro" },
-  "kling-v2-1-master":        { model: "kling-v2-1-master",  mode: "pro" },
-  "kling-v2-5-turbo":         { model: "kling-v2-5-turbo",  mode: "pro" },
-  "kling-v2-6-pro":           { model: "kling-v2-6",        mode: "pro" },
-  "kling-v2-6-motion-pro":    { model: "kling-v2-6",        mode: "pro", isMotion: true },
-  "kling-v3-pro":             { model: "kling-v3",          mode: "pro" },
-  "kling-v3-motion-pro":      { model: "kling-v3",          mode: "pro", isMotion: true },
-  
-  "kling-v3-omni":            { model: "kling-v3-omni",     mode: "pro", isOmni: true },
-};
-
 const BANANA_MODEL_MAP: Record<string, string> = {
   "nano-banana-pro": "nano-banana-pro",
   "nano-banana-2":   "nano-banana-2",
 };
-
-/* ═══════════════════════════════════════════════════════════
-   HANDLE NORMALIZATION SCHEMA
-   Maps UI targetHandle names → standardized internal param keys
-   per provider. This is the SINGLE SOURCE OF TRUTH for edge mapping.
-   Adding a new provider? Just add a new entry here.
-   ═══════════════════════════════════════════════════════════ */
-
-type DataType = "image" | "video" | "audio" | "text";
-
-interface HandleDef {
-  internal_key: string;   // The standardized key the executor reads
-  data_type: DataType;    // Expected data type for validation
-}
-
-const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
-  kling: {
-    start_frame:   { internal_key: "image_url",       data_type: "image" },
-    ref_image:     { internal_key: "ref_image_url",   data_type: "image" },
-    image_input:   { internal_key: "image_url",       data_type: "image" },
-    image:         { internal_key: "image_url",       data_type: "image" },
-    end_frame:     { internal_key: "image_tail_url",  data_type: "image" },
-    ref_video:     { internal_key: "video_url",       data_type: "video" },
-    // Kling Omni v3 only — accepts objects, not URL strings. Marked
-    // "text" so validateEdgeValue skips the URL regex check; the V2
-    // handler then passes the object/array through verbatim.
-    elements:      { internal_key: "elements",        data_type: "text" },
-  },
-  kling_extension: {
-    start_frame:   { internal_key: "image_url",      data_type: "image" },
-    ref_image:     { internal_key: "image_url",      data_type: "image" },
-    image_input:   { internal_key: "image_url",      data_type: "image" },
-    image:         { internal_key: "image_url",      data_type: "image" },
-    ref_video:     { internal_key: "video_url",      data_type: "video" },
-  },
-  motion_control: {
-    start_frame:   { internal_key: "image_url",      data_type: "image" },
-    ref_image:     { internal_key: "image_url",      data_type: "image" },
-    image_input:   { internal_key: "image_url",      data_type: "image" },
-    image:         { internal_key: "image_url",      data_type: "image" },
-  },
-  banana: {
-    ref_image:     { internal_key: "image_url",      data_type: "image" },
-    image_input:   { internal_key: "image_url",      data_type: "image" },
-    image:         { internal_key: "image_url",      data_type: "image" },
-    context_text:  { internal_key: "context_text",   data_type: "text" },
-  },
-  // Mirror banana: gpt-image-2 reads the same param keys (image_url +
-  // mention_image_urls), built up by the V2 entry handler from
-  // edgeImageUrls. Without this entry normalizeHandle returns null
-  // and ref values get parked under the raw `ref_image` key, where
-  // executeOpenAIImage2 never finds them — same bug fixed in the
-  // main project's execute-pipeline-step HANDLE_SCHEMA.
-  openai: {
-    ref_image:     { internal_key: "image_url",      data_type: "image" },
-    image_input:   { internal_key: "image_url",      data_type: "image" },
-    image:         { internal_key: "image_url",      data_type: "image" },
-  },
-  seedream: {
-    ref_image:     { internal_key: "image_url",      data_type: "image" },
-    image_input:   { internal_key: "image_url",      data_type: "image" },
-    image:         { internal_key: "image_url",      data_type: "image" },
-  },
-  chat_ai: {
-    context_text:  { internal_key: "context_text",   data_type: "text" },
-    image_input:   { internal_key: "image_url",      data_type: "image" },
-  },
-  remove_bg: {
-    image:         { internal_key: "image_url",      data_type: "image" },
-    image_input:   { internal_key: "image_url",      data_type: "image" },
-    ref_image:     { internal_key: "image_url",      data_type: "image" },
-  },
-  merge_audio: {
-    video:         { internal_key: "video_url",      data_type: "video" },
-    audio:         { internal_key: "audio_url",      data_type: "text" }, // 'text' = pass-through URL string
-  },
-  video_understanding: {
-    video:         { internal_key: "video_url",      data_type: "video" },
-    ref_video:     { internal_key: "video_url",      data_type: "video" },
-  },
-  seedance: {
-    start_frame:   { internal_key: "image_url",      data_type: "image" },
-    end_frame:     { internal_key: "image_tail_url", data_type: "image" },
-    image_input:   { internal_key: "image_url",      data_type: "image" },
-    image:         { internal_key: "image_url",      data_type: "image" },
-    ref_image:     { internal_key: "image_url",      data_type: "image" },
-    reference_image: { internal_key: "reference_image_urls", data_type: "image" },
-    ref_video:     { internal_key: "reference_video_urls", data_type: "video" },
-    ref_audio:     { internal_key: "reference_audio_urls", data_type: "audio" },
-  },
-  replicate_video: {
-    start_frame:   { internal_key: "image_url",      data_type: "image" },
-    end_frame:     { internal_key: "image_tail_url", data_type: "image" },
-    image_input:   { internal_key: "image_url",      data_type: "image" },
-    image:         { internal_key: "image_url",      data_type: "image" },
-    ref_image:     { internal_key: "reference_image_urls", data_type: "image" },
-    reference_image: { internal_key: "reference_image_urls", data_type: "image" },
-    ref_video:     { internal_key: "reference_video_urls", data_type: "video" },
-    ref_audio:     { internal_key: "reference_audio_urls", data_type: "audio" },
-  },
-  tripo3d: {
-    image:         { internal_key: "image_url",      data_type: "image" },
-    image_input:   { internal_key: "image_url",      data_type: "image" },
-    ref_image:     { internal_key: "image_url",      data_type: "image" },
-  },
-};
-
-/** Resolve a targetHandle to the correct internal param key for a given provider */
-function normalizeHandle(provider: string, targetHandle: string): HandleDef | null {
-  const providerSchema = HANDLE_SCHEMA[provider];
-  if (!providerSchema) return null;
-  return providerSchema[targetHandle] ?? null;
-}
-
-function normalizeHandleForModel(
-  provider: string,
-  targetHandle: string,
-  modelName?: string,
-): HandleDef | null {
-  const model = String(modelName ?? "").toLowerCase();
-  if (provider === "kling" && targetHandle === "ref_image" && model === "kling-v3-omni") {
-    return { internal_key: "ref_image_urls", data_type: "image" };
-  }
-  if (provider === "kling" && targetHandle === "ref_image" && model.includes("motion")) {
-    return HANDLE_SCHEMA.motion_control.ref_image;
-  }
-  if (
-    provider === "seedance" &&
-    targetHandle === "ref_image" &&
-    (model.startsWith("seedance-2-0") || model.startsWith("dreamina-seedance-2-0"))
-  ) {
-    return HANDLE_SCHEMA.seedance.reference_image;
-  }
-  return normalizeHandle(provider, targetHandle);
-}
-
-/* ─── URL validation helper ─── */
-const VALID_URL_REGEX = /^(https?:\/\/|data:)/i;
-
-function isValidMediaUrl(value: string): boolean {
-  return VALID_URL_REGEX.test(value);
-}
-
-function validateEdgeValue(value: string, expectedType: DataType, targetHandle: string): void {
-  if (expectedType === "text") return; // text can be anything
-  // For image/video, must be a URL or data URI
-  if (!isValidMediaUrl(value)) {
-    throw new Error(
-      `Invalid input: Expected a ${expectedType} URL for handle "${targetHandle}", but received non-URL data. ` +
-      `Value starts with: "${value.substring(0, 50)}..."`
-    );
-  }
-}
-
-function appendUniqueStringParam(
-  params: Record<string, unknown>,
-  key: string,
-  values: string[],
-  max: number,
-): void {
-  const existing = Array.isArray(params[key])
-    ? (params[key] as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
-    : typeof params[key] === "string"
-      ? [params[key] as string]
-      : [];
-  params[key] = Array.from(new Set([...existing, ...values])).slice(0, max);
-}
 
 /* ═══════════════════════════════════════════════════════════
    Provider Executors
