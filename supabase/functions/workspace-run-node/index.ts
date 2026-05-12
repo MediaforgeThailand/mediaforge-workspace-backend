@@ -13,14 +13,12 @@ import {
   type ProviderDef,
   type ProviderKey,
 } from "../_shared/pricing.ts";
-import { logApiUsage } from "../_shared/posthogCapture.ts";
 import {
   executeWithInlineBudget,
   INLINE_BUDGET_ATTEMPTS,
   enqueueRetryJob,
   classifyError,
   classifyProviderError,
-  isNonRetryableQuotaError,
   shouldFastFallbackProviderError,
   TOTAL_MAX_RETRIES,
 } from "../_shared/providerRetry.ts";
@@ -30,28 +28,18 @@ import { isPublicEmailDomain } from "../_shared/publicEmailDomains.ts";
 import {
   SEEDANCE_BASE,
   SEEDANCE_TASKS_PATH,
-  SEEDANCE_MODEL_MAP,
-  buildSeedanceContent,
   executeSeedance,
   humanizeSeedanceErrorMessage,
   loadSeedanceCredentials,
   pollSeedanceOnce,
-  submitSeedanceTask,
 } from "../_shared/seedance.ts";
-import {
-  SEEDREAM_MODEL_MAP,
-  executeSeedream,
-  generateSeedreamImage,
-} from "../_shared/seedream.ts";
+import { executeSeedream } from "../_shared/seedream.ts";
 import {
   HYPER3D_BASE,
   HYPER3D_TASKS_PATH,
-  HYPER3D_MODEL_MAP,
-  buildHyper3dContent,
   executeHyper3D,
   pickHyper3dModelUrl,
   pollHyper3dOnce,
-  submitHyper3dTask,
 } from "../_shared/hyper3d.ts";
 import {
   extractVeoVideoUri,
@@ -59,20 +47,10 @@ import {
   normalizeVeoOperationName,
   pollVeoOnce,
 } from "../_shared/veo.ts";
+import { extractProviderMediaUrl } from "../_shared/imageUtils.ts";
 import {
-  extractImageDimensions,
-  extractProviderMediaUrl,
-  findClosestAspectRatio,
-  imageUrlToBase64,
-  type ImageDimensions,
-} from "../_shared/imageUtils.ts";
-import {
-  canUseMagnificImage,
-  canUseMagnificVeo,
-  canUseMagnificVideo,
   canUseReplicate,
   loadMagnificApiKey,
-  shouldUseMagnificSeedanceFallback,
 } from "../_shared/magnific.ts";
 import {
   enforcePrimaryProviderParams,
@@ -82,10 +60,7 @@ import { appendMentionContext, rewriteMentionsInline, type MentionedAssetSrv } f
 import type { ProviderResult } from "../_shared/providerResult.ts";
 import { executeMergeAudio } from "../_shared/mergeAudio.ts";
 import { executeChatAi } from "../_shared/chatAi.ts";
-import {
-  TRIPO3D_POLL_ENDPOINT,
-  executeTripo3D,
-} from "../_shared/tripo3d.ts";
+import { executeTripo3D } from "../_shared/tripo3d.ts";
 import { executeRemoveBg } from "../_shared/removeBg.ts";
 import { executeVideoToPrompt } from "../_shared/videoToPrompt.ts";
 import { executeGoogleTts } from "../_shared/googleTts.ts";
@@ -105,13 +80,8 @@ import { executeBanana } from "../_shared/banana.ts";
 import { executeOpenAIImage2 } from "../_shared/openAIImage.ts";
 import {
   appendUniqueStringParam,
-  HANDLE_SCHEMA,
-  isValidMediaUrl,
-  normalizeHandle,
   normalizeHandleForModel,
   validateEdgeValue,
-  type DataType,
-  type HandleDef,
 } from "./handleNormalization.ts";
 
 const corsHeaders = {
