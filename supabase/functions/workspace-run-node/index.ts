@@ -5679,16 +5679,19 @@ serve(async (req) => {
     // Kling owns its mentions inside executeKlingOmni (positional
     // `@Element{N}` / `@Image{N}` rewrite), so this fallback is for
     // banana / openai / chat_ai only.
+    // Image refs come from native image mentions (m.url) AND from
+    // video mentions that carry a browser-extracted end-frame
+    // (m.imageFrameUrl). The mention chip targets the same node id in
+    // both cases — the URL we plug in changes based on the source's
+    // media type.
     const mentionImageUrls = mentioned
-      .filter(
-        (m) =>
-          m &&
-          m.kind !== "element" &&
-          m.fieldType === "image" &&
-          typeof m.url === "string" &&
-          m.url,
-      )
-      .map((m) => m.url as string);
+      .map((m) => {
+        if (!m || m.kind === "element") return null;
+        if (m.fieldType === "image" && typeof m.url === "string" && m.url) return m.url;
+        if (m.fieldType === "video" && typeof m.imageFrameUrl === "string" && m.imageFrameUrl) return m.imageFrameUrl;
+        return null;
+      })
+      .filter((u): u is string => u !== null);
     if (provider !== "kling" && (mentionImageUrls.length > 0 || edgeImageUrls.length > 0)) {
       if (provider === "banana" || provider === "openai" || provider === "replicate_image") {
         const merged = Array.from(new Set([
