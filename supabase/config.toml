@@ -79,6 +79,9 @@ verify_jwt = false
 [functions.workspace-run-node]
 verify_jwt = false
 
+[functions.poll-seedance]
+verify_jwt = false
+
 [functions.send-email]
 verify_jwt = false
 

@@ -2266,6 +2266,23 @@ function formatVeoPollFailure(statusObj: unknown): string {
   return `Veo operation finished without a video URL: ${safeJsonSnippet(statusObj)}`;
 }
 
+/**
+ * Map a pollAction to a standalone edge function slug when one has been
+ * extracted from workspace-run-node. Routing the durable worker's
+ * status-poll fetch to a small standalone function avoids
+ * workspace-run-node's ~316KB cold-start overhead (the cause of the
+ * intermittent HTTP 546 on poll-only requests). Returns the input URL
+ * unchanged when no split exists yet.
+ */
+function resolvePollFunctionUrl(workspaceRunNodeUrl: string, pollAction: string): string {
+  const SPLIT_POLLERS: Record<string, string> = {
+    poll_seedance: "poll-seedance",
+  };
+  const slug = SPLIT_POLLERS[pollAction];
+  if (!slug) return workspaceRunNodeUrl;
+  return workspaceRunNodeUrl.replace(/\/workspace-run-node$/, `/${slug}`);
+}
+
 async function invokeWorkspaceRunOnce(args: {
   functionUrl: string;
   authHeader: string;
@@ -2416,7 +2433,7 @@ async function pollWorkspaceAsyncResult(args: {
   while (Date.now() + intervalMs < args.budgetEndsAt) {
     await sleep(intervalMs);
     const pollResp = await invokeWorkspaceRunOnce({
-      functionUrl: args.functionUrl,
+      functionUrl: resolvePollFunctionUrl(args.functionUrl, pollAction),
       authHeader: args.authHeader,
       extraHeaders: args.extraHeaders,
       body: {
@@ -2502,7 +2519,7 @@ async function pollWorkspaceAsyncResultOnce(args: {
         : "poll_kling";
 
   const pollResp = await invokeWorkspaceRunOnce({
-    functionUrl: args.functionUrl,
+    functionUrl: resolvePollFunctionUrl(args.functionUrl, pollAction),
     authHeader: args.authHeader,
     extraHeaders: args.extraHeaders,
     body: {
