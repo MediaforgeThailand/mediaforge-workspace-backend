@@ -21,6 +21,13 @@ Deno.test("provider retry classifier: quota and billing fast-fallback", () => {
   assertEquals(billing.kind, "billing");
   assertEquals(billing.fast_fallback, true);
   assertEquals(shouldFastFallbackProviderError("PROVIDER_BILLING_ERROR"), true);
+
+  const overdue = classifyProviderError(
+    'Seedance API error (HTTP 403): {"error":{"code":"AccountOverdueError","message":"The request failed because your account has an overdue balance."}}',
+  );
+  assertEquals(overdue.kind, "billing");
+  assertEquals(overdue.fast_fallback, true);
+  assertEquals(overdue.permanent, false);
 });
 
 Deno.test("provider retry classifier: busy and timeout retry without fast-fallback", () => {
@@ -73,6 +80,26 @@ Deno.test("provider retry classifier: validation and auth are permanent", () => 
     "validation",
   );
   assertEquals(classifyProviderError("HTTP 401 invalid api key").permanent, true);
+});
+
+Deno.test("provider retry classifier: direct Seedance auth can fast-fallback", () => {
+  const unauthorized = classifyProviderError("Seedance API error (HTTP 401): unauthorized");
+  assertEquals(unauthorized.kind, "auth");
+  assertEquals(unauthorized.retryable, false);
+  assertEquals(unauthorized.fast_fallback, true);
+  assertEquals(unauthorized.permanent, false);
+  assertEquals(shouldFastFallbackProviderError("Seedance API error (HTTP 403): unauthorized"), true);
+  assertEquals(
+    shouldFastFallbackProviderError(
+      "Seedance V2 credentials missing: set SEEDANCE_V2_API_KEY or BYTEPLUS_SEEDANCE_V2_API_KEY.",
+    ),
+    true,
+  );
+
+  const genericAuth = classifyProviderError("HTTP 401 invalid api key");
+  assertEquals(genericAuth.kind, "auth");
+  assertEquals(genericAuth.fast_fallback, false);
+  assertEquals(genericAuth.permanent, true);
 });
 
 /* ─── Legacy classifyError bucket coverage ───────────────────────────

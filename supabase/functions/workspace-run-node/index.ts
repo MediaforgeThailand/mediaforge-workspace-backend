@@ -881,7 +881,14 @@ function getProviderForNodeType(
     return "kling";
   }
   if (nodeType === "seedDreamNode") return "seedream";
-  if (nodeType === "seedDanceNode") return "seedance";
+  if (nodeType === "seedDanceNode") {
+    if (
+      m.startsWith("replicate-seedance") ||
+      m.startsWith("seedance-2-0") ||
+      m.startsWith("dreamina-seedance-2-0")
+    ) return "replicate_video";
+    return "seedance";
+  }
   if (nodeType === "removeBackgroundNode") return "remove_bg";
   if (nodeType === "mergeAudioNode") return "merge_audio";
   if (nodeType === "chatAiNode") return "chat_ai";

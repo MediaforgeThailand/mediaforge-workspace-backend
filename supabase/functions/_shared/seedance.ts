@@ -311,9 +311,9 @@ export interface SeedanceCredentials {
  * model that lives behind a *custom* inference endpoint provisioned
  * in the BytePlus console — those endpoints are billed against a
  * dedicated API key (`SEEDANCE_V2_API_KEY`) that may be scoped to
- * only that endpoint. Falling back to the default account key when
- * the v2 key isn't set keeps the function usable for ad-hoc tests
- * before the secret is provisioned.
+ * only that endpoint. If the v2 key is missing, fail explicitly so
+ * workspace jobs can move to fallback instead of retrying the default
+ * ARK key against the wrong scope.
  *
  * Default (no opts) returns the account-wide key Seedream + Hyper3D
  * "auto" endpoints share with the legacy 1.x Seedance models.
@@ -324,9 +324,9 @@ export function loadSeedanceCredentials(opts?: { v2?: boolean }): SeedanceCreden
       Deno.env.get("SEEDANCE_V2_API_KEY") ??
       Deno.env.get("BYTEPLUS_SEEDANCE_V2_API_KEY");
     if (v2Key) return { apiKey: v2Key };
-    // fall through to the default key — better to attempt the call
-    // (and surface the BytePlus error) than fail outright while the
-    // operator is mid-rollout.
+    throw new Error(
+      "Seedance V2 credentials missing: set SEEDANCE_V2_API_KEY or BYTEPLUS_SEEDANCE_V2_API_KEY.",
+    );
   }
 
   const apiKey =
@@ -380,7 +380,7 @@ export async function submitSeedanceTask(
     if (
       res.status === 402 ||
       (res.status !== 429 &&
-        /account balance not enough|insufficient balance|insufficient_quota|billing|payment required|prepaid|top[ -]?up|quota exceeded/i.test(text))
+        /account balance not enough|insufficient balance|insufficient_quota|AccountOverdueError|overdue balance|billing|payment required|prepaid|top[ -]?up|quota exceeded/i.test(text))
     ) {
       throw new Error("PROVIDER_BILLING_ERROR");
     }
