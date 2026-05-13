@@ -795,7 +795,10 @@ async function executeReplicateKlingVideo(
 export async function executeReplicateVideo(
   params: Record<string, unknown>,
 ): Promise<ProviderResult> {
-  const modelSlug = String(params.model_name ?? params.model ?? REPLICATE_SEEDANCE_MODEL_SLUG);
+  const rawModelSlug = String(params.model_name ?? params.model ?? REPLICATE_SEEDANCE_MODEL_SLUG);
+  const modelSlug = /^seedance-2-0|^dreamina-seedance-2-0/i.test(rawModelSlug)
+    ? REPLICATE_SEEDANCE_MODEL_SLUG
+    : rawModelSlug;
   if (REPLICATE_KLING_VIDEO_MODELS[modelSlug]) {
     return await executeReplicateKlingVideo(modelSlug, params);
   }

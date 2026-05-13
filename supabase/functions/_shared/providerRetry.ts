@@ -136,6 +136,9 @@ export function classifyProviderError(errMsg: string): ProviderErrorClassificati
   if (/DEADLINE_EXCEEDED|HTTP\s*504\b|timeout|timed out|aborted|ETIMEDOUT/i.test(msg)) {
     return { kind: "timeout", retryable: true, fast_fallback: false, permanent: false };
   }
+  if (/not having enough compute resources|insufficient compute resources|compute resources/i.test(msg)) {
+    return { kind: "busy", retryable: true, fast_fallback: true, permanent: false };
+  }
   if (/HTTP\s*503\b|UNAVAILABLE|high demand|overload|busy|queue|capacity|currently experiencing/i.test(msg)) {
     return { kind: "busy", retryable: true, fast_fallback: false, permanent: false };
   }
@@ -195,7 +198,7 @@ export function classifyError(errMsg: string): "permanent" | "transient" | "unkn
   if (/requires (?:a |an )?[\w ]+ input|missing required|no .* (?:provided|specified|supplied)|input .* is required|cannot be empty/i.test(errMsg)) {
     return "permanent";
   }
-  if (/504|502|503|500|429|timeout|ECONNRESET|fetch failed|aborted|ENOTFOUND|ETIMEDOUT|socket hang up|overload|busy|queue|rate limit/i.test(errMsg)) {
+  if (/504|502|503|500|429|timeout|ECONNRESET|fetch failed|aborted|ENOTFOUND|ETIMEDOUT|socket hang up|overload|busy|queue|rate limit|compute resources/i.test(errMsg)) {
     return "transient";
   }
   return "unknown";

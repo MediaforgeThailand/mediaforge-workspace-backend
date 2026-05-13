@@ -29,9 +29,9 @@
 // ---------
 // The workspace product runs node jobs through `workspace_generation_jobs`.
 // The admin Retry Queue page still speaks the consumer retry shape, so this
-// function maps workspace job rows into that shape for read-only monitoring.
-// Mutation actions remain disabled until we ship the audited workspace write
-// path.
+// function maps workspace job rows into that shape. Recovery mutations are
+// intentionally narrow: only jobs that already reached a terminal/refunded
+// shape but were left labelled `running` are closed here.
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -474,6 +474,75 @@ async function getRetryObservability(client: SupabaseClient): Promise<{
   };
 }
 
+function recoverableTerminalMessage(row: Record<string, unknown>): string | null {
+  const status = String(row.status ?? "");
+  if (status !== "queued" && status !== "running") return null;
+  const errorMessage = String(row.error ?? row.last_error ?? "").trim();
+  const completedAt = String(row.completed_at ?? "").trim();
+  const charged = Number(row.credits_charged ?? 0);
+  const refunded = Number(row.credits_refunded ?? 0);
+  const fullyRefunded = Number.isFinite(charged) && charged > 0 && refunded >= charged;
+
+  if (completedAt && (errorMessage || fullyRefunded)) {
+    return errorMessage || "Generation failed after credits were refunded.";
+  }
+  return null;
+}
+
+async function recoverStuckWorkspaceJobs(
+  client: SupabaseClient,
+  jobId: string | null,
+  limit: number,
+): Promise<{ recovered: unknown[]; skipped: unknown[] }> {
+  let q = client
+    .from("workspace_generation_jobs")
+    .select("*")
+    .in("status", ["queued", "running"])
+    .order("updated_at", { ascending: true })
+    .limit(limit);
+  if (jobId) q = q.eq("id", jobId);
+
+  const { data, error } = await q;
+  if (error) {
+    throw new Error(`workspace_generation_jobs recovery scan failed: ${error.message}`);
+  }
+
+  const recovered: unknown[] = [];
+  const skipped: unknown[] = [];
+  for (const row of data ?? []) {
+    const record = row as Record<string, unknown>;
+    const msg = recoverableTerminalMessage(record);
+    if (!msg) {
+      skipped.push({ id: record.id, reason: "not terminal/refunded" });
+      continue;
+    }
+
+    const { data: updated, error: updateError } = await client
+      .from("workspace_generation_jobs")
+      .update({
+        status: "failed",
+        error: msg,
+        last_error: msg,
+        locked_by: null,
+        lock_expires_at: null,
+        run_after: new Date().toISOString(),
+        completed_at: record.completed_at ?? new Date().toISOString(),
+      })
+      .eq("id", String(record.id))
+      .in("status", ["queued", "running"])
+      .select("id,status,error,last_error,credits_charged,credits_refunded,completed_at")
+      .maybeSingle();
+
+    if (updateError) {
+      skipped.push({ id: record.id, reason: updateError.message });
+      continue;
+    }
+    recovered.push(updated ?? { id: record.id, status: "failed" });
+  }
+
+  return { recovered, skipped };
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: CORS_HEADERS });
@@ -564,8 +633,14 @@ Deno.serve(async (req: Request) => {
       // frontend short-circuits before calling these (and disables the
       // buttons), but we reject here so a stale client can't accidentally
       // mutate the workspace project.
-      case "cancel_retry_job":
       case "recover_stuck_retry_jobs":
+      case "recover_stuck_workspace_jobs": {
+        const jobId = typeof body.job_id === "string" && body.job_id ? body.job_id : null;
+        const limit = clampLimit(body.limit, 50, 250);
+        return json(await recoverStuckWorkspaceJobs(admin, jobId, limit));
+      }
+
+      case "cancel_retry_job":
       case "retry_failed_run":
       case "mark_run_resolved":
       case "requeue_dead_letter":

@@ -37,6 +37,18 @@ Deno.test("provider retry classifier: busy and timeout retry without fast-fallba
   assertEquals(timeout.fast_fallback, false);
 });
 
+Deno.test("provider retry classifier: platform compute exhaustion fast-fallbacks", () => {
+  const busy = classifyProviderError(
+    "Function failed due to not having enough compute resources (please check logs)",
+  );
+  assertEquals(busy.kind, "busy");
+  assertEquals(busy.retryable, true);
+  assertEquals(busy.fast_fallback, true);
+  assertEquals(busy.permanent, false);
+  assertEquals(shouldFastFallbackProviderError("not having enough compute resources"), true);
+  assertEquals(classifyError("not having enough compute resources"), "transient");
+});
+
 Deno.test("provider retry classifier: OpenAI image timeout retries without fast-fallback", () => {
   const timeout = classifyProviderError("OpenAI Image 2 edit timed out after 118s");
   assertEquals(timeout.kind, "timeout");

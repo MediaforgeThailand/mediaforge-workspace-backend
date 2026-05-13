@@ -875,6 +875,7 @@ function getProviderForNodeType(
     if (m.startsWith("replicate-veo")) return "replicate_veo";
     if (m.startsWith("replicate-kling")) return "replicate_video";
     if (m.startsWith("replicate-seedance")) return "replicate_video";
+    if (m.startsWith("seedance-2-0") || m.startsWith("dreamina-seedance-2-0")) return "replicate_video";
     if (m.startsWith("seedance") || m.startsWith("dreamina-seedance")) return "seedance";
     if (m.startsWith("veo-")) return "veo";
     return "kling";
