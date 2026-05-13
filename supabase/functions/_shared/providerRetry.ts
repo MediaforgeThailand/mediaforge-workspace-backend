@@ -100,6 +100,14 @@ export function classifyProviderError(errMsg: string): ProviderErrorClassificati
   if (msg === "PROVIDER_BILLING_ERROR") {
     return { kind: "billing", retryable: false, fast_fallback: true, permanent: false };
   }
+  // Supabase platform errors when one edge function calls another via
+  // fetch() and the inner worker hits CPU/memory/boot limits. The
+  // response body for these is fixed Supabase wording — retrying just
+  // hits the same congested pool, so treat as permanent + refund. Users
+  // can re-run manually once the worker pool has capacity.
+  if (/Function failed due to not having enough compute resources|Function exceeded resource limit|Function failed to start|workspace-run-node HTTP 5\d\d/i.test(msg)) {
+    return { kind: "transient", retryable: false, fast_fallback: false, permanent: true };
+  }
   if (/is not defined|is not a function|cannot read prop(?:erty|erties) of (?:undefined|null)|ReferenceError|TypeError|SyntaxError/i.test(msg)) {
     return { kind: "programming", retryable: false, fast_fallback: false, permanent: true };
   }
@@ -158,6 +166,12 @@ export function shouldFastFallbackProviderError(errMsg: string): boolean {
  */
 export function classifyError(errMsg: string): "permanent" | "transient" | "unknown" {
   if (errMsg === "PROVIDER_BILLING_ERROR") return "permanent";
+  // Supabase platform errors (inner edge-function fetch hit CPU/memory/boot
+  // limits). Retrying same instant just hits the same congested pool —
+  // mark permanent so the caller refunds promptly.
+  if (/Function failed due to not having enough compute resources|Function exceeded resource limit|Function failed to start|workspace-run-node HTTP 5\d\d/i.test(errMsg)) {
+    return "permanent";
+  }
   // Keep the legacy retry loop behavior: HTTP 429 / 5xx should retry first.
   // Workspace durable jobs use shouldFastFallbackProviderError() directly when
   // they need to skip straight to the next provider on quota/rate-limit errors.
