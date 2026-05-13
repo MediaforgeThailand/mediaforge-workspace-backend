@@ -50,6 +50,37 @@ interface AuthedUser {
   isWorker: boolean;
 }
 
+/**
+ * Load the worker-handshake secret the same way workspace-run-node does:
+ * env first (WORKSPACE_WORKER_SECRET, then CRON_SECRET), and on miss
+ * fall back to vault.decrypted_secrets via the get_retry_worker_cron_secret
+ * RPC. Without this fallback, deployments that keep the secret only in
+ * vault produce a handshake mismatch — workspace-run-node sends the vault
+ * value, poll-seedance sees an empty env string, and every durable-worker
+ * seedance poll returns 401 unauthorized.
+ */
+async function loadExpectedWorkerSecret(): Promise<string> {
+  const envSecret =
+    Deno.env.get("WORKSPACE_WORKER_SECRET") ??
+    Deno.env.get("CRON_SECRET") ??
+    "";
+  if (envSecret) return envSecret;
+  try {
+    const admin = createClient(
+      Deno.env.get("SUPABASE_URL") ?? "",
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+    );
+    const { data, error } = await admin.rpc("get_retry_worker_cron_secret");
+    if (!error && data) return String(data);
+  } catch (err) {
+    console.warn(
+      "[poll-seedance] worker secret vault lookup failed:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+  return "";
+}
+
 async function resolveCaller(req: Request): Promise<AuthedUser | null> {
   const authHeader = req.headers.get("Authorization") ?? "";
   if (!authHeader.startsWith("Bearer ")) return null;
@@ -60,21 +91,15 @@ async function resolveCaller(req: Request): Promise<AuthedUser | null> {
     req.headers.get("x-workspace-worker-secret") ??
     req.headers.get("x-cron-secret") ??
     "";
-  const expectedWorkerSecret =
-    Deno.env.get("WORKSPACE_WORKER_SECRET") ??
-    Deno.env.get("CRON_SECRET") ??
-    "";
 
   // Worker mode — service-role bearer + matching worker secret + explicit user_id header
-  if (
-    serviceRoleKey &&
-    token === serviceRoleKey &&
-    expectedWorkerSecret &&
-    workerSecret === expectedWorkerSecret
-  ) {
-    const userId = req.headers.get("x-workspace-worker-user-id") ?? "";
-    if (!userId) return null;
-    return { id: userId, isWorker: true };
+  if (serviceRoleKey && token === serviceRoleKey && workerSecret) {
+    const expectedWorkerSecret = await loadExpectedWorkerSecret();
+    if (expectedWorkerSecret && workerSecret === expectedWorkerSecret) {
+      const userId = req.headers.get("x-workspace-worker-user-id") ?? "";
+      if (!userId) return null;
+      return { id: userId, isWorker: true };
+    }
   }
 
   // User mode — verify JWT via Supabase
