@@ -2275,8 +2275,12 @@ function formatVeoPollFailure(statusObj: unknown): string {
  * unchanged when no split exists yet.
  */
 function resolvePollFunctionUrl(workspaceRunNodeUrl: string, pollAction: string): string {
+  // ROLLED BACK 2026-05-13: poll-seedance routing returned 401
+  // unauthorized to the durable worker, causing every seedance run
+  // (1.5-pro, 2.0-pro, 2.0-lite) to fail_refunded. Re-enable only
+  // after the auth handshake is verified end-to-end.
   const SPLIT_POLLERS: Record<string, string> = {
-    poll_seedance: "poll-seedance",
+    // poll_seedance: "poll-seedance",
   };
   const slug = SPLIT_POLLERS[pollAction];
   if (!slug) return workspaceRunNodeUrl;
