@@ -2177,7 +2177,14 @@ function isPermanentWorkspaceJobError(err: unknown): boolean {
     // combinations, etc.) are deterministic — retrying just re-burns
     // wall-clock and leaves the job stuck in "running".
     /Kling.*API error.*(?:not supported|is not supported|model\/mode)/i.test(msg) ||
-    /Seedance reference video is invalid|reference videos?.*(?:must|duration|invalid)|video duration.*(?:must|invalid|exceed)|total reference video duration|total duration of all videos/i.test(msg)
+    /Seedance reference video is invalid|reference videos?.*(?:must|duration|invalid)|video duration.*(?:must|invalid|exceed)|total reference video duration|total duration of all videos/i.test(msg) ||
+    // Supabase platform errors when workspace-run-node calls itself for
+    // async polling and the inner worker hits CPU/memory/boot limits.
+    // The function body returned for these is fixed Supabase wording —
+    // matching it lets us fail fast + refund instead of looping until
+    // the 1-hour deadline (each retry just hits the same limit). Users
+    // can re-run manually once worker pool has capacity again.
+    /Function failed due to not having enough compute resources|Function exceeded resource limit|Function failed to start|workspace-run-node HTTP 5\d\d/i.test(msg)
   );
 }
 
@@ -3066,9 +3073,34 @@ async function processWorkspaceGenerationJobTick(args: {
         });
         return { job_id: job.id, status: "permanent_failed", detail: msg.substring(0, 120) };
       }
+      // Poll-failure budget: thrown exceptions from the inner
+      // workspace-run-node fetch (network glitch, transient 5xx,
+      // Supabase worker-limit 546) must bump `attempts` so an
+      // unrecognised error message can't loop forever until the
+      // 1-hour deadline. The legitimate pending-wait path above
+      // (state="pending") goes through scheduleWorkspaceJobRetry
+      // directly and intentionally does NOT consume budget.
+      const nextAttempt = currentAttempts + 1;
+      if (nextAttempt >= maxAttempts) {
+        const finalMsg =
+          `${workspaceJobProviderLabel(job)} polling failed after ${maxAttempts} attempts. ` +
+          `Last error: ${msg}`;
+        await failWorkspaceJob({
+          supabase: args.supabase,
+          job: { ...job, attempts: nextAttempt, last_error: msg },
+          status: "failed",
+          error: finalMsg,
+          refundReason: `workspace polling exhausted: ${msg.substring(0, 160)}`,
+        });
+        return { job_id: job.id, status: "failed", detail: "poll_attempts_exhausted" };
+      }
+      await args.supabase
+        .from("workspace_generation_jobs")
+        .update({ attempts: nextAttempt })
+        .eq("id", job.id);
       await scheduleWorkspaceJobRetry({
         supabase: args.supabase,
-        job,
+        job: { ...job, attempts: nextAttempt },
         workerId: args.workerId,
         message: msg,
         delaySeconds: 30,
