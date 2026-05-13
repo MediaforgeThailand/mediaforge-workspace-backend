@@ -1874,10 +1874,21 @@ const WORKSPACE_JOB_MAX_MS = 60 * 60_000;
 const WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS = 150_000;
 const WORKSPACE_JOB_BACKOFF_MS = [3_000, 5_000, 10_000, 15_000, 30_000, 60_000];
 const BANANA_JOB_BACKOFF_MS = [60_000, 180_000, 300_000, 600_000, 900_000];
-const WORKSPACE_JOB_WORKER_BATCH_SIZE = 8;
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = Deno.env.get(name);
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const WORKSPACE_JOB_WORKER_BATCH_SIZE = positiveIntEnv("WORKSPACE_JOB_WORKER_BATCH_SIZE", 3);
 const WORKSPACE_JOB_LOCK_SEC = 360;
 const WORKSPACE_JOB_HEARTBEAT_MS = 45_000;
 const WORKSPACE_JOB_EXPIRE_SWEEP_LIMIT = 25;
+const WORKSPACE_VIDEO_MIRROR_MAX_BYTES =
+  positiveIntEnv("WORKSPACE_VIDEO_MIRROR_MAX_MB", 48) * 1024 * 1024;
+const WORKSPACE_IMAGE_MIRROR_MAX_BYTES =
+  positiveIntEnv("WORKSPACE_IMAGE_MIRROR_MAX_MB", 16) * 1024 * 1024;
 const DIRECT_REPLICATE_PRIMARY_MODELS: Record<string, string> = {
   "replicate-seedance-2-0": "seedance-2-0-pro",
   "replicate-kling-v3-pro": "kling-v3-pro",
@@ -1888,6 +1899,100 @@ const DIRECT_REPLICATE_PRIMARY_MODELS: Record<string, string> = {
   "replicate-nano-banana-pro": "nano-banana-pro",
   "replicate-gpt-image-2": "gpt-image-2",
 };
+
+function readContentLength(headers: Headers): number | null {
+  const raw = headers.get("content-length");
+  if (!raw) return null;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+async function mirrorRemoteMedia(args: {
+  supabase: any;
+  sourceUrl: string;
+  bucket: string;
+  path: string;
+  fallbackContentType: string;
+  signedUrlTtlSeconds: number;
+  maxBufferBytes: number;
+  allowRawUrlFallback: boolean;
+  label: string;
+}): Promise<{ url: string; mirrored: boolean; contentType: string; skippedReason?: string }> {
+  const res = await fetch(args.sourceUrl);
+  if (!res.ok) throw new Error(`download HTTP ${res.status}`);
+
+  const contentType = res.headers.get("content-type")?.split(";")[0]?.trim() ||
+    args.fallbackContentType;
+  const contentLength = readContentLength(res.headers);
+  const sizeLabel = contentLength == null ? "unknown size" : `${contentLength} bytes`;
+
+  if (contentLength == null && args.allowRawUrlFallback) {
+    try {
+      await res.body?.cancel();
+    } catch {
+      // ignore cancel failures; we are intentionally not buffering the body
+    }
+    console.warn(
+      `[${args.label}] storage mirror skipped (${sizeLabel}); using provider URL to avoid edge memory pressure`,
+    );
+    return {
+      url: args.sourceUrl,
+      mirrored: false,
+      contentType,
+      skippedReason: "unknown_content_length",
+    };
+  }
+
+  if (contentLength != null && contentLength > args.maxBufferBytes) {
+    try {
+      await res.body?.cancel();
+    } catch {
+      // ignore cancel failures; we are intentionally not buffering the body
+    }
+    if (args.allowRawUrlFallback) {
+      console.warn(
+        `[${args.label}] storage mirror skipped (${sizeLabel} > ${args.maxBufferBytes} bytes); using provider URL`,
+      );
+      return {
+        url: args.sourceUrl,
+        mirrored: false,
+        contentType,
+        skippedReason: "content_length_exceeded",
+      };
+    }
+    throw new Error(`remote file ${sizeLabel} exceeds mirror limit ${args.maxBufferBytes} bytes`);
+  }
+
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (bytes.byteLength > args.maxBufferBytes) {
+    if (args.allowRawUrlFallback) {
+      console.warn(
+        `[${args.label}] storage mirror skipped (${bytes.byteLength} bytes > ${args.maxBufferBytes} bytes after download); using provider URL`,
+      );
+      return {
+        url: args.sourceUrl,
+        mirrored: false,
+        contentType,
+        skippedReason: "download_size_exceeded",
+      };
+    }
+    throw new Error(`remote file ${bytes.byteLength} bytes exceeds mirror limit ${args.maxBufferBytes} bytes`);
+  }
+
+  const upload = await args.supabase.storage
+    .from(args.bucket)
+    .upload(args.path, bytes, { contentType, upsert: true });
+  if (upload.error) throw upload.error;
+
+  const signed = await args.supabase.storage
+    .from(args.bucket)
+    .createSignedUrl(args.path, args.signedUrlTtlSeconds);
+  if (signed.error || !signed.data?.signedUrl) {
+    throw signed.error ?? new Error("no signed URL");
+  }
+
+  return { url: signed.data.signedUrl, mirrored: true, contentType };
+}
 
 function workspaceJobMaxAttempts(provider: string): number {
   // Sync image calls consume request/compute on every retry because there is no
@@ -4484,23 +4589,21 @@ serve(async (req) => {
         // completes — the user just keeps an ephemeral link.
         if (videoUrl) {
           try {
-            const videoRes = await fetch(videoUrl);
-            if (!videoRes.ok) throw new Error(`download HTTP ${videoRes.status}`);
-            const bytes = new Uint8Array(await videoRes.arrayBuffer());
             const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
             const path = `${user.id}/kling-renders/mediaforge_${safeTaskId}.mp4`;
-            const upload = await supabase.storage
-              .from("user_assets")
-              .upload(path, bytes, { contentType: "video/mp4", upsert: true });
-            if (upload.error) throw upload.error;
-            const signed = await supabase.storage
-              .from("user_assets")
-              .createSignedUrl(path, 60 * 60 * 24 * 365);
-            if (signed.error || !signed.data?.signedUrl) {
-              throw signed.error ?? new Error("no signed URL");
-            }
-            videoUrl = signed.data.signedUrl;
-            console.log(`[poll_kling] mirrored video path=${path}`);
+            const mirrored = await mirrorRemoteMedia({
+              supabase,
+              sourceUrl: videoUrl,
+              bucket: "user_assets",
+              path,
+              fallbackContentType: "video/mp4",
+              signedUrlTtlSeconds: 60 * 60 * 24 * 365,
+              maxBufferBytes: WORKSPACE_VIDEO_MIRROR_MAX_BYTES,
+              allowRawUrlFallback: true,
+              label: "poll_kling",
+            });
+            videoUrl = mirrored.url;
+            if (mirrored.mirrored) console.log(`[poll_kling] mirrored video path=${path}`);
           } catch (err) {
             console.warn(
               `[poll_kling] storage mirror failed, falling back to Kling URL: ${
@@ -4610,23 +4713,21 @@ serve(async (req) => {
       // failure.
       if (videoUrl) {
         try {
-          const videoRes = await fetch(videoUrl);
-          if (!videoRes.ok) throw new Error(`download HTTP ${videoRes.status}`);
-          const bytes = new Uint8Array(await videoRes.arrayBuffer());
           const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
           const path = `${user.id}/seedance-renders/mediaforge_${safeTaskId}.mp4`;
-          const upload = await supabase.storage
-            .from("user_assets")
-            .upload(path, bytes, { contentType: "video/mp4", upsert: true });
-          if (upload.error) throw upload.error;
-          const signed = await supabase.storage
-            .from("user_assets")
-            .createSignedUrl(path, 60 * 60 * 24 * 365);
-          if (signed.error || !signed.data?.signedUrl) {
-            throw signed.error ?? new Error("no signed URL");
-          }
-          videoUrl = signed.data.signedUrl;
-          console.log(`[poll_seedance] mirrored video path=${path}`);
+          const mirrored = await mirrorRemoteMedia({
+            supabase,
+            sourceUrl: videoUrl,
+            bucket: "user_assets",
+            path,
+            fallbackContentType: "video/mp4",
+            signedUrlTtlSeconds: 60 * 60 * 24 * 365,
+            maxBufferBytes: WORKSPACE_VIDEO_MIRROR_MAX_BYTES,
+            allowRawUrlFallback: true,
+            label: "poll_seedance",
+          });
+          videoUrl = mirrored.url;
+          if (mirrored.mirrored) console.log(`[poll_seedance] mirrored video path=${path}`);
         } catch (err) {
           console.warn(
             `[poll_seedance] storage mirror failed, falling back to BytePlus URL: ${
@@ -4735,20 +4836,8 @@ serve(async (req) => {
       let publicUrl = "";
       if (normalised === "succeed" && providerOutputUrl) {
         try {
-          const outputRes = await fetch(providerOutputUrl);
-          if (!outputRes.ok) {
-            throw new Error(`download HTTP ${outputRes.status}`);
-          }
-          const bytes = new Uint8Array(await outputRes.arrayBuffer());
-          const contentType = outputRes.headers.get("content-type")?.split(";")[0]?.trim() ||
-            (isReplicateImagePoll ? "image/png" : "video/mp4");
           const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
-          const ext =
-            contentType.includes("webp") ? "webp" :
-            contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" :
-            contentType.includes("png") ? "png" :
-            contentType.includes("gif") ? "gif" :
-            "mp4";
+          const ext = isReplicateImagePoll ? "png" : "mp4";
           const bucket = isReplicateImagePoll ? "ai-media" : "user_assets";
           const folder = isReplicateImagePoll
             ? "pipeline"
@@ -4756,28 +4845,40 @@ serve(async (req) => {
               ? `${user.id}/veo-renders`
               : `${user.id}/replicate-video-renders`;
           const path = `${folder}/replicate_${safeTaskId}.${ext}`;
-          const upload = await supabase.storage
-            .from(bucket)
-            .upload(path, bytes, { contentType, upsert: true });
-          if (upload.error) throw upload.error;
-          const signed = await supabase.storage
-            .from(bucket)
-            .createSignedUrl(path, isReplicateImagePoll ? 60 * 60 * 24 * 7 : 60 * 60 * 24 * 365);
-          if (signed.error || !signed.data?.signedUrl) {
-            throw signed.error ?? new Error("no signed URL");
-          }
-          publicUrl = signed.data.signedUrl;
+          const mirrored = await mirrorRemoteMedia({
+            supabase,
+            sourceUrl: providerOutputUrl,
+            bucket,
+            path,
+            fallbackContentType: isReplicateImagePoll ? "image/png" : "video/mp4",
+            signedUrlTtlSeconds: isReplicateImagePoll ? 60 * 60 * 24 * 7 : 60 * 60 * 24 * 365,
+            maxBufferBytes: isReplicateImagePoll ? WORKSPACE_IMAGE_MIRROR_MAX_BYTES : WORKSPACE_VIDEO_MIRROR_MAX_BYTES,
+            allowRawUrlFallback: !isReplicateImagePoll,
+            label: "poll_replicate",
+          });
+          publicUrl = mirrored.url;
         } catch (err) {
-          console.error("[poll_replicate] rehost failed:", err);
-          return new Response(
-            JSON.stringify({
-              status: "failed",
-              task_id: taskId,
-              url: "",
-              message: `${replicateLabel} finished but the output couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
-            }),
-            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
-          );
+          if (!isReplicateImagePoll) {
+            console.warn(
+              `[poll_replicate] video rehost failed, falling back to provider URL: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+            publicUrl = providerOutputUrl;
+          } else {
+            console.error("[poll_replicate] rehost failed:", err);
+          }
+          if (!publicUrl) {
+            return new Response(
+              JSON.stringify({
+                status: "failed",
+                task_id: taskId,
+                url: "",
+                message: `${replicateLabel} finished but the output couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
+              }),
+              { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+            );
+          }
         }
       }
 
@@ -4903,36 +5004,27 @@ serve(async (req) => {
       let publicUrl = "";
       if (normalised === "succeed" && providerVideoUrl) {
         try {
-          const videoRes = await fetch(providerVideoUrl);
-          if (!videoRes.ok) {
-            throw new Error(`download HTTP ${videoRes.status}`);
-          }
-          const bytes = new Uint8Array(await videoRes.arrayBuffer());
-          const contentType = videoRes.headers.get("content-type")?.split(";")[0]?.trim() || "video/mp4";
           const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
           const path = `${user.id}/video-renders/freepik_${safeTaskId}.mp4`;
-          const upload = await supabase.storage
-            .from("user_assets")
-            .upload(path, bytes, { contentType, upsert: true });
-          if (upload.error) throw upload.error;
-          const signed = await supabase.storage
-            .from("user_assets")
-            .createSignedUrl(path, 60 * 60 * 24 * 365);
-          if (signed.error || !signed.data?.signedUrl) {
-            throw signed.error ?? new Error("no signed URL");
-          }
-          publicUrl = signed.data.signedUrl;
+          const mirrored = await mirrorRemoteMedia({
+            supabase,
+            sourceUrl: providerVideoUrl,
+            bucket: "user_assets",
+            path,
+            fallbackContentType: "video/mp4",
+            signedUrlTtlSeconds: 60 * 60 * 24 * 365,
+            maxBufferBytes: WORKSPACE_VIDEO_MIRROR_MAX_BYTES,
+            allowRawUrlFallback: true,
+            label: "poll_freepik_video",
+          });
+          publicUrl = mirrored.url;
         } catch (err) {
-          console.error("[poll_freepik_video] rehost failed:", err);
-          return new Response(
-            JSON.stringify({
-              status: "failed",
-              task_id: taskId,
-              url: "",
-              message: `Freepik/Magnific video finished but the video couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
-            }),
-            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          console.warn(
+            `[poll_freepik_video] rehost failed, falling back to provider URL: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
           );
+          publicUrl = providerVideoUrl;
         }
       }
 
