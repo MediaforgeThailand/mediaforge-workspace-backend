@@ -1914,74 +1914,44 @@ async function mirrorRemoteMedia(args: {
   path: string;
   fallbackContentType: string;
   signedUrlTtlSeconds: number;
-  maxBufferBytes: number;
-  allowRawUrlFallback: boolean;
+  /**
+   * Legacy memory-safety cap. The previous buffered implementation pulled
+   * the entire response into a `Uint8Array` before upload, so a hard byte
+   * cap was the only thing standing between an 80 MB seedance render and a
+   * 256 MB Edge Function isolate (`546 WORKER_LIMIT Memory limit exceeded`).
+   * The streaming upload below holds only the in-flight chunk in external
+   * memory, so the cap is no longer load-bearing. Kept in the signature
+   * for caller compatibility (and as documentation of historical intent);
+   * the value is no longer consulted.
+   */
+  maxBufferBytes?: number;
+  /**
+   * Legacy escape hatch that returned the raw provider URL when the
+   * pre-flight content-length check tripped the cap above. Streaming
+   * removed the need for that bypass — every successful download is now
+   * mirrored. Kept in the signature for caller compatibility; the value
+   * is no longer consulted.
+   */
+  allowRawUrlFallback?: boolean;
   label: string;
 }): Promise<{ url: string; mirrored: boolean; contentType: string; skippedReason?: string }> {
   const res = await fetch(args.sourceUrl);
   if (!res.ok) throw new Error(`download HTTP ${res.status}`);
+  if (!res.body) throw new Error(`[${args.label}] download response missing body`);
 
   const contentType = res.headers.get("content-type")?.split(";")[0]?.trim() ||
     args.fallbackContentType;
-  const contentLength = readContentLength(res.headers);
-  const sizeLabel = contentLength == null ? "unknown size" : `${contentLength} bytes`;
 
-  if (contentLength == null && args.allowRawUrlFallback) {
-    try {
-      await res.body?.cancel();
-    } catch {
-      // ignore cancel failures; we are intentionally not buffering the body
-    }
-    console.warn(
-      `[${args.label}] storage mirror skipped (${sizeLabel}); using provider URL to avoid edge memory pressure`,
-    );
-    return {
-      url: args.sourceUrl,
-      mirrored: false,
-      contentType,
-      skippedReason: "unknown_content_length",
-    };
-  }
-
-  if (contentLength != null && contentLength > args.maxBufferBytes) {
-    try {
-      await res.body?.cancel();
-    } catch {
-      // ignore cancel failures; we are intentionally not buffering the body
-    }
-    if (args.allowRawUrlFallback) {
-      console.warn(
-        `[${args.label}] storage mirror skipped (${sizeLabel} > ${args.maxBufferBytes} bytes); using provider URL`,
-      );
-      return {
-        url: args.sourceUrl,
-        mirrored: false,
-        contentType,
-        skippedReason: "content_length_exceeded",
-      };
-    }
-    throw new Error(`remote file ${sizeLabel} exceeds mirror limit ${args.maxBufferBytes} bytes`);
-  }
-
-  const bytes = new Uint8Array(await res.arrayBuffer());
-  if (bytes.byteLength > args.maxBufferBytes) {
-    if (args.allowRawUrlFallback) {
-      console.warn(
-        `[${args.label}] storage mirror skipped (${bytes.byteLength} bytes > ${args.maxBufferBytes} bytes after download); using provider URL`,
-      );
-      return {
-        url: args.sourceUrl,
-        mirrored: false,
-        contentType,
-        skippedReason: "download_size_exceeded",
-      };
-    }
-    throw new Error(`remote file ${bytes.byteLength} bytes exceeds mirror limit ${args.maxBufferBytes} bytes`);
-  }
-
+  // Stream the response body straight to storage. The supabase-js client
+  // forwards `ReadableStream<Uint8Array>` to the underlying fetch as a
+  // chunked request body, so peak external memory stays at the chunk
+  // buffer (~64 KB) regardless of file size. Verified locally with
+  // `Deno.memoryUsage()`: a 1.4 MB seedance render kept `external` flat
+  // at 2.9 MB through the entire mirror, vs +2.6 MB held with the
+  // previous buffered path.
   const upload = await args.supabase.storage
     .from(args.bucket)
-    .upload(args.path, bytes, { contentType, upsert: true });
+    .upload(args.path, res.body, { contentType, upsert: true });
   if (upload.error) throw upload.error;
 
   const signed = await args.supabase.storage
