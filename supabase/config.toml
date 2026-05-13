@@ -23,6 +23,9 @@ port = 55324
 [analytics]
 port = 55327
 
+[storage]
+file_size_limit = "1GiB"
+
 # ─── Auth (LOCAL DEV ONLY) ────────────────────────────────────────────────
 # Site URL + redirect allow-list must include the frontend dev origin so
 # Supabase Auth accepts the `redirectTo` parameter sent by the OAuth flow.
@@ -77,6 +80,9 @@ verify_jwt = false
 verify_jwt = false
 
 [functions.workspace-run-node]
+verify_jwt = false
+
+[functions.elevenlabs-dubbing]
 verify_jwt = false
 
 [functions.send-email]
