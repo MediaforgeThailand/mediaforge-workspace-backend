@@ -265,12 +265,6 @@ const KLING_REPLICATE_PARITY_ROWS: CreditCostWriteRow[] = [
 }));
 
 const SEEDANCE_ROWS: CreditCostWriteRow[] = [
-  { model: "seedance-1-0-pro-250528", label: "Seedance 1.0 Pro 720p", cost: 90, resolution: "720p", audio: false, notes: "Master Pricing Sheet: 720p approx 90 credits/sec." },
-  { model: "seedance-1-0-pro-250528", label: "Seedance 1.0 Pro 1080p", cost: 200, resolution: "1080p", audio: false, notes: "Master Pricing Sheet: 1080p approx 200 credits/sec." },
-  { model: "seedance-1-0-pro-250528", label: "Seedance 1.0 Pro fallback", cost: 200, resolution: null, audio: false, notes: "Fallback when runtime receives no resolution; uses conservative 1080p rate." },
-  { model: "seedance-1-0-pro-fast-251015", label: "Seedance 1.0 Pro Fast 720p", cost: 35, resolution: "720p", audio: false, notes: "Master Pricing Sheet: 720p approx 35 credits/sec." },
-  { model: "seedance-1-0-pro-fast-251015", label: "Seedance 1.0 Pro Fast 1080p", cost: 80, resolution: "1080p", audio: false, notes: "Master Pricing Sheet: 1080p approx 80 credits/sec." },
-  { model: "seedance-1-0-pro-fast-251015", label: "Seedance 1.0 Pro Fast fallback", cost: 80, resolution: null, audio: false, notes: "Fallback when runtime receives no resolution; uses conservative 1080p rate." },
   { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro 720p no audio", cost: 100, resolution: "720p", audio: false, notes: "Master Pricing Sheet: no audio approx 100 credits/sec." },
   { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro 720p + audio", cost: 200, resolution: "720p", audio: true, notes: "Master Pricing Sheet: with audio approx 200 credits/sec." },
   { model: "seedance-1-5-pro-251215", label: "Seedance 1.5 Pro 1080p no audio", cost: 100, resolution: "1080p", audio: false, notes: "Master Pricing Sheet: 1080p no audio approx 100 credits/sec." },
@@ -996,6 +990,11 @@ async function cleanupLegacyPricingRows(client: SupabaseClient): Promise<number>
       .delete()
       .in("feature", ["generate_freepik_image", "generate_openai_image", "generate_freepik_video"])
       .like("model", "replicate-%"),
+    client
+      .from("credit_costs")
+      .delete()
+      .eq("feature", "generate_freepik_video")
+      .like("model", "seedance-1-0%"),
   ];
   for (const deleteQuery of staleDeletes) {
     const { count, error } = await deleteQuery.select("id", { count: "exact", head: true });
