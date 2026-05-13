@@ -875,20 +875,12 @@ function getProviderForNodeType(
     if (m.startsWith("replicate-veo")) return "replicate_veo";
     if (m.startsWith("replicate-kling")) return "replicate_video";
     if (m.startsWith("replicate-seedance")) return "replicate_video";
-    if (m.startsWith("seedance-2-0") || m.startsWith("dreamina-seedance-2-0")) return "replicate_video";
     if (m.startsWith("seedance") || m.startsWith("dreamina-seedance")) return "seedance";
     if (m.startsWith("veo-")) return "veo";
     return "kling";
   }
   if (nodeType === "seedDreamNode") return "seedream";
-  if (nodeType === "seedDanceNode") {
-    if (
-      m.startsWith("replicate-seedance") ||
-      m.startsWith("seedance-2-0") ||
-      m.startsWith("dreamina-seedance-2-0")
-    ) return "replicate_video";
-    return "seedance";
-  }
+  if (nodeType === "seedDanceNode") return m.startsWith("replicate-seedance") ? "replicate_video" : "seedance";
   if (nodeType === "removeBackgroundNode") return "remove_bg";
   if (nodeType === "mergeAudioNode") return "merge_audio";
   if (nodeType === "chatAiNode") return "chat_ai";

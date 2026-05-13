@@ -311,9 +311,9 @@ export interface SeedanceCredentials {
  * model that lives behind a *custom* inference endpoint provisioned
  * in the BytePlus console — those endpoints are billed against a
  * dedicated API key (`SEEDANCE_V2_API_KEY`) that may be scoped to
- * only that endpoint. If the v2 key is missing, fail explicitly so
- * workspace jobs can move to fallback instead of retrying the default
- * ARK key against the wrong scope.
+ * only that endpoint. The workspace production primary currently
+ * uses the account-wide `ARK_API_KEY` for Seedance 2.0 as well, so a
+ * missing dedicated v2 key must fall through to the default key chain.
  *
  * Default (no opts) returns the account-wide key Seedream + Hyper3D
  * "auto" endpoints share with the legacy 1.x Seedance models.
@@ -324,9 +324,7 @@ export function loadSeedanceCredentials(opts?: { v2?: boolean }): SeedanceCreden
       Deno.env.get("SEEDANCE_V2_API_KEY") ??
       Deno.env.get("BYTEPLUS_SEEDANCE_V2_API_KEY");
     if (v2Key) return { apiKey: v2Key };
-    throw new Error(
-      "Seedance V2 credentials missing: set SEEDANCE_V2_API_KEY or BYTEPLUS_SEEDANCE_V2_API_KEY.",
-    );
+    // Fall through: ARK_API_KEY is the production primary for this workspace.
   }
 
   const apiKey =

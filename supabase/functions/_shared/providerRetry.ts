@@ -100,10 +100,6 @@ export function classifyProviderError(errMsg: string): ProviderErrorClassificati
   if (msg === "PROVIDER_BILLING_ERROR") {
     return { kind: "billing", retryable: false, fast_fallback: true, permanent: false };
   }
-  const authLike =
-    /HTTP\s*(?:401|403)\b|unauthorized|forbidden|invalid api key|api key.*(?:invalid|not configured|missing)|credentials missing/i.test(
-      msg,
-    );
   if (/is not defined|is not a function|cannot read prop(?:erty|erties) of (?:undefined|null)|ReferenceError|TypeError|SyntaxError/i.test(msg)) {
     return { kind: "programming", retryable: false, fast_fallback: false, permanent: true };
   }
@@ -125,10 +121,7 @@ export function classifyProviderError(errMsg: string): ProviderErrorClassificati
   if (/HTTP\s*402\b|payment required|insufficient balance|account balance not enough|AccountOverdueError|overdue balance|prepaid|top[ -]?up/i.test(msg)) {
     return { kind: "billing", retryable: false, fast_fallback: true, permanent: false };
   }
-  if (/Seedance/i.test(msg) && authLike) {
-    return { kind: "auth", retryable: false, fast_fallback: true, permanent: false };
-  }
-  if (authLike) {
+  if (/HTTP\s*(?:401|403)\b|unauthorized|forbidden|invalid api key|api key.*(?:invalid|not configured|missing)|credentials missing/i.test(msg)) {
     return { kind: "auth", retryable: false, fast_fallback: false, permanent: true };
   }
   if (isNonRetryableQuotaError(msg)) {

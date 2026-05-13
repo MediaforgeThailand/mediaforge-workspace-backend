@@ -82,19 +82,13 @@ Deno.test("provider retry classifier: validation and auth are permanent", () => 
   assertEquals(classifyProviderError("HTTP 401 invalid api key").permanent, true);
 });
 
-Deno.test("provider retry classifier: direct Seedance auth can fast-fallback", () => {
+Deno.test("provider retry classifier: Seedance auth stays primary-visible", () => {
   const unauthorized = classifyProviderError("Seedance API error (HTTP 401): unauthorized");
   assertEquals(unauthorized.kind, "auth");
   assertEquals(unauthorized.retryable, false);
-  assertEquals(unauthorized.fast_fallback, true);
-  assertEquals(unauthorized.permanent, false);
-  assertEquals(shouldFastFallbackProviderError("Seedance API error (HTTP 403): unauthorized"), true);
-  assertEquals(
-    shouldFastFallbackProviderError(
-      "Seedance V2 credentials missing: set SEEDANCE_V2_API_KEY or BYTEPLUS_SEEDANCE_V2_API_KEY.",
-    ),
-    true,
-  );
+  assertEquals(unauthorized.fast_fallback, false);
+  assertEquals(unauthorized.permanent, true);
+  assertEquals(shouldFastFallbackProviderError("Seedance API error (HTTP 403): unauthorized"), false);
 
   const genericAuth = classifyProviderError("HTTP 401 invalid api key");
   assertEquals(genericAuth.kind, "auth");
