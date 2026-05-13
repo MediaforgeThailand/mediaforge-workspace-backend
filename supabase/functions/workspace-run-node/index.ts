@@ -2273,29 +2273,61 @@ async function invokeWorkspaceRunOnce(args: {
   extraHeaders?: Record<string, string>;
   body: WorkspaceRunBody;
 }): Promise<Record<string, unknown>> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS);
   const gatewayApiKey = firstSupabaseGatewayKey();
-  try {
-    const res = await fetch(args.functionUrl, {
-      method: "POST",
-      headers: {
-        Authorization: args.authHeader,
-        ...(gatewayApiKey ? { apikey: gatewayApiKey } : {}),
-        ...(args.extraHeaders ?? {}),
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(args.body),
-      signal: controller.signal,
-    });
-    const payload = await readJsonSafe(res);
-    if (!res.ok || payload.error) {
-      throw new Error(String(payload.error ?? payload.message ?? `workspace-run-node HTTP ${res.status}`));
+  // Inline retry budget for Supabase platform 546 (the inner edge worker
+  // hit CPU/memory/boot limits during cold start). These blips usually
+  // succeed on a warm worker on the next attempt, so spending ~2.3s on
+  // a fresh try keeps the failure invisible to the user. Persistent
+  // overload still falls through to the outer fast-fallback +
+  // permanent-classification path that already lives downstream.
+  const PLATFORM_RETRY_DELAYS_MS = [0, 800, 1500];
+  let lastPlatformErrorMsg = "workspace-run-node HTTP 546";
+  for (let attempt = 0; attempt < PLATFORM_RETRY_DELAYS_MS.length; attempt++) {
+    if (PLATFORM_RETRY_DELAYS_MS[attempt] > 0) {
+      await new Promise((r) => setTimeout(r, PLATFORM_RETRY_DELAYS_MS[attempt]));
     }
-    return payload;
-  } finally {
-    clearTimeout(timer);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), WORKSPACE_JOB_ATTEMPT_TIMEOUT_MS);
+    try {
+      const res = await fetch(args.functionUrl, {
+        method: "POST",
+        headers: {
+          Authorization: args.authHeader,
+          ...(gatewayApiKey ? { apikey: gatewayApiKey } : {}),
+          ...(args.extraHeaders ?? {}),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(args.body),
+        signal: controller.signal,
+      });
+      const payload = await readJsonSafe(res);
+      const platformOverload =
+        res.status === 546 ||
+        (!res.ok &&
+          typeof payload.message === "string" &&
+          /Function failed due to not having enough compute resources|Function exceeded resource limit|Function failed to start/i.test(
+            payload.message,
+          ));
+      if (platformOverload && attempt < PLATFORM_RETRY_DELAYS_MS.length - 1) {
+        lastPlatformErrorMsg = String(payload.message ?? `workspace-run-node HTTP ${res.status}`);
+        console.warn(
+          `[invokeWorkspaceRunOnce] Supabase platform overload (HTTP ${res.status}), retrying attempt ${attempt + 2}/${PLATFORM_RETRY_DELAYS_MS.length} after ${PLATFORM_RETRY_DELAYS_MS[attempt + 1]}ms`,
+        );
+        continue;
+      }
+      if (!res.ok || payload.error) {
+        throw new Error(
+          String(payload.error ?? payload.message ?? `workspace-run-node HTTP ${res.status}`),
+        );
+      }
+      return payload;
+    } finally {
+      clearTimeout(timer);
+    }
   }
+  // Exhausted inline platform retries — propagate so the outer
+  // fast-fallback + permanent-classification path can decide.
+  throw new Error(lastPlatformErrorMsg);
 }
 
 function startWorkspaceJobHeartbeat(args: {
