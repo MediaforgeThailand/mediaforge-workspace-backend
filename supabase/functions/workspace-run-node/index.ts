@@ -4338,7 +4338,7 @@ serve(async (req) => {
             { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } },
           );
         }
-        const buf = new Uint8Array(await r.arrayBuffer());
+        if (!r.body) throw new Error("Tripo mirror response missing body");
         // User-scoped path so the asset is owned by THIS user's
         // bucket policy. Uniqueness via timestamp + a hash of the
         // source URL keeps re-mirrors from clobbering each other.
@@ -4352,7 +4352,7 @@ serve(async (req) => {
 
         const { error: upErr } = await supabase.storage
           .from("ai-media")
-          .upload(fileName, buf, { contentType, upsert: true });
+          .upload(fileName, r.body, { contentType, upsert: true });
         if (upErr) {
           console.warn(`[tripo3d-mirror] upload err: ${upErr.message}`);
           return new Response(
@@ -4487,12 +4487,12 @@ serve(async (req) => {
           try {
             const videoRes = await fetch(videoUrl);
             if (!videoRes.ok) throw new Error(`download HTTP ${videoRes.status}`);
-            const bytes = new Uint8Array(await videoRes.arrayBuffer());
+            if (!videoRes.body) throw new Error("kling video response missing body");
             const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
             const path = `${user.id}/kling-renders/mediaforge_${safeTaskId}.mp4`;
             const upload = await supabase.storage
               .from("user_assets")
-              .upload(path, bytes, { contentType: "video/mp4", upsert: true });
+              .upload(path, videoRes.body, { contentType: "video/mp4", upsert: true });
             if (upload.error) throw upload.error;
             const signed = await supabase.storage
               .from("user_assets")
@@ -4613,12 +4613,12 @@ serve(async (req) => {
         try {
           const videoRes = await fetch(videoUrl);
           if (!videoRes.ok) throw new Error(`download HTTP ${videoRes.status}`);
-          const bytes = new Uint8Array(await videoRes.arrayBuffer());
+          if (!videoRes.body) throw new Error("seedance video response missing body");
           const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
           const path = `${user.id}/seedance-renders/mediaforge_${safeTaskId}.mp4`;
           const upload = await supabase.storage
             .from("user_assets")
-            .upload(path, bytes, { contentType: "video/mp4", upsert: true });
+            .upload(path, videoRes.body, { contentType: "video/mp4", upsert: true });
           if (upload.error) throw upload.error;
           const signed = await supabase.storage
             .from("user_assets")
@@ -4740,7 +4740,7 @@ serve(async (req) => {
           if (!outputRes.ok) {
             throw new Error(`download HTTP ${outputRes.status}`);
           }
-          const bytes = new Uint8Array(await outputRes.arrayBuffer());
+          if (!outputRes.body) throw new Error("replicate output response missing body");
           const contentType = outputRes.headers.get("content-type")?.split(";")[0]?.trim() ||
             (isReplicateImagePoll ? "image/png" : "video/mp4");
           const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -4759,7 +4759,7 @@ serve(async (req) => {
           const path = `${folder}/replicate_${safeTaskId}.${ext}`;
           const upload = await supabase.storage
             .from(bucket)
-            .upload(path, bytes, { contentType, upsert: true });
+            .upload(path, outputRes.body, { contentType, upsert: true });
           if (upload.error) throw upload.error;
           const signed = await supabase.storage
             .from(bucket)
@@ -4908,13 +4908,13 @@ serve(async (req) => {
           if (!videoRes.ok) {
             throw new Error(`download HTTP ${videoRes.status}`);
           }
-          const bytes = new Uint8Array(await videoRes.arrayBuffer());
+          if (!videoRes.body) throw new Error("freepik video response missing body");
           const contentType = videoRes.headers.get("content-type")?.split(";")[0]?.trim() || "video/mp4";
           const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
           const path = `${user.id}/video-renders/freepik_${safeTaskId}.mp4`;
           const upload = await supabase.storage
             .from("user_assets")
-            .upload(path, bytes, { contentType, upsert: true });
+            .upload(path, videoRes.body, { contentType, upsert: true });
           if (upload.error) throw upload.error;
           const signed = await supabase.storage
             .from("user_assets")
@@ -5059,7 +5059,7 @@ serve(async (req) => {
           if (!imageRes.ok) {
             throw new Error(`download HTTP ${imageRes.status}`);
           }
-          const bytes = new Uint8Array(await imageRes.arrayBuffer());
+          if (!imageRes.body) throw new Error("freepik image response missing body");
           const contentType = imageRes.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
           const ext =
             contentType.includes("jpeg") ? "jpg" :
@@ -5070,7 +5070,7 @@ serve(async (req) => {
           const path = `pipeline/magnific_banana_${safeTaskId}.${ext}`;
           const upload = await supabase.storage
             .from("ai-media")
-            .upload(path, bytes, { contentType, upsert: true });
+            .upload(path, imageRes.body, { contentType, upsert: true });
           if (upload.error) throw upload.error;
           const signed = await supabase.storage
             .from("ai-media")
@@ -5167,12 +5167,12 @@ serve(async (req) => {
           if (!videoRes.ok) {
             throw new Error(`download HTTP ${videoRes.status}`);
           }
-          const bytes = new Uint8Array(await videoRes.arrayBuffer());
+          if (!videoRes.body) throw new Error("veo video response missing body");
           const opId = taskId.replace(/^operations\//, "").replace(/[^a-zA-Z0-9_-]/g, "_");
           const path = `veo-renders/mediaforge_${opId}.mp4`;
           const upload = await supabase.storage
             .from("user_assets")
-            .upload(path, bytes, { contentType: "video/mp4", upsert: true });
+            .upload(path, videoRes.body, { contentType: "video/mp4", upsert: true });
           if (upload.error) throw upload.error;
           const signed = await supabase.storage
             .from("user_assets")
@@ -5297,11 +5297,14 @@ serve(async (req) => {
               console.warn(`[hyper3d] mirror ${ext} fetch ${r.status}`);
               return null;
             }
-            const buf = new Uint8Array(await r.arrayBuffer());
+            if (!r.body) {
+              console.warn(`[hyper3d] mirror ${ext} response missing body`);
+              return null;
+            }
             const fileName = `hyper3d/${taskId}/mediaforge_${Date.now()}.${ext}`;
             const { error: upErr } = await supabase.storage
               .from("ai-media")
-              .upload(fileName, buf, { contentType, upsert: true });
+              .upload(fileName, r.body, { contentType, upsert: true });
             if (upErr) {
               console.warn(`[hyper3d] mirror ${ext} upload err: ${upErr.message}`);
               return null;
@@ -5518,11 +5521,14 @@ serve(async (req) => {
               console.warn(`[tripo3d] mirror ${ext} fetch ${r.status}`);
               return null;
             }
-            const buf = new Uint8Array(await r.arrayBuffer());
+            if (!r.body) {
+              console.warn(`[tripo3d] mirror ${ext} response missing body`);
+              return null;
+            }
             const fileName = `tripo3d/${taskId}/mediaforge_${Date.now()}.${ext}`;
             const { error: upErr } = await supabase.storage
               .from("ai-media")
-              .upload(fileName, buf, { contentType, upsert: true });
+              .upload(fileName, r.body, { contentType, upsert: true });
             if (upErr) {
               console.warn(`[tripo3d] mirror ${ext} upload err: ${upErr.message}`);
               return null;
