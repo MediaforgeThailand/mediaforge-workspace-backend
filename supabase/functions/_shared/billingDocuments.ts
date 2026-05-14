@@ -1,6 +1,7 @@
 // deno-lint-ignore-file no-explicit-any
-import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { sendTransactionalEmail } from "./sendEmail.ts";
+
+type SupabaseClient = any;
 
 const ZERO_DECIMAL_CURRENCIES = new Set(["bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg", "rwf", "ugx", "vnd", "vuv", "xaf", "xof", "xpf"]);
 
@@ -84,15 +85,56 @@ async function logBillingDocumentEvent(
 }
 
 async function upsertDocument(client: SupabaseClient, values: Record<string, unknown>) {
+  const source = asString(values.source);
+  const documentType = asString(values.document_type);
+  const sourceReference = asString(values.source_reference);
+  if (!source || !documentType || !sourceReference) {
+    throw new Error("billing document source, type, and reference are required");
+  }
+
+  const { data: existing, error: existingError } = await client
+    .from("billing_documents")
+    .select("*")
+    .eq("source", source)
+    .eq("document_type", documentType)
+    .eq("source_reference", sourceReference)
+    .maybeSingle();
+  if (existingError) throw existingError;
+
+  if (existing?.id) {
+    const updateValues = { ...values };
+    delete updateValues.document_number;
+    delete updateValues.issued_at;
+    delete updateValues.created_by;
+
+    const { data, error } = await client
+      .from("billing_documents")
+      .update(updateValues)
+      .eq("id", existing.id)
+      .select("*")
+      .single();
+    if (error) throw error;
+    return data;
+  }
+
   const { data, error } = await client
     .from("billing_documents")
-    .upsert(values, {
-      onConflict: "source,document_type,source_reference",
-      ignoreDuplicates: false,
-    })
+    .insert(values)
     .select("*")
     .single();
-  if (error) throw error;
+  if (error) {
+    // Unique-race fallback: keep the original document number stable if a
+    // duplicate insert landed between the select and insert.
+    const { data: raced, error: racedError } = await client
+      .from("billing_documents")
+      .select("*")
+      .eq("source", source)
+      .eq("document_type", documentType)
+      .eq("source_reference", sourceReference)
+      .maybeSingle();
+    if (raced?.id && !racedError) return raced;
+    throw error;
+  }
   return data;
 }
 

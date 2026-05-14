@@ -119,6 +119,42 @@ Deno.test("verifyAdminJwt — null when JWT has wrong number of parts", async ()
   });
 });
 
+Deno.test("verifyAdminJwt — accepts service-role key for internal automation", async () => {
+  const original = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  try {
+    Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-test-key");
+    const result = await verifyAdminJwt(reqWithAuth("service-role-test-key"));
+    assertEquals(result?.sub, "00000000-0000-0000-0000-000000000000");
+    assertEquals(result?.email, "service-role@mediaforge.internal");
+    assertEquals(result?.role, "service_role");
+    assertEquals(result?.type, "admin");
+  } finally {
+    if (original === undefined) Deno.env.delete("SUPABASE_SERVICE_ROLE_KEY");
+    else Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", original);
+  }
+});
+
+Deno.test("verifyAdminJwt — accepts configured internal automation key", async () => {
+  const original = Deno.env.get("ADMIN_WORKSPACE_INTERNAL_KEY");
+  try {
+    Deno.env.set("ADMIN_WORKSPACE_INTERNAL_KEY", "internal-admin-test-key");
+    const result = await verifyAdminJwt(new Request("http://x", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer any-well-formed-admin-auth",
+        "x-admin-internal-key": "internal-admin-test-key",
+      },
+    }));
+    assertEquals(result?.sub, "00000000-0000-0000-0000-000000000001");
+    assertEquals(result?.email, "internal-automation@mediaforge.internal");
+    assertEquals(result?.role, "internal_automation");
+    assertEquals(result?.type, "admin");
+  } finally {
+    if (original === undefined) Deno.env.delete("ADMIN_WORKSPACE_INTERNAL_KEY");
+    else Deno.env.set("ADMIN_WORKSPACE_INTERNAL_KEY", original);
+  }
+});
+
 Deno.test("verifyAdminJwt — null when JWT_SECRET env is unset (fail closed)", async () => {
   await withSecret(undefined, async () => {
     // Can't even build a valid JWT against the unset secret — but even a

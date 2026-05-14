@@ -70,7 +70,7 @@ serve(async (req) => {
     const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
     if (!SENDGRID_API_KEY) {
-      return new Response(JSON.stringify({ error: "SENDGRID_API_KEY not configured" }), {
+      return new Response(JSON.stringify({ error: "email_provider_not_configured" }), {
         status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }

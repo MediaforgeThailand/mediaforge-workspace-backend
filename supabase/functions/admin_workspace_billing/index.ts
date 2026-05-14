@@ -31,6 +31,7 @@ const PAYMENT_SELECT = [
   "stripe_payment_intent_id",
   "stripe_charge_id",
   "stripe_invoice_id",
+  "stripe_customer_id",
   "amount_thb",
   "currency",
   "amount_original",
@@ -39,6 +40,7 @@ const PAYMENT_SELECT = [
   "payment_method",
   "receipt_url",
   "invoice_url",
+  "invoice_pdf_url",
   "receipt_number",
   "receipt_generated_at",
   "checkout_metadata",
@@ -139,7 +141,16 @@ async function listBillingDocuments(client: SupabaseClient, body: Record<string,
 
   const docs = await hydrateUsers(client, docsRaw ?? []);
   const payments = await hydrateUsers(client, paymentsRaw ?? []);
-  const docPaymentIds = new Set((docsRaw ?? []).map((doc: any) => doc.payment_transaction_id).filter(Boolean));
+  const paymentIds = (paymentsRaw ?? []).map((payment: any) => payment.id).filter(Boolean);
+  let docPaymentIds = new Set<string>();
+  if (paymentIds.length > 0) {
+    const { data: linkedDocs, error: linkedDocsError } = await client
+      .from("billing_documents")
+      .select("payment_transaction_id")
+      .in("payment_transaction_id", paymentIds);
+    if (linkedDocsError) throw new Error(`billing document link read failed: ${linkedDocsError.message}`);
+    docPaymentIds = new Set((linkedDocs ?? []).map((doc: any) => doc.payment_transaction_id).filter(Boolean));
+  }
   const paymentsMissingDocuments = payments.filter((payment: any) => !docPaymentIds.has(payment.id));
 
   const filteredDocs = search

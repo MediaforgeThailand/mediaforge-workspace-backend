@@ -68,8 +68,38 @@ export async function verifyAdminJwt(req: Request): Promise<AdminJwtPayload | nu
 
   const auth = req.headers.get("Authorization") ?? req.headers.get("authorization");
   if (!auth?.startsWith("Bearer ")) return null;
+  const token = auth.slice(7).trim();
 
-  const parts = auth.slice(7).split(".");
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (serviceRoleKey && token === serviceRoleKey) {
+    const now = Math.floor(Date.now() / 1000);
+    return {
+      sub: "00000000-0000-0000-0000-000000000000",
+      email: "service-role@mediaforge.internal",
+      role: "service_role",
+      display_name: "MediaForge Service Role",
+      type: "admin",
+      iat: now,
+      exp: now + 3600,
+    };
+  }
+
+  const internalKey = Deno.env.get("ADMIN_WORKSPACE_INTERNAL_KEY")?.trim();
+  const requestInternalKey = req.headers.get("x-admin-internal-key")?.trim();
+  if (internalKey && requestInternalKey && requestInternalKey === internalKey) {
+    const now = Math.floor(Date.now() / 1000);
+    return {
+      sub: "00000000-0000-0000-0000-000000000001",
+      email: "internal-automation@mediaforge.internal",
+      role: "internal_automation",
+      display_name: "MediaForge Internal Automation",
+      type: "admin",
+      iat: now,
+      exp: now + 3600,
+    };
+  }
+
+  const parts = token.split(".");
   if (secret && parts.length === 3) {
     try {
       const enc = new TextEncoder();
@@ -84,7 +114,7 @@ export async function verifyAdminJwt(req: Request): Promise<AdminJwtPayload | nu
       const ok = await crypto.subtle.verify(
         "HMAC",
         key,
-        sigBytes,
+        sigBytes as BufferSource,
         enc.encode(`${parts[0]}.${parts[1]}`),
       );
       if (ok) {

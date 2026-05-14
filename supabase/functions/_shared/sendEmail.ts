@@ -55,7 +55,19 @@ export async function sendTransactionalEmail(
     if (!res.ok) {
       const errText = await res.text();
       console.warn(`[sendTransactionalEmail] template=${template} to=${to} HTTP ${res.status}: ${errText.substring(0, 200)}`);
-      return { success: false, error: `http_${res.status}` };
+      let providerError = `http_${res.status}`;
+      try {
+        const parsed = JSON.parse(errText);
+        const errorText = typeof parsed?.error === "string" ? parsed.error : "";
+        if (errorText.includes("SENDGRID_API_KEY") || errorText === "email_provider_not_configured") {
+          providerError = "email_provider_not_configured";
+        } else if (errorText) {
+          providerError = errorText;
+        }
+      } catch {
+        // Keep the generic HTTP code if the email function returns plain text.
+      }
+      return { success: false, error: providerError };
     }
 
     const json = await res.json();
