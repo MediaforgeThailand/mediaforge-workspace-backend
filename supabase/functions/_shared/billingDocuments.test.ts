@@ -219,3 +219,28 @@ Deno.test("buildGeneratedBillingDocumentPdfAttachment creates a PDF attachment",
   assert(pdf.includes("Amount due"));
   assert(pdf.includes("MediaForge Co., Ltd."));
 });
+
+Deno.test("buildGeneratedBillingDocumentPdfAttachment lays out receipt payment history safely", () => {
+  const attachment = buildGeneratedBillingDocumentPdfAttachment({
+    document_type: "manual_receipt",
+    document_number: "RCPT-M-20260514-F75DD53C",
+    issued_at: "2026-05-14T00:00:00Z",
+    email_to: "mediaforge2026@gmail.com",
+    title: "Manual receipt test",
+    amount_thb: 1,
+    currency: "thb",
+    credits_added: 0,
+    line_items: [{ description: "Manual receipt test", amount_thb: 1, credits: 0 }],
+    metadata: { note: "Receipt layout test", payment_method: "Card payment" },
+  });
+
+  assertEquals(attachment.filename, "RCPT-M-20260514-F75DD53C.pdf");
+  const pdf = atob(attachment.content);
+  assert(pdf.startsWith("%PDF-1.4"));
+  assert(pdf.includes("Receipt"));
+  assert(pdf.includes("Receipt number RCPT-M-20260514-F75DD53C"));
+  assert(!pdf.includes("Invoice number RCPT-M-20260514-F75DD53C"));
+  assert(pdf.includes("Payment history"));
+  assert(pdf.includes("Card payment"));
+  assert(pdf.includes("Amount paid"));
+});

@@ -330,13 +330,17 @@ function generatedBillingDocumentPdf(document: any): Uint8Array {
   });
 
   let metaY = 682;
-  doc.text(`Invoice number ${invoiceNo}`, PAGE_MARGIN_X, metaY, { size: 10, maxWidth: 260 });
-  metaY -= 16;
   if (isReceipt) {
     doc.text(`Receipt number ${receiptNo}`, PAGE_MARGIN_X, metaY, { size: 10, maxWidth: 260 });
     metaY -= 16;
+    if (documentNo !== receiptNo) {
+      doc.text(`Document number ${documentNo}`, PAGE_MARGIN_X, metaY, { size: 10, maxWidth: 260 });
+      metaY -= 16;
+    }
     doc.text(`Date paid ${issued}`, PAGE_MARGIN_X, metaY, { size: 10, maxWidth: 260 });
   } else {
+    doc.text(`Invoice number ${invoiceNo}`, PAGE_MARGIN_X, metaY, { size: 10, maxWidth: 260 });
+    metaY -= 16;
     doc.text(`Date of issue ${issued}`, PAGE_MARGIN_X, metaY, { size: 10, maxWidth: 260 });
     metaY -= 16;
     doc.text(`Date due ${due}`, PAGE_MARGIN_X, metaY, { size: 10, maxWidth: 260 });
@@ -417,19 +421,18 @@ function generatedBillingDocumentPdf(document: any): Uint8Array {
 
   doc.setY(summaryY - 90);
   if (isReceipt) {
-    doc.ensureSpace(82);
+    doc.ensureSpace(110);
     const y = doc.cursorY();
     doc.text("Payment history", PAGE_MARGIN_X, y, { size: 12, bold: true, maxWidth: 160 });
     doc.rect(PAGE_MARGIN_X, y - 38, PAGE_WIDTH - PAGE_MARGIN_X * 2, 24, "0.96 0.97 0.99");
     doc.text("Payment method", PAGE_MARGIN_X + 10, y - 30, { size: 9, bold: true, color: "muted", maxWidth: 140 });
-    doc.text("Date", 320, y - 30, { size: 9, bold: true, color: "muted", maxWidth: 80 });
-    doc.text("Amount paid", 450, y - 30, { size: 9, bold: true, color: "muted", align: "right", maxWidth: 90 });
-    doc.text("Receipt number", 560, y - 30, { size: 9, bold: true, color: "muted", align: "right", maxWidth: 105 });
+    doc.text("Date", 300, y - 30, { size: 9, bold: true, color: "muted", maxWidth: 80 });
+    doc.text("Amount paid", 560, y - 30, { size: 9, bold: true, color: "muted", align: "right", maxWidth: 90 });
     doc.text(pdfSafeText(metadata.payment_method || "Card payment"), PAGE_MARGIN_X + 10, y - 58, { size: 10, maxWidth: 160 });
-    doc.text(issued, 320, y - 58, { size: 10, maxWidth: 90 });
-    doc.text(fmtMoney(total, currency), 450, y - 58, { size: 10, align: "right", maxWidth: 90 });
-    doc.text(receiptNo, 560, y - 58, { size: 10, align: "right", maxWidth: 105 });
-    doc.setY(y - 92);
+    doc.text(issued, 300, y - 58, { size: 10, maxWidth: 90 });
+    doc.text(fmtMoney(total, currency), 560, y - 58, { size: 10, align: "right", maxWidth: 90 });
+    doc.text(`Receipt number ${receiptNo}`, PAGE_MARGIN_X + 10, y - 84, { size: 9, color: "muted", maxWidth: 420 });
+    doc.setY(y - 116);
   }
 
   const note = pdfSafeText(
