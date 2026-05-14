@@ -34,7 +34,6 @@ import {
   pollSeedanceOnce,
 } from "../_shared/seedance.ts";
 import { executeSeedream } from "../_shared/seedream.ts";
-import { snapMem } from "../_shared/memDebug.ts";
 import {
   HYPER3D_BASE,
   HYPER3D_TASKS_PATH,
@@ -4403,7 +4402,6 @@ serve(async (req) => {
         : "application/octet-stream";
 
       try {
-        snapMem("mirror_tripo_url BEFORE");
         const r = await fetch(srcUrl);
         if (!r.ok) {
           return new Response(
@@ -4434,7 +4432,6 @@ serve(async (req) => {
         const { error: upErr } = await supabase.storage
           .from("ai-media")
           .upload(fileName, r.body, { contentType, upsert: true });
-        snapMem("mirror_tripo_url AFTER ");
         if (upErr) {
           console.warn(`[tripo3d-mirror] upload err: ${upErr.message}`);
           return new Response(
@@ -5124,7 +5121,6 @@ serve(async (req) => {
       let publicUrl = "";
       if (normalised === "succeed" && providerImageUrl) {
         try {
-          snapMem("poll_freepik_image BEFORE");
           const imageRes = await fetch(providerImageUrl);
           if (!imageRes.ok) {
             throw new Error(`download HTTP ${imageRes.status}`);
@@ -5141,7 +5137,6 @@ serve(async (req) => {
           const upload = await supabase.storage
             .from("ai-media")
             .upload(path, imageRes.body, { contentType, upsert: true });
-          snapMem("poll_freepik_image AFTER ");
           if (upload.error) throw upload.error;
           const signed = await supabase.storage
             .from("ai-media")
@@ -5234,7 +5229,6 @@ serve(async (req) => {
       if (normalised === "succeed" && videoUri) {
         try {
           const downloadUrl = `${videoUri}${videoUri.includes("?") ? "&" : "?"}key=${apiKey}`;
-          snapMem("poll_veo BEFORE");
           const videoRes = await fetch(downloadUrl);
           if (!videoRes.ok) {
             throw new Error(`download HTTP ${videoRes.status}`);
@@ -5245,7 +5239,6 @@ serve(async (req) => {
           const upload = await supabase.storage
             .from("user_assets")
             .upload(path, videoRes.body, { contentType: "video/mp4", upsert: true });
-          snapMem("poll_veo AFTER ");
           if (upload.error) throw upload.error;
           const signed = await supabase.storage
             .from("user_assets")
@@ -5365,7 +5358,6 @@ serve(async (req) => {
           contentType: string,
         ): Promise<string | null> => {
           try {
-            snapMem(`poll_hyper3d ${ext} BEFORE`);
             const r = await fetch(srcUrl);
             if (!r.ok) {
               console.warn(`[hyper3d] mirror ${ext} fetch ${r.status}`);
@@ -5379,7 +5371,6 @@ serve(async (req) => {
             const { error: upErr } = await supabase.storage
               .from("ai-media")
               .upload(fileName, r.body, { contentType, upsert: true });
-            snapMem(`poll_hyper3d ${ext} AFTER `);
             if (upErr) {
               console.warn(`[hyper3d] mirror ${ext} upload err: ${upErr.message}`);
               return null;
@@ -5591,7 +5582,6 @@ serve(async (req) => {
           contentType: string,
         ): Promise<string | null> => {
           try {
-            snapMem(`poll_tripo3d ${ext} BEFORE`);
             const r = await fetch(srcUrl);
             if (!r.ok) {
               console.warn(`[tripo3d] mirror ${ext} fetch ${r.status}`);
@@ -5605,7 +5595,6 @@ serve(async (req) => {
             const { error: upErr } = await supabase.storage
               .from("ai-media")
               .upload(fileName, r.body, { contentType, upsert: true });
-            snapMem(`poll_tripo3d ${ext} AFTER `);
             if (upErr) {
               console.warn(`[tripo3d] mirror ${ext} upload err: ${upErr.message}`);
               return null;
