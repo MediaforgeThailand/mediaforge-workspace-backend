@@ -18,6 +18,7 @@ const jsonHeaders = {
 const ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1";
 const DOWNLOAD_TOKEN_TTL_SEC = 60 * 60 * 6;
 const ELEVENLABS_DUBBING_WATERMARK = false;
+const ELEVENLABS_DUBBING_NAME_MAX = 100;
 
 type StartBody = {
   action: "start";
@@ -105,6 +106,35 @@ function downloadSecret(): string {
 
 function textValue(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function truncateProviderText(value: string, maxLength: number): string {
+  const chars = Array.from(value);
+  if (chars.length <= maxLength) return value;
+  if (maxLength <= 3) return chars.slice(0, maxLength).join("");
+  return `${chars.slice(0, maxLength - 3).join("").trimEnd()}...`;
+}
+
+function cleanProviderNamePart(value: string): string {
+  const withoutQuery = value.split(/[?#]/)[0] ?? value;
+  const fileLike = withoutQuery.split(/[\\/]/).filter(Boolean).pop() ?? withoutQuery;
+  let decoded = fileLike;
+  try {
+    decoded = decodeURIComponent(fileLike);
+  } catch {
+    // Keep the original text if it is not valid URL-encoded input.
+  }
+  return decoded
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function elevenLabsDubbingName(sourceName: string, outputLanguage: string): string {
+  const cleanedSource = cleanProviderNamePart(sourceName);
+  const cleanedLanguage = cleanProviderNamePart(outputLanguage);
+  const suffix = cleanedSource || cleanedLanguage || "media";
+  return truncateProviderText(`MediaForge Translate - ${suffix}`, ELEVENLABS_DUBBING_NAME_MAX);
 }
 
 function boolValue(value: unknown, fallback = false): boolean {
@@ -463,7 +493,7 @@ serve(async (req) => {
       form.append("source_url", providerSourceUrl);
       form.append("target_lang", targetLang);
       form.append("source_lang", sourceLang);
-      form.append("name", sourceName ? `MediaForge Translate - ${sourceName}` : `MediaForge Translate - ${outputLanguage}`);
+      form.append("name", elevenLabsDubbingName(sourceName, outputLanguage));
       form.append("num_speakers", String(speakerNum ?? 0));
       form.append("watermark", ELEVENLABS_DUBBING_WATERMARK ? "true" : "false");
       form.append("highest_resolution", "false");
