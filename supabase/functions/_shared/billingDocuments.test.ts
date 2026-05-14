@@ -210,5 +210,12 @@ Deno.test("buildGeneratedBillingDocumentPdfAttachment creates a PDF attachment",
   assertEquals(attachment.filename, "INV-M-TEST-1.pdf");
   assertEquals(attachment.type, "application/pdf");
   assertEquals(attachment.disposition, "attachment");
-  assert(atob(attachment.content).startsWith("%PDF-1.4"));
+  const pdf = atob(attachment.content);
+  assert(pdf.startsWith("%PDF-1.4"));
+  assert(pdf.includes("Invoice"));
+  assert(pdf.includes("Invoice number INV-M-TEST-1"));
+  assert(pdf.includes("Bill to"));
+  assert(pdf.includes("Subtotal"));
+  assert(pdf.includes("Amount due"));
+  assert(pdf.includes("MediaForge Co., Ltd."));
 });

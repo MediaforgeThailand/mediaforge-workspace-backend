@@ -19,6 +19,28 @@ function fmtNum(n: number): string {
   return new Intl.NumberFormat("en-US").format(Number.isFinite(n) ? n : 0);
 }
 
+function fmtMoney(amount: number, currency: string): string {
+  const code = String(currency || "thb").toUpperCase();
+  const safeAmount = Number.isFinite(amount) ? amount : 0;
+  const fractionDigits = ZERO_DECIMAL_CURRENCIES.has(code.toLowerCase()) ? 0 : 2;
+  const formatted = new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits,
+  }).format(safeAmount);
+  if (code === "USD") return `$${formatted}`;
+  return `${code} ${formatted}`;
+}
+
+function fmtDate(value: unknown): string {
+  const date = value ? new Date(String(value)) : new Date();
+  const safeDate = Number.isFinite(date.getTime()) ? date : new Date();
+  return new Intl.DateTimeFormat("en-US", {
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+  }).format(safeDate);
+}
+
 function majorFromStripeAmount(amount: number | null | undefined, currency: string | null | undefined): number {
   const safeAmount = Number(amount ?? 0);
   return ZERO_DECIMAL_CURRENCIES.has(String(currency ?? "").toLowerCase())
@@ -75,6 +97,12 @@ function wrapPdfLine(value: unknown, max = 84): string[] {
   return lines;
 }
 
+function fitPdfText(value: unknown, max = 110): string {
+  const text = pdfSafeText(value);
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 3)).trimEnd()}...`;
+}
+
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
   const chunkSize = 0x8000;
@@ -84,38 +112,335 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-function simplePdf(lines: Array<{ text: string; size?: number; gap?: number }>): Uint8Array {
-  const encoder = new TextEncoder();
-  const content: string[] = ["q", "1 1 1 rg", "0 0 612 792 re f", "Q"];
-  let y = 742;
-  for (const line of lines) {
-    const size = line.size ?? 10;
-    content.push("BT", `/F1 ${size} Tf`, `50 ${y} Td`, `(${pdfEscape(line.text)}) Tj`, "ET");
-    y -= line.gap ?? Math.max(14, size + 5);
-    if (y < 48) break;
-  }
-  const stream = `${content.join("\n")}\n`;
-  const objects = [
-    "<< /Type /Catalog /Pages 2 0 R >>",
-    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
-    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-    `<< /Length ${encoder.encode(stream).length} >>\nstream\n${stream}endstream`,
-  ];
+type PdfTextOpts = {
+  size?: number;
+  color?: string;
+  bold?: boolean;
+  align?: "left" | "right";
+  maxWidth?: number;
+};
 
-  let pdf = "%PDF-1.4\n";
-  const offsets: number[] = [];
-  for (let i = 0; i < objects.length; i += 1) {
-    offsets.push(encoder.encode(pdf).length);
-    pdf += `${i + 1} 0 obj\n${objects[i]}\nendobj\n`;
+type PdfLineItem = {
+  description: string;
+  quantity: number;
+  unitAmount: number;
+  amount: number;
+};
+
+const PAGE_WIDTH = 612;
+const PAGE_HEIGHT = 792;
+const PAGE_MARGIN_X = 50;
+const PAGE_BOTTOM_Y = 58;
+
+function approxTextWidth(text: string, size: number): number {
+  return pdfSafeText(text).length * size * 0.52;
+}
+
+function pdfColor(color: string): string {
+  switch (color) {
+    case "muted":
+      return "0.38 0.42 0.49";
+    case "light":
+      return "0.85 0.87 0.90";
+    case "brand":
+      return "0.08 0.10 0.16";
+    case "white":
+      return "1 1 1";
+    default:
+      return "0.06 0.07 0.09";
   }
-  const xrefOffset = encoder.encode(pdf).length;
-  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
-  for (const offset of offsets) {
-    pdf += `${String(offset).padStart(10, "0")} 00000 n \n`;
+}
+
+class PdfDoc {
+  private pages: string[][] = [[]];
+  private y = 742;
+
+  private get current(): string[] {
+    return this.pages[this.pages.length - 1];
   }
-  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
-  return encoder.encode(pdf);
+
+  pageCount(): number {
+    return this.pages.length;
+  }
+
+  cursorY(): number {
+    return this.y;
+  }
+
+  setY(y: number) {
+    this.y = y;
+  }
+
+  ensureSpace(height = 72) {
+    if (this.y - height >= PAGE_BOTTOM_Y) return;
+    this.newPage();
+  }
+
+  newPage() {
+    this.pages.push([]);
+    this.y = 742;
+  }
+
+  text(value: unknown, x: number, y: number, opts: PdfTextOpts = {}) {
+    const size = opts.size ?? 10;
+    const font = opts.bold ? "F2" : "F1";
+    const text = fitPdfText(value, opts.maxWidth ?? 160);
+    const tx = opts.align === "right" ? x - approxTextWidth(text, size) : x;
+    this.current.push(
+      "BT",
+      `${pdfColor(opts.color ?? "default")} rg`,
+      `/${font} ${size} Tf`,
+      `${tx.toFixed(2)} ${y.toFixed(2)} Td`,
+      `(${pdfEscape(text)}) Tj`,
+      "ET",
+    );
+  }
+
+  line(x1: number, y1: number, x2: number, y2: number, color = "0.88 0.90 0.94") {
+    this.current.push("q", `${color} RG`, "0.8 w", `${x1} ${y1} m`, `${x2} ${y2} l`, "S", "Q");
+  }
+
+  rect(x: number, y: number, w: number, h: number, color = "0.96 0.97 0.98") {
+    this.current.push("q", `${color} rg`, `${x} ${y} ${w} ${h} re f`, "Q");
+  }
+
+  move(delta: number) {
+    this.y -= delta;
+  }
+
+  flowText(value: unknown, x: number, maxChars: number, lineHeight = 13, opts: PdfTextOpts = {}) {
+    for (const line of wrapPdfLine(value, maxChars)) {
+      this.ensureSpace(lineHeight + 4);
+      this.text(line, x, this.y, opts);
+      this.move(lineHeight);
+    }
+  }
+
+  toBytes(): Uint8Array {
+    const encoder = new TextEncoder();
+    const total = this.pages.length;
+    const pageStreams = this.pages.map((ops, index) => {
+      const pageNo = index + 1;
+      return [
+        "q",
+        "1 1 1 rg",
+        `0 0 ${PAGE_WIDTH} ${PAGE_HEIGHT} re f`,
+        "Q",
+        ...ops,
+        "BT",
+        "0.38 0.42 0.49 rg",
+        "/F1 9 Tf",
+        `${PAGE_WIDTH - 100} 28 Td`,
+        `(Page ${pageNo} of ${total}) Tj`,
+        "ET",
+      ].join("\n");
+    });
+
+    const objects: string[] = [
+      "",
+      "",
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>",
+    ];
+    const kids: string[] = [];
+    for (const stream of pageStreams) {
+      const pageId = objects.length + 1;
+      const contentId = pageId + 1;
+      kids.push(`${pageId} 0 R`);
+      objects.push(
+        `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${PAGE_WIDTH} ${PAGE_HEIGHT}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${contentId} 0 R >>`,
+      );
+      objects.push(`<< /Length ${encoder.encode(stream).length} >>\nstream\n${stream}\nendstream`);
+    }
+    objects[0] = "<< /Type /Catalog /Pages 2 0 R >>";
+    objects[1] = `<< /Type /Pages /Kids [${kids.join(" ")}] /Count ${kids.length} >>`;
+
+    let pdf = "%PDF-1.4\n";
+    const offsets: number[] = [];
+    for (let i = 0; i < objects.length; i += 1) {
+      offsets.push(encoder.encode(pdf).length);
+      pdf += `${i + 1} 0 obj\n${objects[i]}\nendobj\n`;
+    }
+    const xrefOffset = encoder.encode(pdf).length;
+    pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    for (const offset of offsets) {
+      pdf += `${String(offset).padStart(10, "0")} 00000 n \n`;
+    }
+    pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+    return encoder.encode(pdf);
+  }
+}
+
+function normaliseLineItems(document: any, amount: number): PdfLineItem[] {
+  const lineItems = Array.isArray(document?.line_items) ? document.line_items : [];
+  const rows = lineItems.length > 0 ? lineItems : [{
+    description: document?.title || "MediaForge credits",
+    amount_thb: amount,
+    credits: document?.credits_added ?? 0,
+  }];
+  return rows.slice(0, 18).map((item: any) => {
+    const itemAmount = Number(item?.amount_thb ?? item?.amount ?? amount);
+    const credits = Number(item?.credits ?? 0);
+    const quantity = Number.isFinite(Number(item?.quantity))
+      ? Number(item.quantity)
+      : credits > 0
+        ? credits
+        : 1;
+    const unitAmount = quantity > 0 ? itemAmount / quantity : itemAmount;
+    return {
+      description: pdfSafeText(item?.description || document?.title || "MediaForge credits"),
+      quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : 1,
+      unitAmount: Number.isFinite(unitAmount) ? unitAmount : itemAmount,
+      amount: Number.isFinite(itemAmount) ? itemAmount : 0,
+    };
+  });
+}
+
+function generatedBillingDocumentPdf(document: any): Uint8Array {
+  const isReceipt = String(document?.document_type ?? "").includes("receipt");
+  const typeLabel = isReceipt ? "Receipt" : "Invoice";
+  const issued = fmtDate(document?.issued_at);
+  const due = fmtDate(document?.due_at ?? document?.issued_at);
+  const currency = String(document?.currency ?? "thb").toUpperCase();
+  const amount = Number(document?.amount_thb ?? 0);
+  const money = fmtMoney(amount, currency);
+  const documentNo = pdfSafeText(document?.document_number || documentNumber(isReceipt ? "RCPT" : "INV"));
+  const invoiceNo = pdfSafeText(document?.stripe_invoice_id || document?.invoice_number || documentNo);
+  const receiptNo = pdfSafeText(document?.receipt_number || documentNo);
+  const emailTo = pdfSafeText(document?.email_to || "-");
+  const metadata = document?.metadata && typeof document.metadata === "object" ? document.metadata : {};
+  const checkoutMeta = metadata.checkout_metadata && typeof metadata.checkout_metadata === "object"
+    ? metadata.checkout_metadata as Record<string, unknown>
+    : {};
+  const customerName =
+    pdfSafeText(metadata.customer_name || checkoutMeta.customer_name || checkoutMeta.name || checkoutMeta.organization_name) ||
+    (emailTo.includes("@") ? emailTo.split("@")[0] : "MediaForge customer");
+  const title = pdfSafeText(document?.title) || (isReceipt ? "MediaForge payment" : "MediaForge invoice");
+  const items = normaliseLineItems(document, amount);
+  const subtotal = items.reduce((sum, item) => sum + item.amount, 0);
+  const total = Number.isFinite(subtotal) && subtotal > 0 ? subtotal : amount;
+  const doc = new PdfDoc();
+
+  doc.text(typeLabel, PAGE_MARGIN_X, 720, { size: 28, bold: true, maxWidth: 220 });
+  doc.text(`MediaForge ${typeLabel}`, PAGE_WIDTH - PAGE_MARGIN_X, 722, {
+    size: 11,
+    color: "muted",
+    align: "right",
+    maxWidth: 190,
+  });
+
+  let metaY = 682;
+  doc.text(`Invoice number ${invoiceNo}`, PAGE_MARGIN_X, metaY, { size: 10, maxWidth: 260 });
+  metaY -= 16;
+  if (isReceipt) {
+    doc.text(`Receipt number ${receiptNo}`, PAGE_MARGIN_X, metaY, { size: 10, maxWidth: 260 });
+    metaY -= 16;
+    doc.text(`Date paid ${issued}`, PAGE_MARGIN_X, metaY, { size: 10, maxWidth: 260 });
+  } else {
+    doc.text(`Date of issue ${issued}`, PAGE_MARGIN_X, metaY, { size: 10, maxWidth: 260 });
+    metaY -= 16;
+    doc.text(`Date due ${due}`, PAGE_MARGIN_X, metaY, { size: 10, maxWidth: 260 });
+  }
+
+  const sellerX = 360;
+  let sellerY = 682;
+  const sellerLines = [
+    "MediaForge Co., Ltd.",
+    "MediaForge Workspace",
+    "Bangkok, Thailand",
+    "support@mediaforge.co",
+    "https://mediaforge.co",
+  ];
+  for (const line of sellerLines) {
+    doc.text(line, sellerX, sellerY, { size: 10, color: line === sellerLines[0] ? "default" : "muted", bold: line === sellerLines[0], maxWidth: 200 });
+    sellerY -= 14;
+  }
+
+  doc.line(PAGE_MARGIN_X, 604, PAGE_WIDTH - PAGE_MARGIN_X, 604);
+
+  doc.text("Bill to", PAGE_MARGIN_X, 570, { size: 11, bold: true });
+  let billY = 552;
+  for (const line of [customerName, emailTo]) {
+    if (!line) continue;
+    doc.text(line, PAGE_MARGIN_X, billY, { size: 10, color: line === customerName ? "default" : "muted", maxWidth: 245 });
+    billY -= 14;
+  }
+
+  doc.text(
+    isReceipt ? `${money} paid on ${issued}` : `${money} due ${due}`,
+    PAGE_MARGIN_X,
+    492,
+    { size: 17, bold: true, maxWidth: 330 },
+  );
+  if (!isReceipt && firstHttpsUrl(document?.invoice_url)) {
+    doc.text("Pay online", PAGE_MARGIN_X, 468, { size: 10, bold: true, color: "brand" });
+  }
+
+  const tableTop = 430;
+  doc.rect(PAGE_MARGIN_X, tableTop - 22, PAGE_WIDTH - PAGE_MARGIN_X * 2, 24, "0.96 0.97 0.99");
+  doc.text("Description", PAGE_MARGIN_X + 10, tableTop - 14, { size: 9, bold: true, color: "muted", maxWidth: 210 });
+  doc.text("Qty", 360, tableTop - 14, { size: 9, bold: true, color: "muted", align: "right" });
+  doc.text("Unit price", 446, tableTop - 14, { size: 9, bold: true, color: "muted", align: "right" });
+  doc.text("Amount", 560, tableTop - 14, { size: 9, bold: true, color: "muted", align: "right" });
+  doc.line(PAGE_MARGIN_X, tableTop - 24, PAGE_WIDTH - PAGE_MARGIN_X, tableTop - 24);
+
+  doc.setY(tableTop - 48);
+  for (const item of items) {
+    doc.ensureSpace(42);
+    const y = doc.cursorY();
+    const descriptionLines = wrapPdfLine(item.description, 42).slice(0, 2);
+    doc.text(descriptionLines[0] || "MediaForge credits", PAGE_MARGIN_X + 10, y, { size: 10, maxWidth: 230 });
+    if (descriptionLines[1]) {
+      doc.text(descriptionLines[1], PAGE_MARGIN_X + 10, y - 13, { size: 9, color: "muted", maxWidth: 230 });
+    }
+    doc.text(fmtNum(item.quantity), 360, y, { size: 10, align: "right", maxWidth: 52 });
+    doc.text(fmtMoney(item.unitAmount, currency), 446, y, { size: 10, align: "right", maxWidth: 80 });
+    doc.text(fmtMoney(item.amount, currency), 560, y, { size: 10, align: "right", maxWidth: 90 });
+    doc.move(descriptionLines[1] ? 34 : 28);
+    doc.line(PAGE_MARGIN_X, doc.cursorY() + 10, PAGE_WIDTH - PAGE_MARGIN_X, doc.cursorY() + 10, "0.93 0.94 0.96");
+  }
+
+  doc.ensureSpace(96);
+  const summaryY = doc.cursorY() - 6;
+  doc.text("Subtotal", 410, summaryY, { size: 10, color: "muted", maxWidth: 80 });
+  doc.text(fmtMoney(total, currency), 560, summaryY, { size: 10, align: "right", maxWidth: 90 });
+  doc.text("Total", 410, summaryY - 24, { size: 10, bold: true, maxWidth: 80 });
+  doc.text(fmtMoney(total, currency), 560, summaryY - 24, { size: 10, bold: true, align: "right", maxWidth: 90 });
+  doc.text(isReceipt ? "Amount paid" : "Amount due", 410, summaryY - 48, { size: 10, bold: true, maxWidth: 80 });
+  const amountDueText = isReceipt || currency !== "USD" ? fmtMoney(total, currency) : `${fmtMoney(total, currency)} USD`;
+  doc.text(amountDueText, 560, summaryY - 48, {
+    size: 10,
+    bold: true,
+    align: "right",
+    maxWidth: 110,
+  });
+
+  doc.setY(summaryY - 90);
+  if (isReceipt) {
+    doc.ensureSpace(82);
+    const y = doc.cursorY();
+    doc.text("Payment history", PAGE_MARGIN_X, y, { size: 12, bold: true, maxWidth: 160 });
+    doc.rect(PAGE_MARGIN_X, y - 38, PAGE_WIDTH - PAGE_MARGIN_X * 2, 24, "0.96 0.97 0.99");
+    doc.text("Payment method", PAGE_MARGIN_X + 10, y - 30, { size: 9, bold: true, color: "muted", maxWidth: 140 });
+    doc.text("Date", 320, y - 30, { size: 9, bold: true, color: "muted", maxWidth: 80 });
+    doc.text("Amount paid", 450, y - 30, { size: 9, bold: true, color: "muted", align: "right", maxWidth: 90 });
+    doc.text("Receipt number", 560, y - 30, { size: 9, bold: true, color: "muted", align: "right", maxWidth: 105 });
+    doc.text(pdfSafeText(metadata.payment_method || "Card payment"), PAGE_MARGIN_X + 10, y - 58, { size: 10, maxWidth: 160 });
+    doc.text(issued, 320, y - 58, { size: 10, maxWidth: 90 });
+    doc.text(fmtMoney(total, currency), 450, y - 58, { size: 10, align: "right", maxWidth: 90 });
+    doc.text(receiptNo, 560, y - 58, { size: 10, align: "right", maxWidth: 105 });
+    doc.setY(y - 92);
+  }
+
+  const note = pdfSafeText(
+    metadata.note ||
+      metadata.reason ||
+      `Charges for "${title}" represent MediaForge workspace credits and platform usage. Detailed usage is available in the billing and usage dashboard.`,
+  );
+  doc.ensureSpace(72);
+  doc.flowText(note, PAGE_MARGIN_X, 100, 12, { size: 9, color: "muted", maxWidth: 500 });
+
+  return doc.toBytes();
 }
 
 function documentFilename(document: any): string {
@@ -126,50 +451,8 @@ function documentFilename(document: any): string {
 }
 
 export function buildGeneratedBillingDocumentPdfAttachment(document: any): EmailAttachment {
-  const typeLabel = String(document?.document_type ?? "").includes("receipt") ? "Receipt" : "Invoice";
-  const issuedAt = document?.issued_at ? new Date(document.issued_at) : new Date();
-  const issued = Number.isFinite(issuedAt.getTime()) ? issuedAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
-  const currency = String(document?.currency ?? "thb").toUpperCase();
-  const amount = fmtNum(Number(document?.amount_thb ?? 0));
-  const lineItems = Array.isArray(document?.line_items) ? document.line_items : [];
-  const metadata = document?.metadata && typeof document.metadata === "object" ? document.metadata : {};
-  const rows: Array<{ text: string; size?: number; gap?: number }> = [
-    { text: `MediaForge ${typeLabel}`, size: 20, gap: 30 },
-    { text: `Document number: ${document?.document_number ?? "-"}`, size: 11 },
-    { text: `Issued date: ${issued}`, size: 11 },
-    { text: `Recipient: ${document?.email_to ?? "-"}`, size: 11 },
-    { text: `Title: ${document?.title ?? "-"}`, size: 11 },
-    { text: `Amount: ${amount} ${currency}`, size: 11 },
-    { text: `Credits: ${fmtNum(Number(document?.credits_added ?? 0))}`, size: 11, gap: 24 },
-    { text: "Line items", size: 13, gap: 18 },
-  ];
-
-  if (lineItems.length > 0) {
-    for (const item of lineItems.slice(0, 12)) {
-      const description = pdfSafeText(item?.description || "MediaForge credits");
-      const itemCredits = Number(item?.credits ?? 0);
-      const itemAmount = Number(item?.amount_thb ?? 0);
-      for (const wrapped of wrapPdfLine(`- ${description} | credits: ${fmtNum(itemCredits)} | amount: ${fmtNum(itemAmount)} ${currency}`, 86)) {
-        rows.push({ text: wrapped, size: 10 });
-      }
-    }
-  } else {
-    rows.push({ text: "- MediaForge billing document", size: 10 });
-  }
-
-  const note = pdfSafeText(metadata.note || metadata.reason || "");
-  if (note) {
-    rows.push({ text: "", gap: 10 });
-    rows.push({ text: "Note", size: 13, gap: 18 });
-    for (const wrapped of wrapPdfLine(note, 86)) rows.push({ text: wrapped, size: 10 });
-  }
-
-  rows.push({ text: "", gap: 12 });
-  rows.push({ text: "MediaForge Co., Ltd. | https://mediaforge.co", size: 9 });
-  rows.push({ text: "This PDF was generated automatically for billing records.", size: 9 });
-
   return {
-    content: bytesToBase64(simplePdf(rows)),
+    content: bytesToBase64(generatedBillingDocumentPdf(document)),
     filename: documentFilename(document),
     type: "application/pdf",
     disposition: "attachment",
