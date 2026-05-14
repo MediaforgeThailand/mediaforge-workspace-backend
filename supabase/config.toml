@@ -193,6 +193,9 @@ verify_jwt = false
 [functions.admin_workspace_analytics]
 verify_jwt = false
 
+[functions.admin_workspace_billing]
+verify_jwt = false
+
 [functions.admin_workspace_orgs]
 verify_jwt = false
 

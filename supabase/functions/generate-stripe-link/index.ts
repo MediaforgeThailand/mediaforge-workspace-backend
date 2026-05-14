@@ -126,6 +126,20 @@ Deno.serve(async (req) => {
           quantity: 1,
         },
       ],
+      invoice_creation: {
+        enabled: true,
+        invoice_data: {
+          metadata: {
+            customer_email,
+            plan_id,
+            plan_name: plan.name,
+            billing_cycle,
+            months: String(months),
+            total_credits: String(totalCredits),
+            direct_sales: "true",
+          },
+        },
+      },
       metadata: {
         customer_email,
         plan_id,

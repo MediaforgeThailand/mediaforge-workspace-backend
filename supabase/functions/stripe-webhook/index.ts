@@ -2,6 +2,7 @@ import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import Stripe from "https://esm.sh/stripe@18.5.0";
 import { createClient } from "npm:@supabase/supabase-js@2.57.2";
 import { sendTransactionalEmail } from "../_shared/sendEmail.ts";
+import { syncBillingDocumentsForPayment } from "../_shared/billingDocuments.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -482,7 +483,7 @@ serve(async (req) => {
           }
         }
 
-        const { error: ptError } = await supabase.from("payment_transactions").insert({
+        const { data: paymentRow, error: ptError } = await supabase.from("payment_transactions").insert({
           user_id: userId,
           package_id: null,
           stripe_session_id: session.id,
@@ -491,8 +492,11 @@ serve(async (req) => {
           credits_added: creditsToAdd,
           status: "completed",
           payment_method: session.payment_method_types?.[0] || "card",
-        });
+        }).select("*").maybeSingle();
         if (ptError) console.error("[STRIPE-WEBHOOK] payment_transactions insert error:", ptError);
+        if (paymentRow) {
+          await syncBillingDocumentsForPayment(supabase, stripe, paymentRow, { sendEmail: true });
+        }
 
         // Track one-time-per-user promo redemption (idempotent via UNIQUE constraint)
         if (topupPackageId) {
@@ -593,7 +597,7 @@ serve(async (req) => {
         }
 
         // Log payment
-        await supabase.from("payment_transactions").insert({
+        const { data: paymentRow } = await supabase.from("payment_transactions").insert({
           user_id: userId,
           package_id: null,
           stripe_session_id: session.id,
@@ -608,7 +612,10 @@ serve(async (req) => {
           credits_added: creditsToAdd,
           status: "completed",
           payment_method: session.payment_method_types?.[0] || "card",
-        });
+        }).select("*").maybeSingle();
+        if (paymentRow) {
+          await syncBillingDocumentsForPayment(supabase, stripe, paymentRow, { sendEmail: false });
+        }
 
         // Get subscription period end
         let periodEnd: string | null = null;
@@ -890,7 +897,7 @@ serve(async (req) => {
           throw new Error("Team renewal credit grant failed");
         }
 
-        await supabase.from("payment_transactions").insert({
+        const { data: paymentRow } = await supabase.from("payment_transactions").insert({
           user_id: teamUserId,
           organization_id: orgRow.id,
           payment_scope: "team",
@@ -909,7 +916,10 @@ serve(async (req) => {
           credits_added: totalCredits,
           status: "completed",
           payment_method: "card",
-        });
+        }).select("*").maybeSingle();
+        if (paymentRow) {
+          await syncBillingDocumentsForPayment(supabase, stripe, paymentRow, { sendEmail: true });
+        }
 
         await supabase
           .from("organizations")
@@ -1007,7 +1017,7 @@ serve(async (req) => {
             console.log(`[STRIPE-WEBHOOK] Renewal: +${creditsToAdd} credits for user ${profile.user_id}`);
           }
 
-          await supabase.from("payment_transactions").insert({
+          const { data: paymentRow } = await supabase.from("payment_transactions").insert({
             user_id: profile.user_id,
             package_id: null,
             stripe_session_id: null,
@@ -1026,7 +1036,10 @@ serve(async (req) => {
             credits_added: Number.isFinite(creditsToAdd) ? creditsToAdd : 0,
             status: "completed",
             payment_method: "card",
-          });
+          }).select("*").maybeSingle();
+          if (paymentRow) {
+            await syncBillingDocumentsForPayment(supabase, stripe, paymentRow, { sendEmail: true });
+          }
 
           // Update period end
           if (subscriptionId) {
@@ -1163,6 +1176,15 @@ serve(async (req) => {
               .update(receiptFields)
               .eq("stripe_payment_intent_id", intent.id)
               .eq("organization_id", organizationId);
+          }
+          const { data: paymentRow } = await supabase
+            .from("payment_transactions")
+            .select("*")
+            .eq("stripe_payment_intent_id", intent.id)
+            .eq("organization_id", organizationId)
+            .maybeSingle();
+          if (paymentRow) {
+            await syncBillingDocumentsForPayment(supabase, stripe, paymentRow, { sendEmail: false });
           }
         }
 
@@ -1307,7 +1329,7 @@ serve(async (req) => {
           subscription_plan_id: planId,
         }).eq("user_id", userId);
 
-        await supabase.from("payment_transactions").insert({
+        const { data: paymentRow } = await supabase.from("payment_transactions").insert({
           user_id: userId,
           package_id: null,
           stripe_session_id: null,
@@ -1322,7 +1344,10 @@ serve(async (req) => {
           credits_added: finalCredits,
           status: "completed",
           payment_method: intent.payment_method_types?.[0] || "card",
-        });
+        }).select("*").maybeSingle();
+        if (paymentRow) {
+          await syncBillingDocumentsForPayment(supabase, stripe, paymentRow, { sendEmail: false });
+        }
 
         // Commission accrual
         try {
@@ -1475,10 +1500,13 @@ serve(async (req) => {
           status: "completed",
           payment_method: "promptpay",
         };
-        const { error: paymentRowError } = existingTx?.id
-          ? await supabase.from("payment_transactions").update(paymentRow).eq("id", existingTx.id)
-          : await supabase.from("payment_transactions").insert(paymentRow);
+        const { data: savedPaymentRow, error: paymentRowError } = existingTx?.id
+          ? await supabase.from("payment_transactions").update(paymentRow).eq("id", existingTx.id).select("*").maybeSingle()
+          : await supabase.from("payment_transactions").insert(paymentRow).select("*").maybeSingle();
         if (paymentRowError) console.error("[STRIPE-WEBHOOK] Org PromptPay payment row error:", paymentRowError);
+        if (savedPaymentRow) {
+          await syncBillingDocumentsForPayment(supabase, stripe, savedPaymentRow, { sendEmail: false });
+        }
 
         console.log(`[STRIPE-WEBHOOK] Org PromptPay success: +${creditsToAdd} for org ${organizationId}`);
 
@@ -1551,7 +1579,7 @@ serve(async (req) => {
           if (topupPkg) amountThb = topupPkg.price_thb;
         }
 
-        await supabase.from("payment_transactions").insert({
+        const { data: paymentRow } = await supabase.from("payment_transactions").insert({
           user_id: userId,
           package_id: null,
           stripe_session_id: null,
@@ -1561,7 +1589,10 @@ serve(async (req) => {
           credits_added: creditsToAdd,
           status: "completed",
           payment_method: intent.payment_method_types?.[0] || "stripe",
-        });
+        }).select("*").maybeSingle();
+        if (paymentRow) {
+          await syncBillingDocumentsForPayment(supabase, stripe, paymentRow, { sendEmail: false });
+        }
 
         console.log(`[STRIPE-WEBHOOK] PromptPay success: +${creditsToAdd} for ${userId}`);
 

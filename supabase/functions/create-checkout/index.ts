@@ -333,6 +333,10 @@ serve(async (req) => {
           mode: "payment",
           payment_method_types: paymentMethodTypes(paymentMethod),
           metadata: teamMetadata,
+          invoice_creation: {
+            enabled: true,
+            invoice_data: { metadata: teamMetadata },
+          },
           payment_intent_data: { metadata: teamMetadata },
           success_url: `${origin}/app/pricing?payment=success`,
           cancel_url: `${origin}/app/pricing?payment=cancelled`,
@@ -699,6 +703,14 @@ serve(async (req) => {
       mode: "payment",
       payment_method_types: paymentMethodTypes(paymentMethod),
       metadata,
+      invoice_creation: {
+        enabled: true,
+        invoice_data: {
+          metadata: applyFirstTimeDiscount
+            ? { ...metadata, first_time_discount_pct: String(FIRST_TIME_DISCOUNT_PCT) }
+            : metadata,
+        },
+      },
       payment_intent_data: {
         // Mirror metadata onto PaymentIntent so payment_intent.succeeded webhook works for async PromptPay
         metadata: applyFirstTimeDiscount

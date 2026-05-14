@@ -228,6 +228,10 @@ serve(async (req) => {
       mode: "payment",
       payment_method_types: paymentMethodTypes(paymentMethod),
       metadata,
+      invoice_creation: {
+        enabled: true,
+        invoice_data: { metadata },
+      },
     };
 
     if (embedded) {
