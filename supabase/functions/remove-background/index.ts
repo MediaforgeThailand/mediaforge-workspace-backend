@@ -1,5 +1,6 @@
 /// <reference lib="deno.ns" />
 import { getAuthUser, isServiceRole, unauthorized } from "../_shared/auth.ts";
+import { snapMem } from "../_shared/memDebug.ts";
 /**
  * remove-background — Removes background from an image using Replicate's BiRefNet model.
  * Returns a transparent PNG uploaded to the ai-media bucket.
@@ -132,6 +133,7 @@ serve(async (req) => {
     console.log(`[remove-background] Downloading result PNG from Replicate...`);
 
     // 3) Download the transparent PNG (stream straight to storage upload)
+    snapMem("remove-background BEFORE");
     const pngRes = await fetch(outputUrl);
     if (!pngRes.ok) {
       throw new Error(`Failed to download Replicate output: ${pngRes.status}`);
@@ -146,6 +148,7 @@ serve(async (req) => {
     const { error: uploadError } = await supabase.storage
       .from("ai-media")
       .upload(fileName, pngRes.body, { contentType: "image/png", upsert: true });
+    snapMem("remove-background AFTER ");
 
     let publicUrl = outputUrl; // fallback
     if (uploadError) {

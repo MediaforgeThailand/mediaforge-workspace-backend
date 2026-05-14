@@ -1,5 +1,6 @@
 /// <reference lib="deno.ns" />
 import { getAuthUser, isServiceRole, unauthorized } from "../_shared/auth.ts";
+import { snapMem } from "../_shared/memDebug.ts";
 /**
  * merge-audio-video — Combines a video stream with an audio track via Shotstack.
  *
@@ -233,6 +234,7 @@ serve(async (req) => {
     // 3. Download the rendered MP4 and re-upload to ai-media so we get a stable signed URL
     let finalUrl = renderedUrl;
     try {
+      snapMem("merge-audio-video BEFORE");
       const dl = await fetch(renderedUrl);
       if (dl.ok && dl.body) {
         const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -240,6 +242,7 @@ serve(async (req) => {
         const { error: upErr } = await supabase.storage
           .from("ai-media")
           .upload(path, dl.body, { contentType: "video/mp4", upsert: true });
+        snapMem("merge-audio-video AFTER ");
         if (!upErr) {
           const { data: signed } = await supabase.storage
             .from("ai-media")

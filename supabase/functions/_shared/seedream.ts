@@ -29,6 +29,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { loadSeedanceCredentials } from "./seedance.ts";
+import { snapMem } from "./memDebug.ts";
 import type { ProviderResult } from "./providerResult.ts";
 
 /** BytePlus ModelArk base URL (international). Same gateway as Seedance. */
@@ -339,6 +340,7 @@ export async function executeSeedream(
   // empty placeholder matched.
   let publicUrl = url;
   try {
+    snapMem("seedream BEFORE");
     const res = await fetch(url);
     if (!res.ok) throw new Error(`download HTTP ${res.status}`);
     if (!res.body) throw new Error("download response missing body");
@@ -354,6 +356,7 @@ export async function executeSeedream(
       .from("ai-media")
       .upload(fileName, res.body, { contentType, upsert: true });
     if (uploadError) throw uploadError;
+    snapMem("seedream AFTER ");
     const { data: urlData, error: signError } = await supabase.storage
       .from("ai-media")
       .createSignedUrl(fileName, 60 * 60 * 24 * 7);
