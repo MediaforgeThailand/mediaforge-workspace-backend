@@ -210,3 +210,6 @@ verify_jwt = false
 
 [functions.mf-um-class-enroll]
 verify_jwt = false
+
+[functions.captions-transcribe]
+verify_jwt = true

@@ -17,13 +17,50 @@ const jsonHeaders = {
 
 const ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1";
 const DOWNLOAD_TOKEN_TTL_SEC = 60 * 60 * 6;
-const ELEVENLABS_DUBBING_WATERMARK = false;
 const ELEVENLABS_DUBBING_NAME_MAX = 100;
+const ELEVENLABS_DUBBING_LANGUAGE_NAMES =
+  "English, Hindi, Portuguese, Chinese, Spanish, French, German, Japanese, Arabic, Russian, Korean, Indonesian, Italian, Dutch, Turkish, Polish, Swedish, Filipino, Malay, Romanian, Ukrainian, Greek, Czech, Danish, Finnish, Bulgarian, Croatian, Slovak, or Tamil";
+const ELEVENLABS_DUBBING_LANGUAGE_CODES = new Set([
+  "en",
+  "hi",
+  "pt",
+  "zh",
+  "es",
+  "fr",
+  "de",
+  "ja",
+  "ar",
+  "ru",
+  "ko",
+  "id",
+  "it",
+  "nl",
+  "tr",
+  "pl",
+  "sv",
+  "fil",
+  "ms",
+  "ro",
+  "uk",
+  "el",
+  "cs",
+  "da",
+  "fi",
+  "bg",
+  "hr",
+  "sk",
+  "ta",
+]);
+
+class RequestValidationError extends Error {
+  status = 400;
+}
 
 type StartBody = {
   action: "start";
   video_url?: unknown;
   output_language?: unknown;
+  output_type?: unknown;
   source_language?: unknown;
   source_content_type?: unknown;
   source_name?: unknown;
@@ -71,6 +108,18 @@ function getElevenLabsKey(): string {
     throw new Error("ElevenLabs is not configured. Set ELEVENLABS_API_KEY or ELEVEN_API_KEY.");
   }
   return key;
+}
+
+function elevenLabsDubbingWatermark(): boolean {
+  const raw = Deno.env.get("ELEVENLABS_DUBBING_WATERMARK")?.trim().toLowerCase();
+  if (!raw) return true;
+  if (["false", "0", "no", "off"].includes(raw)) return false;
+  return true;
+}
+
+function elevenLabsAllowWatermarkedVideo(): boolean {
+  const raw = Deno.env.get("ELEVENLABS_DUBBING_ALLOW_WATERMARKED_VIDEO")?.trim().toLowerCase();
+  return raw ? ["true", "1", "yes", "on"].includes(raw) : false;
 }
 
 function compactProviderError(text: string): string {
@@ -174,31 +223,53 @@ function outputTypeForMedia(contentType: string, url = ""): "audio" | "video" {
   return "video";
 }
 
+function requestedOutputType(value: unknown, fallback: "audio" | "video"): "audio" | "video" {
+  const requested = textValue(value).toLowerCase();
+  return requested === "audio" || requested === "video" ? requested : fallback;
+}
+
 function standaloneCanvasId(projectId: string): string {
   return `standalone:${projectId}`;
 }
 
-function languageCode(value: string): string {
+function languageCode(value: string, role: "source" | "target" = "target"): string {
   const normalised = value.trim().toLowerCase();
-  if (/^[a-z]{2,3}$/.test(normalised)) return normalised;
   const map: Record<string, string> = {
     english: "en",
-    thai: "th",
-    japanese: "ja",
-    korean: "ko",
+    hindi: "hi",
+    portuguese: "pt",
     chinese: "zh",
-    indonesian: "id",
-    vietnamese: "vi",
     spanish: "es",
     french: "fr",
     german: "de",
-    portuguese: "pt",
+    japanese: "ja",
     arabic: "ar",
-    hindi: "hi",
+    russian: "ru",
+    korean: "ko",
+    indonesian: "id",
+    italian: "it",
+    dutch: "nl",
+    turkish: "tr",
+    polish: "pl",
+    swedish: "sv",
+    filipino: "fil",
+    malay: "ms",
+    romanian: "ro",
+    ukrainian: "uk",
+    greek: "el",
+    czech: "cs",
+    danish: "da",
+    finnish: "fi",
+    bulgarian: "bg",
+    croatian: "hr",
+    slovak: "sk",
+    tamil: "ta",
   };
-  const code = map[normalised];
+  const code = ELEVENLABS_DUBBING_LANGUAGE_CODES.has(normalised) ? normalised : map[normalised];
   if (!code) {
-    throw new Error(`Unsupported ElevenLabs dubbing language: ${value}`);
+    throw new RequestValidationError(
+      `ElevenLabs dubbing does not support ${role} language "${value}". Supported languages: ${ELEVENLABS_DUBBING_LANGUAGE_NAMES}.`,
+    );
   }
   return code;
 }
@@ -390,20 +461,31 @@ serve(async (req) => {
       const videoUrl = textValue(start.video_url);
       const outputLanguage = textValue(start.output_language);
       if (!outputLanguage) return json({ error: "output_language is required." }, 400);
-      const targetLang = languageCode(outputLanguage);
+      const targetLang = languageCode(outputLanguage, "target");
       const sourceLanguage = textValue(start.source_language);
-      const sourceLang = sourceLanguage ? languageCode(sourceLanguage) : "auto";
+      const sourceLang = sourceLanguage ? languageCode(sourceLanguage, "source") : "auto";
       const sourceContentType = textValue(start.source_content_type);
       const sourceName = textValue(start.source_name);
-      const outputType = outputTypeForMedia(sourceContentType, videoUrl);
+      const sourceMediaType = outputTypeForMedia(sourceContentType, videoUrl);
+      const outputType = requestedOutputType(start.output_type, sourceMediaType);
       const speakerNum = optionalPositiveInt(start.speaker_num);
       const projectId = textValue(start.project_id);
       const sourceStorageBucket = textValue(start.source_storage_bucket);
       const sourceStoragePath = textValue(start.source_storage_path);
       const consent = boolValue(start.consent);
+      const watermark = outputType === "video" ? elevenLabsDubbingWatermark() : false;
 
       if (!consent) return json({ error: "Voice clone dubbing requires user consent." }, 400);
       if (!projectId) return json({ error: "project_id is required." }, 400);
+      if (outputType === "video" && !elevenLabsAllowWatermarkedVideo()) {
+        return json(
+          {
+            error:
+              "MP4 dubbing is disabled for this ElevenLabs account because video output includes a watermark unless the account is Creator+. Choose MP3 / audio output.",
+          },
+          400,
+        );
+      }
 
       const supabase = serviceSupabase();
       let providerSourceUrl = videoUrl;
@@ -437,6 +519,8 @@ serve(async (req) => {
           target_lang: targetLang,
           source_lang: sourceLang,
           source_content_type: sourceContentType || null,
+          source_media_type: sourceMediaType,
+          output_type: outputType,
           source_name: sourceName || null,
           speaker_num: speakerNum ?? 0,
           project_id: projectId,
@@ -444,7 +528,7 @@ serve(async (req) => {
           source_storage_path: sourceStoragePath || null,
           translate_engine: "elevenlabs_dubbing_clone",
           disable_voice_cloning: false,
-          watermark: ELEVENLABS_DUBBING_WATERMARK,
+          watermark,
           highest_resolution: false,
         },
         inputs: { video_url: providerSourceUrl },
@@ -495,7 +579,9 @@ serve(async (req) => {
       form.append("source_lang", sourceLang);
       form.append("name", elevenLabsDubbingName(sourceName, outputLanguage));
       form.append("num_speakers", String(speakerNum ?? 0));
-      form.append("watermark", ELEVENLABS_DUBBING_WATERMARK ? "true" : "false");
+      if (outputType === "video") {
+        form.append("watermark", watermark ? "true" : "false");
+      }
       form.append("highest_resolution", "false");
       form.append("drop_background_audio", "false");
       form.append("disable_voice_cloning", "false");
@@ -546,7 +632,7 @@ serve(async (req) => {
           output_type: outputType,
           voice_cloning: true,
           disable_voice_cloning: false,
-          watermark: ELEVENLABS_DUBBING_WATERMARK,
+          watermark,
           source_storage_bucket: sourceStorageBucket || null,
           source_storage_path: sourceStoragePath || null,
         },
@@ -575,7 +661,7 @@ serve(async (req) => {
         target_lang: targetLang,
         output_type: outputType,
         voice_cloning: true,
-        watermark: ELEVENLABS_DUBBING_WATERMARK,
+        watermark,
         provider_response: providerResponse,
       });
     }
@@ -629,10 +715,12 @@ serve(async (req) => {
         mediaMetadata.content_type,
         jobParams.source_content_type,
       );
-      const outputType = outputTypeForMedia(
+      const sourceMediaType = outputTypeForMedia(
         sourceContentType,
         firstString(jobParams.original_video_url, jobParams.video_url),
       );
+      const outputType = requestedOutputType(jobParams.output_type, sourceMediaType);
+      const watermark = outputType === "video" ? boolValue(jobParams.watermark, elevenLabsDubbingWatermark()) : false;
       const rawStatus = firstString(providerResponse.status);
       const errorMessage = firstString(providerResponse.error);
       const status = normaliseDubbingStatus(rawStatus);
@@ -677,7 +765,7 @@ serve(async (req) => {
           output_type: outputType,
           voice_cloning: true,
           disable_voice_cloning: false,
-          watermark: ELEVENLABS_DUBBING_WATERMARK,
+          watermark,
           source_language: firstString(providerResponse.source_language),
           target_languages: Array.isArray(providerResponse.target_languages)
             ? providerResponse.target_languages
@@ -719,6 +807,6 @@ serve(async (req) => {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[elevenlabs-dubbing]", message);
-    return json({ error: message }, 500);
+    return json({ error: message }, err instanceof RequestValidationError ? err.status : 500);
   }
 });
