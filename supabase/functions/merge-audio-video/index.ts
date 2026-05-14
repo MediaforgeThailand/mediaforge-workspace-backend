@@ -234,13 +234,12 @@ serve(async (req) => {
     let finalUrl = renderedUrl;
     try {
       const dl = await fetch(renderedUrl);
-      if (dl.ok) {
-        const bytes = new Uint8Array(await dl.arrayBuffer());
+      if (dl.ok && dl.body) {
         const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
         const path = `merge/mediaforge_${Date.now()}_${renderId.substring(0, 8)}.mp4`;
         const { error: upErr } = await supabase.storage
           .from("ai-media")
-          .upload(path, bytes, { contentType: "video/mp4", upsert: true });
+          .upload(path, dl.body, { contentType: "video/mp4", upsert: true });
         if (!upErr) {
           const { data: signed } = await supabase.storage
             .from("ai-media")

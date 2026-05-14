@@ -131,19 +131,21 @@ serve(async (req) => {
 
     console.log(`[remove-background] Downloading result PNG from Replicate...`);
 
-    // 3) Download the transparent PNG
+    // 3) Download the transparent PNG (stream straight to storage upload)
     const pngRes = await fetch(outputUrl);
     if (!pngRes.ok) {
       throw new Error(`Failed to download Replicate output: ${pngRes.status}`);
     }
-    const pngBytes = new Uint8Array(await pngRes.arrayBuffer());
+    if (!pngRes.body) {
+      throw new Error("Replicate response missing body");
+    }
 
     // 4) Upload to ai-media bucket
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     const fileName = `pipeline/mediaforge_nobg_${Date.now()}.png`;
     const { error: uploadError } = await supabase.storage
       .from("ai-media")
-      .upload(fileName, pngBytes, { contentType: "image/png", upsert: true });
+      .upload(fileName, pngRes.body, { contentType: "image/png", upsert: true });
 
     let publicUrl = outputUrl; // fallback
     if (uploadError) {

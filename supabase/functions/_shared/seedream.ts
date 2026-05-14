@@ -341,7 +341,7 @@ export async function executeSeedream(
   try {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`download HTTP ${res.status}`);
-    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (!res.body) throw new Error("download response missing body");
     const contentType =
       res.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
     const ext =
@@ -352,7 +352,7 @@ export async function executeSeedream(
     const fileName = `pipeline/seedream_${Date.now()}.${ext}`;
     const { error: uploadError } = await supabase.storage
       .from("ai-media")
-      .upload(fileName, bytes, { contentType, upsert: true });
+      .upload(fileName, res.body, { contentType, upsert: true });
     if (uploadError) throw uploadError;
     const { data: urlData, error: signError } = await supabase.storage
       .from("ai-media")
