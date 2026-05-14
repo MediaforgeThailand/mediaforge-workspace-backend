@@ -1,8 +1,10 @@
 /**
  * Unified Provider Retry Strategy (12 + 6 with health probe)
  *
- * Used by both run-flow-init (single-node) and execute-pipeline-step (multi-node)
- * to maximize success rate before refunding the user.
+ * Used by workspace-run-node — provides the error classifiers
+ * (classifyError / classifyProviderError / shouldFastFallbackProviderError)
+ * and the retry cap (TOTAL_MAX_RETRIES) that the workspace job worker uses
+ * when retrying provider calls through workspace_generation_jobs.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * Strategy
@@ -426,131 +428,6 @@ export async function defaultProbeProviderHealth(provider: string): Promise<Heal
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// PHASE 2 — Inline Budget (for execute-pipeline-step)
-// Use INSTEAD of executeWithUnifiedRetry when you want the edge
-// function to return fast and push remaining retries onto the
-// provider_retry_queue (handled async by retry-worker).
-// ═══════════════════════════════════════════════════════════════
-
-export const INLINE_BUDGET_ATTEMPTS = 4;       // 4 attempts max in-process
-const INLINE_BASE_DELAY_MS = 3000;             // 3s starting
-const INLINE_MAX_DELAY_MS = 15_000;            // 15s cap (aggressive)
-
-export interface InlineBudgetOutcome<T> {
-  result: T | null;
-  error: Error | null;
-  attempts: number;
-  classification: "success" | "permanent" | "exhausted_inline";
-}
-
-/**
- * Short in-process retry budget — ~90s worst case incl. provider latency.
- * After exhausting, caller should enqueue the step into provider_retry_queue.
- *
- * Classifications:
- *   - "success"           → result returned, no further action
- *   - "permanent"         → billing/safety/programming error, refund immediately
- *   - "exhausted_inline"  → transient error persisted past budget → ENQUEUE
- */
-export async function executeWithInlineBudget<T>(
-  runOnce: () => Promise<T>,
-  logTag = "[inline-retry]",
-): Promise<InlineBudgetOutcome<T>> {
-  let lastError: Error | null = null;
-  let attempts = 0;
-  let deadlineExceededHits = 0;
-
-  for (let attempt = 0; attempt < INLINE_BUDGET_ATTEMPTS; attempt++) {
-    attempts++;
-    try {
-      const result = await runOnce();
-      return { result, error: null, attempts, classification: "success" };
-    } catch (e) {
-      lastError = e instanceof Error ? e : new Error(String(e));
-      const kind = classifyError(lastError.message);
-
-      if (kind === "permanent") {
-        console.error(`${logTag} attempt ${attempts} PERMANENT: ${lastError.message}`);
-        return { result: null, error: lastError, attempts, classification: "permanent" };
-      }
-
-      // Streak short-circuit on Google DEADLINE_EXCEEDED — same logic
-      // as the durable retry loop. Inline budget is shorter (4 attempts)
-      // so the cap rarely triggers here, but it still saves the user a
-      // pointless final retry.
-      if (isDeadlineExceededError(lastError.message)) {
-        deadlineExceededHits++;
-        if (deadlineExceededHits >= DEADLINE_EXCEEDED_RETRY_CAP) {
-          console.error(
-            `${logTag} attempt ${attempts} ${deadlineExceededHits} consecutive DEADLINE_EXCEEDED — short-circuit: ${lastError.message}`,
-          );
-          return { result: null, error: lastError, attempts, classification: "permanent" };
-        }
-      } else {
-        deadlineExceededHits = 0;
-      }
-
-      if (attempt === INLINE_BUDGET_ATTEMPTS - 1) {
-        console.warn(
-          `${logTag} attempt ${attempts}/${INLINE_BUDGET_ATTEMPTS} inline budget exhausted: ${lastError.message}`,
-        );
-        break;
-      }
-
-      const base = Math.min(INLINE_BASE_DELAY_MS * Math.pow(2, attempt), INLINE_MAX_DELAY_MS);
-      const jitter = Math.floor(Math.random() * 500);
-      const delay = base + jitter;
-      console.warn(`${logTag} attempt ${attempts} transient, waiting ${delay}ms: ${lastError.message}`);
-      await new Promise((r) => setTimeout(r, delay));
-    }
-  }
-
-  return { result: null, error: lastError, attempts, classification: "exhausted_inline" };
-}
-
-// ═══════════════════════════════════════════════════════════════
-// PHASE 2 — Enqueue helper (called from execute-pipeline-step)
-// ═══════════════════════════════════════════════════════════════
-
-export interface EnqueueRetryParams {
-  // Loose typing because this is also called from edge functions that don't
-  // have full Supabase types — only `.rpc(name, args)` is required.
-  supabase: {
-    rpc: (fn: string, args: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }>;
-  };
-  flow_run_id: string;
-  step_index: number;
-  node_id: string;
-  provider: string;
-  node_type: string;
-  resume_payload: Record<string, unknown>;
-  last_error: string;
-  initial_attempt?: number;   // default INLINE_BUDGET_ATTEMPTS (4)
-  max_attempts?: number;      // default 14 (total 4+14=18 matches original budget)
-  first_delay_sec?: number;   // default 30
-}
-
-export async function enqueueRetryJob(p: EnqueueRetryParams): Promise<string | null> {
-  const { data, error } = await p.supabase.rpc("enqueue_retry_job", {
-    p_flow_run_id: p.flow_run_id,
-    p_step_index: p.step_index,
-    p_node_id: p.node_id,
-    p_provider: p.provider,
-    p_node_type: p.node_type,
-    p_resume_payload: p.resume_payload,
-    p_initial_attempt: p.initial_attempt ?? INLINE_BUDGET_ATTEMPTS,
-    p_max_attempts: p.max_attempts ?? 14,
-    p_first_delay_sec: p.first_delay_sec ?? 30,
-    p_last_error: p.last_error,
-    p_classification: "transient",
-  });
-  if (error) {
-    console.error("[enqueueRetryJob] RPC failed:", error);
-    return null;
-  }
-  return data as string;
-}
 
 // Minimal JWT helper for Kling probe — duplicated here to keep _shared self-contained.
 async function generateKlingJWT(accessKey: string, secretKey: string): Promise<string> {

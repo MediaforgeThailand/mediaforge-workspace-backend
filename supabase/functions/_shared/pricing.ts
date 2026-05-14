@@ -2,7 +2,8 @@
 /// <reference lib="dom" />
 /**
  * Shared Pricing Module — Single Source of Truth for credit cost calculation.
- * Used by: quote-flow, run-flow-init, execute-pipeline-step
+ * Used by: workspace-run-node (historically also by run-flow / quote-flow /
+ * execute-pipeline-step, which have been removed).
  *
  * STRICT MODE: No hardcoded fallbacks. If a price row is missing from
  * `credit_costs`, the function throws `PricingConfigError` which callers

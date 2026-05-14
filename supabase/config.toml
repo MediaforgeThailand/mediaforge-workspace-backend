@@ -61,9 +61,6 @@ verify_jwt = false
 [functions.admin-api]
 verify_jwt = false
 
-[functions.execute-pipeline-step]
-verify_jwt = false
-
 [functions.erp-bridge]
 verify_jwt = false
 
@@ -74,9 +71,6 @@ verify_jwt = false
 verify_jwt = false
 
 [functions.merge-audio-video]
-verify_jwt = false
-
-[functions.retry-worker]
 verify_jwt = false
 
 [functions.workspace-run-node]
@@ -121,12 +115,6 @@ verify_jwt = false
 [functions.freepik-stock]
 verify_jwt = false
 
-[functions.generate-embedding]
-verify_jwt = false
-
-[functions.generate-video]
-verify_jwt = false
-
 [functions.get-stripe-key]
 verify_jwt = false
 
@@ -136,7 +124,10 @@ verify_jwt = false
 [functions.phone-otp-verify]
 verify_jwt = false
 
-[functions.quote-flow]
+[functions.sweep-stuck-runs]
+verify_jwt = false
+
+[functions.remove-background]
 verify_jwt = false
 
 [functions.redeem-code]
@@ -145,34 +136,10 @@ verify_jwt = false
 [functions.redeem-demo]
 verify_jwt = false
 
-[functions.sweep-stuck-runs]
-verify_jwt = false
-
-[functions.remove-background]
-verify_jwt = false
-
-[functions.run-flow]
-verify_jwt = false
-
-[functions.run-flow-init]
-verify_jwt = false
-
-[functions.run-flow-status]
-verify_jwt = false
-
 [functions.stripe-webhook]
 verify_jwt = false
 
-[functions.submit-flow-for-review]
-verify_jwt = false
-
-[functions.submit-flow-review]
-verify_jwt = false
-
 [functions.test-refund-flow]
-verify_jwt = false
-
-[functions.text-to-speech]
 verify_jwt = false
 
 [functions.voice-preview]
