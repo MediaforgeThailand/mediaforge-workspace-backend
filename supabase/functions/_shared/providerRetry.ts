@@ -1,8 +1,9 @@
 /**
  * Unified Provider Retry Strategy (12 + 6 with health probe)
  *
- * Used by both run-flow-init (single-node) and execute-pipeline-step (multi-node)
- * to maximize success rate before refunding the user.
+ * Used by execute-pipeline-step (multi-node pipelines) and workspace-run-node
+ * (single-node inline budget + queue fallback) to maximize success rate
+ * before refunding the user.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * Strategy

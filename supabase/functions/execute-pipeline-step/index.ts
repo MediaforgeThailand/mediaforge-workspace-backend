@@ -19,7 +19,8 @@ const corsHeaders = {
 };
 
 /* ═══════════════════════════════════════════════════════════
-   Helpers (duplicated from run-flow-init — shared module would be ideal)
+   Helpers — base64/url helpers used during step execution.
+   (Formerly duplicated from run-flow-init; that function is gone.)
    ═══════════════════════════════════════════════════════════ */
 
 function bytesToBase64(bytes: Uint8Array): string {
