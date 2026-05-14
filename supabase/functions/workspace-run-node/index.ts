@@ -62,10 +62,19 @@ import { executeMergeAudio } from "../_shared/mergeAudio.ts";
 import { executeChatAi } from "../_shared/chatAi.ts";
 import { executeTripo3D } from "../_shared/tripo3d.ts";
 import { executeRemoveBg } from "../_shared/removeBg.ts";
+import {
+  executeMagnificUpscale,
+  MAGNIFIC_UPSCALE_MODEL,
+  MAGNIFIC_UPSCALE_PATH,
+} from "../_shared/magnificUpscale.ts";
 import { executeVideoToPrompt } from "../_shared/videoToPrompt.ts";
 import { executeGoogleTts } from "../_shared/googleTts.ts";
 import { executeElevenLabsTts } from "../_shared/elevenLabsTts.ts";
 import { executeGeminiTts } from "../_shared/geminiTts.ts";
+import {
+  executeElevenLabsDubbing,
+  pollElevenLabsDubbing,
+} from "../_shared/elevenLabsDubbing.ts";
 import {
   executeReplicateImage,
   executeReplicateVeo,
@@ -882,7 +891,9 @@ function getProviderForNodeType(
   if (nodeType === "seedDreamNode") return "seedream";
   if (nodeType === "seedDanceNode") return m.startsWith("replicate-seedance") ? "replicate_video" : "seedance";
   if (nodeType === "removeBackgroundNode") return "remove_bg";
+  if (nodeType === "upscaleImageNode") return "upscale_image";
   if (nodeType === "mergeAudioNode") return "merge_audio";
+  if (nodeType === "voiceTranslateNode") return "elevenlabs_dubbing";
   if (nodeType === "chatAiNode") return "chat_ai";
   if (nodeType === "videoToPromptNode") return "video_understanding";
   // 3D nodes: Hyper3D rides BytePlus ModelArk; Tripo3D is its own API.
@@ -913,7 +924,7 @@ function workspaceProviderDef(
 ): ProviderDef {
   const p = provider as ProviderKey;
   const output: ProviderDef["output_type"] =
-    p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "merge_audio"
+    p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "merge_audio" || p === "elevenlabs_dubbing"
       ? "video_url"
       : p === "tripo3d" || p === "hyper3d"
         ? "model_3d"
@@ -930,7 +941,9 @@ function workspaceProviderDef(
     p === "banana" ? "generate_freepik_image" :
     p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" ? "generate_freepik_video" :
     p === "remove_bg" ? "remove_background" :
+    p === "upscale_image" ? "upscale_image" :
     p === "merge_audio" ? "merge_audio_video" :
+    p === "elevenlabs_dubbing" ? "voice_translate" :
     p === "chat_ai" ? "chat_ai" :
     p === "tripo3d" || p === "hyper3d" ? "model_3d" :
     p === "google_tts" || p === "gemini_tts" || p === "elevenlabs_tts" ? "text_to_speech" :
@@ -940,7 +953,7 @@ function workspaceProviderDef(
     provider: p,
     feature,
     output_type: output,
-    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "replicate_image" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio",
+    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "replicate_image" || p === "upscale_image" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio" || p === "elevenlabs_dubbing",
   };
 }
 
@@ -959,6 +972,7 @@ function workspaceMultiplierForProvider(
     case "openai":
     case "seedream":
     case "remove_bg":
+    case "upscale_image":
     case "tripo3d":
     case "hyper3d":
       return multipliers.image;
@@ -977,6 +991,7 @@ function workspaceMultiplierForProvider(
     case "google_tts":
     case "gemini_tts":
     case "elevenlabs_tts":
+    case "elevenlabs_dubbing":
     case "mp3_input":
       return multipliers.audio ?? multipliers.chat;
     default:
@@ -1825,6 +1840,7 @@ interface WorkspaceRunBody {
     | "poll_freepik_veo"
     | "poll_freepik_video"
     | "poll_freepik_image"
+    | "poll_magnific_upscale"
     | "poll_hyper3d"
     | "poll_tripo3d"
     | "mirror_tripo_url"
@@ -1977,10 +1993,16 @@ function workspaceJobMaxAttempts(provider: string): number {
 const REMOVE_BG_MODEL = "freepik-remove-bg";
 
 function normalizeWorkspaceProviderModel(provider: string, params: Record<string, unknown>): string | null {
-  if (provider !== "remove_bg") return null;
-  params.model_name = REMOVE_BG_MODEL;
-  if (params.model != null) params.model = REMOVE_BG_MODEL;
-  return REMOVE_BG_MODEL;
+  const normalized =
+    provider === "remove_bg"
+      ? REMOVE_BG_MODEL
+      : provider === "upscale_image"
+        ? MAGNIFIC_UPSCALE_MODEL
+        : null;
+  if (!normalized) return null;
+  params.model_name = normalized;
+  if (params.model != null) params.model = normalized;
+  return normalized;
 }
 
 function normalizeDirectReplicateModelForPrimary(body: WorkspaceRunBody): string | null {
@@ -2464,8 +2486,12 @@ async function pollWorkspaceAsyncResult(args: {
         ? "poll_replicate_video"
       : provider === "replicate_image"
         ? "poll_replicate_image"
+      : provider === "elevenlabs_dubbing"
+        ? "poll_elevenlabs_dubbing"
       : provider === "freepik_veo" || provider === "freepik_seedance"
         ? "poll_freepik_video"
+      : provider === "magnific_upscale"
+        ? "poll_magnific_upscale"
       : provider === "freepik_image"
         ? "poll_freepik_image"
         : "poll_kling";
@@ -2502,6 +2528,9 @@ async function pollWorkspaceAsyncResult(args: {
         model: String(providerMeta.model ?? providerMeta.provider_model_id ?? ""),
         provider_model_id: String(providerMeta.provider_model_id ?? ""),
         api_key_alias: String(providerMeta.api_key_alias ?? ""),
+        output_type: String(providerMeta.output_type ?? ""),
+        target_lang: String(providerMeta.target_lang ?? ""),
+        output_language: String(providerMeta.output_language ?? ""),
       } as WorkspaceRunBody,
     });
     lastStatus = String(pollResp.status ?? "").toLowerCase();
@@ -2571,8 +2600,12 @@ async function pollWorkspaceAsyncResultOnce(args: {
         ? "poll_replicate_video"
       : provider === "replicate_image"
         ? "poll_replicate_image"
+      : provider === "elevenlabs_dubbing"
+        ? "poll_elevenlabs_dubbing"
       : provider === "freepik_veo" || provider === "freepik_seedance"
         ? "poll_freepik_video"
+      : provider === "magnific_upscale"
+        ? "poll_magnific_upscale"
       : provider === "freepik_image"
         ? "poll_freepik_image"
         : "poll_kling";
@@ -2588,6 +2621,9 @@ async function pollWorkspaceAsyncResultOnce(args: {
       model: String(providerMeta.model ?? providerMeta.provider_model_id ?? ""),
       provider_model_id: String(providerMeta.provider_model_id ?? ""),
       api_key_alias: String(providerMeta.api_key_alias ?? ""),
+      output_type: String(providerMeta.output_type ?? ""),
+      target_lang: String(providerMeta.target_lang ?? ""),
+      output_language: String(providerMeta.output_language ?? ""),
     } as WorkspaceRunBody,
   });
 
@@ -2669,6 +2705,7 @@ function inferAsyncPollProvider(
     endpoint.includes("api.magnific.com") ||
     endpoint.includes("api.freepik.com")
   ) {
+    if (endpoint.includes("/image-upscaler-precision-v2")) return "magnific_upscale";
     if (endpoint.includes("/text-to-image/")) return "freepik_image";
     if (endpoint.includes("/seedance-")) return "freepik_seedance";
     return "freepik_veo";
@@ -2717,6 +2754,8 @@ function workspaceJobLink(job: WorkspaceJobRow): string {
   const section =
     job.node_type === "klingVideoNode" || job.node_type === "videoGenNode"
       ? "video_gen"
+      : job.node_type === "upscaleImageNode"
+        ? "image_upscale"
       : job.node_type === "googleTtsNode" || job.node_type === "geminiTtsNode"
         ? "voice_gen"
         : job.node_type === "tripo3dNode" || job.node_type === "hyper3dNode"
@@ -5170,6 +5209,146 @@ serve(async (req) => {
       );
     }
 
+    if (body.action === "poll_magnific_upscale") {
+      const taskId = String(body.task_id ?? "").trim();
+      const pollEndpoint = String(body.poll_endpoint ?? "").trim();
+      if (!taskId || !pollEndpoint) {
+        return new Response(
+          JSON.stringify({ error: "task_id and poll_endpoint required for poll_magnific_upscale" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let pollUrlOk = false;
+      try {
+        const u = new URL(pollEndpoint);
+        const normalizedPath = u.pathname.replace(/\/+$/, "");
+        pollUrlOk =
+          u.protocol === "https:" &&
+          (u.hostname === "api.magnific.com" || u.hostname === "api.freepik.com") &&
+          (normalizedPath === MAGNIFIC_UPSCALE_PATH ||
+            normalizedPath === `/v1${MAGNIFIC_UPSCALE_PATH}`);
+      } catch {
+        pollUrlOk = false;
+      }
+      if (!pollUrlOk) {
+        return new Response(
+          JSON.stringify({ error: "poll_endpoint must be a Magnific Precision V2 upscale endpoint" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let apiKey: string;
+      try {
+        apiKey = loadMagnificApiKey();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({ error: msg }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const pollUrl = `${pollEndpoint.replace(/\/+$/, "")}/${encodeURIComponent(taskId)}`;
+      let payload: Record<string, unknown>;
+      try {
+        const endpointHost = new URL(pollEndpoint).hostname;
+        const authHeaderName = endpointHost.includes("magnific.com")
+          ? "x-magnific-api-key"
+          : "x-freepik-api-key";
+        const r = await fetch(pollUrl, {
+          method: "GET",
+          headers: { [authHeaderName]: apiKey },
+        });
+        const text = await r.text();
+        if (!r.ok) {
+          return new Response(
+            JSON.stringify({
+              status: "polling_error",
+              message: `Magnific upscale poll failed (HTTP ${r.status}): ${text.slice(0, 300)}`,
+            }),
+            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(
+          JSON.stringify({
+            status: "polling_error",
+            message: msg.substring(0, 300),
+          }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      const data = payload.data && typeof payload.data === "object"
+        ? (payload.data as Record<string, unknown>)
+        : payload;
+      const rawStatus = String(data.status ?? payload.status ?? "").toUpperCase();
+      const generated = Array.isArray(data.generated)
+        ? data.generated
+        : Array.isArray(payload.generated)
+          ? payload.generated
+          : [];
+      const providerImageUrl =
+        extractProviderMediaUrl(generated) ||
+        extractProviderMediaUrl(data) ||
+        extractProviderMediaUrl(payload);
+      const errorMessage = String(
+        data.error ??
+          data.message ??
+          payload.error ??
+          payload.message ??
+          "",
+      );
+      const normalised =
+        rawStatus === "COMPLETED" || rawStatus === "DONE" || rawStatus === "SUCCEEDED" || providerImageUrl
+          ? "succeed"
+          : rawStatus === "FAILED" || rawStatus === "ERROR" || rawStatus === "CANCELLED" || rawStatus === "CANCELED"
+            ? "failed"
+            : "processing";
+
+      let publicUrl = "";
+      if (normalised === "succeed" && providerImageUrl) {
+        try {
+          const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
+          const mirrored = await mirrorRemoteMedia({
+            supabase,
+            sourceUrl: providerImageUrl,
+            bucket: "ai-media",
+            path: `pipeline/magnific_upscale_${safeTaskId}.png`,
+            fallbackContentType: "image/png",
+            signedUrlTtlSeconds: 60 * 60 * 24 * 365,
+            maxBufferBytes: WORKSPACE_IMAGE_MIRROR_MAX_BYTES,
+            label: "poll_magnific_upscale",
+          });
+          publicUrl = mirrored.url;
+        } catch (err) {
+          console.error("[poll_magnific_upscale] rehost failed:", err);
+          return new Response(
+            JSON.stringify({
+              status: "failed",
+              task_id: taskId,
+              url: "",
+              message: `Magnific upscale finished but the image couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
+            }),
+            { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          status: normalised,
+          task_id: taskId,
+          url: publicUrl,
+          message: normalised === "failed" ? errorMessage || "Magnific upscale task failed" : rawStatus,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
     if (body.action === "poll_veo") {
       const taskId = normalizeVeoOperationName(String(body.task_id ?? ""));
       if (!taskId) {
@@ -5929,6 +6108,9 @@ serve(async (req) => {
         break;
       case "remove_bg":
         result = await executeRemoveBg(params, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+        break;
+      case "upscale_image":
+        result = await executeMagnificUpscale(params);
         break;
       case "merge_audio":
         result = await executeMergeAudio(params);

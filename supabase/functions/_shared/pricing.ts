@@ -31,6 +31,7 @@ export type ProviderKey =
   | "seedream"
   | "chat_ai"
   | "remove_bg"
+  | "upscale_image"
   | "merge_audio"
   | "mp3_input"
   | "tripo3d"
@@ -55,6 +56,7 @@ export const NODE_TYPE_REGISTRY: Record<string, ProviderDef> = {
   imageGenNode:          { provider: "banana",    feature: "generate_freepik_image", output_type: "image_url", is_async: false },
   chatAiNode:            { provider: "chat_ai",   feature: "chat_ai",                output_type: "text",      is_async: false },
   removeBackgroundNode:  { provider: "remove_bg", feature: "remove_background",      output_type: "image_url", is_async: false },
+  upscaleImageNode:      { provider: "upscale_image", feature: "upscale_image",      output_type: "image_url", is_async: true },
   mergeAudioNode:        { provider: "merge_audio", feature: "merge_audio_video",    output_type: "video_url", is_async: true },
   mp3InputNode:          { provider: "mp3_input", feature: "mp3_input",              output_type: "audio_url", is_async: false },
   audioGenNode:          { provider: "google_tts", feature: "text_to_speech",         output_type: "audio_url", is_async: false },
@@ -308,6 +310,12 @@ export async function lookupModelDiscountPercent(
     return maxDiscountByModelKeys(supabase, "remove_background", keys);
   }
 
+  if (providerDef.provider === "upscale_image") {
+    const model = String(params.model_name ?? params.model ?? "magnific-upscale-precision-v2");
+    const keys = Array.from(new Set([model, "magnific-upscale-precision-v2"]));
+    return maxDiscountByModelKeys(supabase, "upscale_image", keys);
+  }
+
   if (providerDef.provider === "chat_ai") {
     const model = String(params.model_name ?? params.model ?? DEFAULT_CHAT_MODEL);
     return maxDiscountByModelKeys(supabase, "chat_ai", googleModelPriceKeys(model));
@@ -491,6 +499,20 @@ export async function lookupBaseCost(
     if (!data) {
       throw new PricingConfigError(
         `Pricing configuration missing for remove_background model: ${model}`
+      );
+    }
+    return data.cost;
+  }
+
+  /* ── Image Upscale (Magnific Precision V2) ── */
+  if (providerDef.provider === "upscale_image") {
+    const model = String(params.model_name ?? params.model ?? "magnific-upscale-precision-v2");
+    const keys = Array.from(new Set([model, "magnific-upscale-precision-v2"]));
+    const data = await firstCostByModelKeys(supabase, "upscale_image", keys);
+
+    if (!data) {
+      throw new PricingConfigError(
+        `Pricing configuration missing for upscale_image model: ${model}`
       );
     }
     return data.cost;
@@ -786,6 +808,7 @@ function getMultiplierForNode(nodeType: string, featureMultipliers?: FeatureMult
     case "seedance": return featureMultipliers.video;
     case "chat_ai": return featureMultipliers.chat;
     case "remove_bg": return featureMultipliers.image;
+    case "upscale_image": return featureMultipliers.image;
     case "merge_audio": return featureMultipliers.video;
     case "tripo3d": return featureMultipliers.image;
     case "hyper3d": return featureMultipliers.image;

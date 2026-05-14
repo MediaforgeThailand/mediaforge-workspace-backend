@@ -400,7 +400,7 @@ export async function defaultProbeProviderHealth(provider: string): Promise<Heal
       await res.body?.cancel();
       return { healthy: res.ok, reason: `HTTP ${res.status}` };
     }
-    if (provider === "remove_bg") {
+    if (provider === "remove_bg" || provider === "upscale_image") {
       const key =
         Deno.env.get("MAGNIFIC_API_KEY") ??
         Deno.env.get("FREEPIK_API_KEY") ??

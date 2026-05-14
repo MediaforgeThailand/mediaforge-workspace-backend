@@ -69,6 +69,11 @@ export const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     image_input:   { internal_key: "image_url",      data_type: "image" },
     ref_image:     { internal_key: "image_url",      data_type: "image" },
   },
+  upscale_image: {
+    image:         { internal_key: "image_url",      data_type: "image" },
+    image_input:   { internal_key: "image_url",      data_type: "image" },
+    ref_image:     { internal_key: "image_url",      data_type: "image" },
+  },
   merge_audio: {
     video:         { internal_key: "video_url",      data_type: "video" },
     audio:         { internal_key: "audio_url",      data_type: "text" }, // 'text' = pass-through URL string
