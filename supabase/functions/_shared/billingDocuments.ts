@@ -355,11 +355,20 @@ export async function sendBillingDocumentEmail(
     client,
     document.id,
     result.success ? "email_sent" : "email_failed",
-    { to: emailTo, error: result.error ?? null, attachment_filename: pdfAttachment.filename },
+    {
+      to: emailTo,
+      error: result.error ?? null,
+      attachment_filename: pdfAttachment.filename,
+      attachment_count: 1,
+    },
     { id: opts.actorId ?? null, email: opts.actorEmail ?? null },
   );
 
-  return result;
+  return {
+    ...result,
+    attachment_count: result.attachment_count ?? 1,
+    attachment_filename: pdfAttachment.filename,
+  };
 }
 
 export async function syncBillingDocumentsForPayment(

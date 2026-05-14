@@ -50,6 +50,7 @@ Deno.test("sendTransactionalEmail — forwards PDF attachments to send-email", a
     });
 
     assertEquals(result.success, true);
+    assertEquals(result.attachment_count, 1);
     assertEquals(sentBody.attachments?.[0]?.filename, "invoice.pdf");
     assertEquals(sentBody.attachments?.[0]?.type, "application/pdf");
   } finally {

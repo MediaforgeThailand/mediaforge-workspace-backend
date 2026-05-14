@@ -24,7 +24,7 @@ export async function sendTransactionalEmail(
   to: string,
   data: Record<string, unknown>,
   opts?: { subject?: string; reply_to?: string; attachments?: TransactionalEmailAttachment[] },
-): Promise<{ success: boolean; message_id?: string; error?: string }> {
+): Promise<{ success: boolean; message_id?: string; error?: string; attachment_count?: number }> {
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
   const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
@@ -80,8 +80,9 @@ export async function sendTransactionalEmail(
     }
 
     const json = await res.json();
-    console.log(`[sendTransactionalEmail] template=${template} to=${to} message_id=${json.message_id ?? "n/a"}`);
-    return { success: true, message_id: json.message_id };
+    const attachmentCount = Number(json.attachment_count ?? opts?.attachments?.length ?? 0);
+    console.log(`[sendTransactionalEmail] template=${template} to=${to} message_id=${json.message_id ?? "n/a"} attachments=${attachmentCount}`);
+    return { success: true, message_id: json.message_id, attachment_count: attachmentCount };
   } catch (e) {
     console.warn(`[sendTransactionalEmail] template=${template} to=${to} error:`, e);
     return { success: false, error: e instanceof Error ? e.message : String(e) };

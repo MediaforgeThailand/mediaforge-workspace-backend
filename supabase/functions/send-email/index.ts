@@ -208,10 +208,10 @@ serve(async (req) => {
     }
 
     const messageId = sgRes.headers.get("x-message-id") ?? null;
-    console.log(`[send-email] Sent template=${template} to=${recipients.join(",")} message_id=${messageId}`);
+    console.log(`[send-email] Sent template=${template} to=${recipients.join(",")} message_id=${messageId} attachments=${attachments.length}`);
 
     return new Response(
-      JSON.stringify({ success: true, message_id: messageId, template, recipients }),
+      JSON.stringify({ success: true, message_id: messageId, template, recipients, attachment_count: attachments.length }),
       { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
   } catch (e) {
