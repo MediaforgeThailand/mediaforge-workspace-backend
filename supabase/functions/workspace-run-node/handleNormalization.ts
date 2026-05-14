@@ -73,10 +73,17 @@ export const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     image:         { internal_key: "image_url",      data_type: "image" },
     image_input:   { internal_key: "image_url",      data_type: "image" },
     ref_image:     { internal_key: "image_url",      data_type: "image" },
+    video:         { internal_key: "video_url",      data_type: "video" },
+    ref_video:     { internal_key: "video_url",      data_type: "video" },
   },
   merge_audio: {
     video:         { internal_key: "video_url",      data_type: "video" },
     audio:         { internal_key: "audio_url",      data_type: "text" }, // 'text' = pass-through URL string
+  },
+  elevenlabs_dubbing: {
+    media:         { internal_key: "media_url",      data_type: "text" }, // hybrid MP3/MP4 URL; executor infers type.
+    video:         { internal_key: "media_url",      data_type: "video" },
+    audio:         { internal_key: "media_url",      data_type: "audio" },
   },
   video_understanding: {
     video:         { internal_key: "video_url",      data_type: "video" },

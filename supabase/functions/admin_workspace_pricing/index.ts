@@ -366,6 +366,25 @@ const ELEVENLABS_TTS_ROWS: CreditCostWriteRow[] = [
   notes: `${row.notes} ${row.usdPer1k} USD/1K chars -> ${USD_TO_THB} THB/USD -> ${WORKSPACE_CREDITS_PER_THB} credits/THB.`,
 }));
 
+const ELEVENLABS_DUBBING_ROWS: CreditCostWriteRow[] = [
+  {
+    feature: "voice_translate",
+    model: "elevenlabs-dubbing-voice-clone",
+    label: "ElevenLabs Dubbing Voice Clone / min",
+    cost: creditsFromUsd(0.92),
+    pricing_type: "per_minute",
+    provider: "elevenlabs",
+    price_key: "dubbing:voice-clone",
+    resolution: "media",
+    quality: "voice-clone",
+    source: "official_docs_estimate",
+    source_url: "https://help.elevenlabs.io/hc/en-us/articles/23338815703697-How-much-does-Dubbing-cost",
+    provider_unit: "per media minute",
+    notes:
+      "Conservative Creator-plan estimate from ElevenLabs credit-based dubbing guidance; runtime bills by source media duration and auto-returns MP3/MP4 based on input.",
+  },
+];
+
 const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   ...GPT_IMAGE_2_ROWS,
   ...NANO_BANANA_ROWS,
@@ -385,6 +404,7 @@ const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   { feature: "text_to_speech", model: "gemini-2.5-flash-preview-tts", label: "Gemini 2.5 Flash Preview TTS / 1K chars", cost: 50, pricing_type: "per_1k_chars", provider: "google", price_key: "gemini-2.5-flash-preview-tts", source: "official_docs_estimate", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per 1K chars", notes: "Emergency estimate. Gemini lists Flash Preview TTS at $0.50/1M text input tokens and $10/1M audio output tokens; runtime bills by text length, so use a conservative per-1K-character floor until audio-token metering is implemented." },
   { feature: "text_to_speech", model: "gemini-2.5-pro-preview-tts", label: "Gemini 2.5 Pro Preview TTS / 1K chars", cost: 100, pricing_type: "per_1k_chars", provider: "google", price_key: "gemini-2.5-pro-preview-tts", source: "official_docs_estimate", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per 1K chars", notes: "Emergency estimate. Gemini Pro Preview TTS output audio is more expensive than Flash; runtime bills by text length, so use a conservative per-1K-character floor until audio-token metering is implemented." },
   ...ELEVENLABS_TTS_ROWS,
+  ...ELEVENLABS_DUBBING_ROWS,
   { feature: "text_to_speech", model: "google-tts-studio", label: "Google Cloud TTS Studio / 1K chars", cost: 280, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-studio", quality: "studio", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
   { feature: "text_to_speech", model: "google-tts-neural2", label: "Google Cloud TTS Neural2 / 1K chars", cost: 28, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-neural2", quality: "neural2", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
   { feature: "text_to_speech", model: "google-tts-wavenet", label: "Google Cloud TTS WaveNet / 1K chars", cost: 7, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-wavenet", quality: "wavenet", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },

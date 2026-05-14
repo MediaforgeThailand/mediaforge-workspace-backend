@@ -112,9 +112,10 @@ function getElevenLabsKey(): string {
 
 function elevenLabsDubbingWatermark(): boolean {
   const raw = Deno.env.get("ELEVENLABS_DUBBING_WATERMARK")?.trim().toLowerCase();
-  if (!raw) return true;
+  if (!raw) return false;
   if (["false", "0", "no", "off"].includes(raw)) return false;
-  return true;
+  if (["true", "1", "yes", "on"].includes(raw)) return true;
+  return false;
 }
 
 function elevenLabsAllowWatermarkedVideo(): boolean {
@@ -477,11 +478,11 @@ serve(async (req) => {
 
       if (!consent) return json({ error: "Voice clone dubbing requires user consent." }, 400);
       if (!projectId) return json({ error: "project_id is required." }, 400);
-      if (outputType === "video" && !elevenLabsAllowWatermarkedVideo()) {
+      if (outputType === "video" && watermark && !elevenLabsAllowWatermarkedVideo()) {
         return json(
           {
             error:
-              "MP4 dubbing is disabled for this ElevenLabs account because video output includes a watermark unless the account is Creator+. Choose MP3 / audio output.",
+              "Watermarked MP4 dubbing is disabled for this ElevenLabs account. Use non-watermarked Creator output or choose MP3 / audio output.",
           },
           400,
         );

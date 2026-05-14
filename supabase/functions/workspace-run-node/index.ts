@@ -66,6 +66,7 @@ import {
   executeMagnificUpscale,
   MAGNIFIC_UPSCALE_MODEL,
   MAGNIFIC_UPSCALE_PATH,
+  MAGNIFIC_VIDEO_UPSCALE_PATH,
 } from "../_shared/magnificUpscale.ts";
 import { executeVideoToPrompt } from "../_shared/videoToPrompt.ts";
 import { executeGoogleTts } from "../_shared/googleTts.ts";
@@ -73,6 +74,7 @@ import { executeElevenLabsTts } from "../_shared/elevenLabsTts.ts";
 import { executeGeminiTts } from "../_shared/geminiTts.ts";
 import {
   executeElevenLabsDubbing,
+  elevenLabsDubbingStatusCode,
   pollElevenLabsDubbing,
 } from "../_shared/elevenLabsDubbing.ts";
 import {
@@ -548,6 +550,8 @@ async function executeOneStep(
         return await executeRemoveBg(stepParams);
       case "merge_audio":
         return await executeMergeAudio(stepParams);
+      case "elevenlabs_dubbing":
+        return await executeElevenLabsDubbing(stepParams);
       case "mp3_input":
         return {
           result_url: String(stepParams.audio_url ?? stepParams.previewUrl ?? ""),
@@ -1386,6 +1390,18 @@ function buildChargeParams(
   ) {
     params.prompt = inputs.text;
   }
+  for (const key of [
+    "source_duration_seconds",
+    "duration_seconds",
+    "duration",
+    "source_content_type",
+    "source_media_type",
+    "media_type",
+  ]) {
+    if (params[key] === undefined && inputs[key] !== undefined) {
+      params[key] = inputs[key];
+    }
+  }
   return params;
 }
 
@@ -1837,6 +1853,7 @@ interface WorkspaceRunBody {
     | "poll_replicate_veo"
     | "poll_replicate_video"
     | "poll_replicate_image"
+    | "poll_elevenlabs_dubbing"
     | "poll_freepik_veo"
     | "poll_freepik_video"
     | "poll_freepik_image"
@@ -1856,6 +1873,9 @@ interface WorkspaceRunBody {
   model?: string;
   provider_model_id?: string;
   api_key_alias?: string;
+  output_type?: string;
+  target_lang?: string;
+  output_language?: string;
   /** For action="mirror_tripo_url": the Tripo3D CDN URL to mirror
    *  into Supabase storage so model-viewer can fetch it across
    *  CORS. Used to migrate generations that were created before
@@ -2542,6 +2562,21 @@ async function pollWorkspaceAsyncResult(args: {
       if (!url) {
         throw new Error(`${provider} task succeeded but returned no URL`);
       }
+      const responseType = String(args.response.type ?? args.response.output_type ?? "");
+      const outputKey =
+        responseType === "video" || responseType === "video_url"
+          ? "output_video"
+          : responseType === "audio" || responseType === "audio_url"
+            ? "output_audio"
+            : "output_image";
+      const currentOutputs =
+        args.response.outputs && typeof args.response.outputs === "object"
+          ? (args.response.outputs as Record<string, string>)
+          : {};
+      const nextOutputs =
+        provider === "elevenlabs_dubbing"
+          ? { ...currentOutputs, [outputKey]: url, output_media: url }
+          : { ...currentOutputs, [outputKey]: url };
       const nextProviderMeta = {
         ...providerMeta,
         ...(pollResp.model_url ? { model_url: pollResp.model_url } : {}),
@@ -2550,6 +2585,7 @@ async function pollWorkspaceAsyncResult(args: {
       return {
         ...args.response,
         url,
+        outputs: nextOutputs,
         provider_meta: nextProviderMeta,
       };
     }
@@ -2671,15 +2707,16 @@ async function pollWorkspaceAsyncResultOnce(args: {
         : responseType === "audio" || responseType === "audio_url"
           ? "output_audio"
           : "output_image";
+    const nextOutputs =
+      provider === "elevenlabs_dubbing"
+        ? { ...currentOutputs, [outputKey]: url, output_media: url }
+        : { ...currentOutputs, [outputKey]: url };
     return {
       state: "succeeded",
       result: {
         ...args.response,
         url,
-        outputs: {
-          ...currentOutputs,
-          [outputKey]: url,
-        },
+        outputs: nextOutputs,
         provider_meta: nextProviderMeta,
       },
     };
@@ -2705,7 +2742,10 @@ function inferAsyncPollProvider(
     endpoint.includes("api.magnific.com") ||
     endpoint.includes("api.freepik.com")
   ) {
-    if (endpoint.includes("/image-upscaler-precision-v2")) return "magnific_upscale";
+    if (
+      endpoint.includes("/image-upscaler-precision-v2") ||
+      endpoint.includes("/video-upscaler-precision")
+    ) return "magnific_upscale";
     if (endpoint.includes("/text-to-image/")) return "freepik_image";
     if (endpoint.includes("/seedance-")) return "freepik_seedance";
     return "freepik_veo";
@@ -2758,6 +2798,8 @@ function workspaceJobLink(job: WorkspaceJobRow): string {
         ? "image_upscale"
       : job.node_type === "googleTtsNode" || job.node_type === "geminiTtsNode"
         ? "voice_gen"
+      : job.node_type === "voiceTranslateNode"
+        ? "voice_translate"
         : job.node_type === "tripo3dNode" || job.node_type === "hyper3dNode"
           ? "model_3d"
           : "image_gen";
@@ -4507,6 +4549,41 @@ serve(async (req) => {
       }
     }
 
+    if (body.action === "poll_elevenlabs_dubbing") {
+      const taskId = String(body.task_id ?? "").trim();
+      const pollEndpoint = String(body.poll_endpoint ?? "").trim();
+      const outputType = String(body.output_type ?? "").toLowerCase() === "audio" ? "audio" : "video";
+      try {
+        const poll = await pollElevenLabsDubbing({
+          req,
+          userId: user.id,
+          taskId,
+          pollEndpoint,
+          targetLang: String(body.target_lang ?? ""),
+          outputLanguage: String(body.output_language ?? ""),
+          outputType,
+        });
+        return new Response(JSON.stringify(poll), {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return new Response(
+          JSON.stringify({
+            status: "failed",
+            task_id: taskId,
+            url: "",
+            message,
+          }),
+          {
+            status: elevenLabsDubbingStatusCode(err),
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          },
+        );
+      }
+    }
+
     /* ─── Async poll path (Kling video tasks) ──────────────── */
     if (body.action === "poll_kling") {
       const taskId = String(body.task_id ?? "").trim();
@@ -5220,20 +5297,25 @@ serve(async (req) => {
       }
 
       let pollUrlOk = false;
+      let isVideoUpscale = false;
       try {
         const u = new URL(pollEndpoint);
         const normalizedPath = u.pathname.replace(/\/+$/, "");
+        const normalizedEndpointPath = normalizedPath.startsWith("/v1/")
+          ? normalizedPath.slice(3)
+          : normalizedPath;
+        const isImageUpscale = normalizedEndpointPath === MAGNIFIC_UPSCALE_PATH;
+        isVideoUpscale = normalizedEndpointPath === MAGNIFIC_VIDEO_UPSCALE_PATH;
         pollUrlOk =
           u.protocol === "https:" &&
           (u.hostname === "api.magnific.com" || u.hostname === "api.freepik.com") &&
-          (normalizedPath === MAGNIFIC_UPSCALE_PATH ||
-            normalizedPath === `/v1${MAGNIFIC_UPSCALE_PATH}`);
+          (isImageUpscale || isVideoUpscale);
       } catch {
         pollUrlOk = false;
       }
       if (!pollUrlOk) {
         return new Response(
-          JSON.stringify({ error: "poll_endpoint must be a Magnific Precision V2 upscale endpoint" }),
+          JSON.stringify({ error: "poll_endpoint must be a Magnific image or video upscale endpoint" }),
           { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       }
@@ -5291,7 +5373,7 @@ serve(async (req) => {
         : Array.isArray(payload.generated)
           ? payload.generated
           : [];
-      const providerImageUrl =
+      const providerMediaUrl =
         extractProviderMediaUrl(generated) ||
         extractProviderMediaUrl(data) ||
         extractProviderMediaUrl(payload);
@@ -5303,24 +5385,25 @@ serve(async (req) => {
           "",
       );
       const normalised =
-        rawStatus === "COMPLETED" || rawStatus === "DONE" || rawStatus === "SUCCEEDED" || providerImageUrl
+        rawStatus === "COMPLETED" || rawStatus === "DONE" || rawStatus === "SUCCEEDED" || providerMediaUrl
           ? "succeed"
           : rawStatus === "FAILED" || rawStatus === "ERROR" || rawStatus === "CANCELLED" || rawStatus === "CANCELED"
             ? "failed"
             : "processing";
 
       let publicUrl = "";
-      if (normalised === "succeed" && providerImageUrl) {
+      if (normalised === "succeed" && providerMediaUrl) {
         try {
           const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
           const mirrored = await mirrorRemoteMedia({
             supabase,
-            sourceUrl: providerImageUrl,
+            sourceUrl: providerMediaUrl,
             bucket: "ai-media",
-            path: `pipeline/magnific_upscale_${safeTaskId}.png`,
-            fallbackContentType: "image/png",
+            path: `pipeline/magnific_upscale_${safeTaskId}.${isVideoUpscale ? "mp4" : "png"}`,
+            fallbackContentType: isVideoUpscale ? "video/mp4" : "image/png",
             signedUrlTtlSeconds: 60 * 60 * 24 * 365,
-            maxBufferBytes: WORKSPACE_IMAGE_MIRROR_MAX_BYTES,
+            maxBufferBytes: isVideoUpscale ? WORKSPACE_VIDEO_MIRROR_MAX_BYTES : WORKSPACE_IMAGE_MIRROR_MAX_BYTES,
+            allowRawUrlFallback: isVideoUpscale,
             label: "poll_magnific_upscale",
           });
           publicUrl = mirrored.url;
@@ -5331,7 +5414,7 @@ serve(async (req) => {
               status: "failed",
               task_id: taskId,
               url: "",
-              message: `Magnific upscale finished but the image couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
+              message: `Magnific upscale finished but the ${isVideoUpscale ? "video" : "image"} couldn't be saved: ${err instanceof Error ? err.message : String(err)}`,
             }),
             { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
           );
@@ -5342,6 +5425,8 @@ serve(async (req) => {
         JSON.stringify({
           status: normalised,
           task_id: taskId,
+          type: isVideoUpscale ? "video" : "image",
+          output_type: isVideoUpscale ? "video_url" : "image_url",
           url: publicUrl,
           message: normalised === "failed" ? errorMessage || "Magnific upscale task failed" : rawStatus,
         }),
@@ -6114,6 +6199,9 @@ serve(async (req) => {
         break;
       case "merge_audio":
         result = await executeMergeAudio(params);
+        break;
+      case "elevenlabs_dubbing":
+        result = await executeElevenLabsDubbing(params);
         break;
       case "openai":
         result = await executeOpenAIImage2(params, supabase);
