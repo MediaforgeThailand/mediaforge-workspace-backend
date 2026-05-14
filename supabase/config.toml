@@ -61,9 +61,6 @@ verify_jwt = false
 [functions.admin-api]
 verify_jwt = false
 
-[functions.execute-pipeline-step]
-verify_jwt = false
-
 [functions.erp-bridge]
 verify_jwt = false
 
@@ -74,9 +71,6 @@ verify_jwt = false
 verify_jwt = false
 
 [functions.merge-audio-video]
-verify_jwt = false
-
-[functions.retry-worker]
 verify_jwt = false
 
 [functions.workspace-run-node]
