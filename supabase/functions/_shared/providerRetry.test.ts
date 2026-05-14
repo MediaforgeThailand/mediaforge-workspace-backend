@@ -128,6 +128,13 @@ Deno.test("classifyError — wiring / missing-input errors are permanent", () =>
   assertEquals(classifyError("missing required parameter prompt"), "permanent");
   assertEquals(classifyError("input prompt is required"), "permanent");
   assertEquals(classifyError("prompt cannot be empty"), "permanent");
+  // Both word orders the executors actually throw. Until 2026-05-14
+  // these returned "unknown", so workspace jobs retry-looped 18 attempts
+  // on a no-prompt run instead of failing fast + refunding.
+  assertEquals(classifyError("A prompt is required."), "permanent");
+  assertEquals(classifyError("Seedream requires a prompt."), "permanent");
+  assertEquals(classifyError("Seedance requires a prompt, start_frame image, reference_image, ref_video, or ref_audio."), "permanent");
+  assertEquals(classifyError("Replicate Veo 3.1 requires a prompt."), "permanent");
 });
 
 Deno.test("classifyError — unrecognized errors fall back to 'unknown' (still retried)", () => {

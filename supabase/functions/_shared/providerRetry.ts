@@ -195,7 +195,13 @@ export function classifyError(errMsg: string): "permanent" | "transient" | "unkn
     return "permanent";
   }
   // Validation errors — missing required inputs / wiring issues. Retry never helps.
-  if (/requires (?:a |an )?[\w ]+ input|missing required|no .* (?:provided|specified|supplied)|input .* is required|cannot be empty/i.test(errMsg)) {
+  // Two word orders cover the executor message conventions in this repo:
+  //   - "A prompt is required."          (banana, openAIImage)
+  //   - "Seedream requires a prompt."    (seedream, seedance, replicate variants)
+  // Both must classify as permanent or the durable worker retry-loops the
+  // user's no-prompt run 18× until the deadline expires (job stays
+  // "running" the whole time — the credit is never refunded automatically).
+  if (/requires (?:a |an )?[\w ]+ input|requires? (?:a |an )?prompt|missing required|no .* (?:provided|specified|supplied)|input .* is required|prompt (?:is |are )?required|cannot be empty/i.test(errMsg)) {
     return "permanent";
   }
   if (/504|502|503|500|429|timeout|ECONNRESET|fetch failed|aborted|ENOTFOUND|ETIMEDOUT|socket hang up|overload|busy|queue|rate limit|compute resources/i.test(errMsg)) {
