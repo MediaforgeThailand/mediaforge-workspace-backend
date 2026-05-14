@@ -1,7 +1,7 @@
 /// <reference lib="deno.ns" />
 // deno-lint-ignore-file no-explicit-any
 import { assertEquals, assert } from "https://deno.land/std@0.224.0/assert/mod.ts";
-import { syncBillingDocumentsForPayment } from "./billingDocuments.ts";
+import { buildGeneratedBillingDocumentPdfAttachment, syncBillingDocumentsForPayment } from "./billingDocuments.ts";
 
 function createFakeClient() {
   const state = {
@@ -193,3 +193,22 @@ Deno.test("syncBillingDocumentsForPayment keeps generated document numbers stabl
   assertEquals(secondNumbers, firstNumbers);
 });
 
+Deno.test("buildGeneratedBillingDocumentPdfAttachment creates a PDF attachment", () => {
+  const attachment = buildGeneratedBillingDocumentPdfAttachment({
+    document_type: "manual_invoice",
+    document_number: "INV-M-TEST-1",
+    issued_at: "2026-05-14T00:00:00Z",
+    email_to: "mediaforge2026@gmail.com",
+    title: "Manual invoice test",
+    amount_thb: 1,
+    currency: "thb",
+    credits_added: 0,
+    line_items: [{ description: "Manual invoice test", amount_thb: 1, credits: 0 }],
+    metadata: { note: "E2E PDF attachment test" },
+  });
+
+  assertEquals(attachment.filename, "INV-M-TEST-1.pdf");
+  assertEquals(attachment.type, "application/pdf");
+  assertEquals(attachment.disposition, "attachment");
+  assert(atob(attachment.content).startsWith("%PDF-1.4"));
+});

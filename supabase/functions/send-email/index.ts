@@ -59,6 +59,31 @@ interface SendEmailBody {
   subject?: string;
   from?: { email: string; name?: string };
   reply_to?: string;
+  attachments?: Array<{
+    content: string;
+    filename: string;
+    type?: string;
+    disposition?: "attachment" | "inline";
+    content_id?: string;
+  }>;
+}
+
+function sanitizeAttachments(attachments: SendEmailBody["attachments"] = []) {
+  if (!Array.isArray(attachments) || attachments.length === 0) return [];
+  if (attachments.length > 5) throw new Error("too_many_attachments");
+  return attachments.map((attachment) => {
+    const content = typeof attachment?.content === "string" ? attachment.content : "";
+    const filename = typeof attachment?.filename === "string" ? attachment.filename.trim() : "";
+    if (!content || !filename) throw new Error("invalid_attachment");
+    if (content.length > 10_000_000) throw new Error("attachment_too_large");
+    return {
+      content,
+      filename,
+      type: attachment.type || "application/octet-stream",
+      disposition: attachment.disposition || "attachment",
+      ...(attachment.content_id ? { content_id: attachment.content_id } : {}),
+    };
+  });
 }
 
 serve(async (req) => {
@@ -101,6 +126,15 @@ serve(async (req) => {
 
     const body = (await req.json()) as SendEmailBody;
     const { template, to, data = {}, subject, from, reply_to } = body;
+    let attachments: ReturnType<typeof sanitizeAttachments>;
+    try {
+      attachments = sanitizeAttachments(body.attachments);
+    } catch (error) {
+      return new Response(
+        JSON.stringify({ error: error instanceof Error ? error.message : "invalid_attachment" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
 
     if (!template || !to) {
       return new Response(JSON.stringify({ error: "template and to are required" }), {
@@ -121,6 +155,11 @@ serve(async (req) => {
 
     // SECURITY: Non-service callers can only send to themselves
     if (!isServiceRole) {
+      if (attachments.length > 0) {
+        return new Response(JSON.stringify({ error: "attachments_require_service_role" }), {
+          status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
       const invalid = recipients.find((r) => r.toLowerCase() !== (callerEmail ?? "").toLowerCase());
       if (invalid) {
         console.warn(`[send-email] Blocked: ${callerEmail} tried to send to ${invalid}`);
@@ -139,6 +178,7 @@ serve(async (req) => {
       })),
       from: from ?? DEFAULT_FROM,
       template_id: templateId,
+      ...(attachments.length > 0 ? { attachments } : {}),
       ...(reply_to ? { reply_to: { email: reply_to } } : {}),
       mail_settings: {
         sandbox_mode: { enable: false },

@@ -11,11 +11,19 @@
  *
  * Failures are logged but never thrown — emails are best-effort.
  */
+export interface TransactionalEmailAttachment {
+  content: string;
+  filename: string;
+  type?: string;
+  disposition?: "attachment" | "inline";
+  content_id?: string;
+}
+
 export async function sendTransactionalEmail(
   template: string,
   to: string,
   data: Record<string, unknown>,
-  opts?: { subject?: string; reply_to?: string },
+  opts?: { subject?: string; reply_to?: string; attachments?: TransactionalEmailAttachment[] },
 ): Promise<{ success: boolean; message_id?: string; error?: string }> {
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
   const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -49,6 +57,7 @@ export async function sendTransactionalEmail(
         data: enrichedData,
         ...(opts?.subject ? { subject: opts.subject } : {}),
         ...(opts?.reply_to ? { reply_to: opts.reply_to } : {}),
+        ...(opts?.attachments?.length ? { attachments: opts.attachments } : {}),
       }),
     });
 

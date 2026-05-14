@@ -2,6 +2,12 @@
 import { sendTransactionalEmail } from "./sendEmail.ts";
 
 type SupabaseClient = any;
+type EmailAttachment = {
+  content: string;
+  filename: string;
+  type?: string;
+  disposition?: "attachment" | "inline";
+};
 
 const ZERO_DECIMAL_CURRENCIES = new Set(["bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg", "rwf", "ugx", "vnd", "vuv", "xaf", "xof", "xpf"]);
 
@@ -35,6 +41,163 @@ function firstHttpsUrl(...values: Array<unknown>): string | null {
     if (trimmed.startsWith("https://")) return trimmed;
   }
   return null;
+}
+
+function pdfSafeText(value: unknown): string {
+  return String(value ?? "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/[^\x20-\x7E]/g, "?")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function pdfEscape(value: unknown): string {
+  return pdfSafeText(value).replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+}
+
+function wrapPdfLine(value: unknown, max = 84): string[] {
+  const text = pdfSafeText(value);
+  if (!text) return [""];
+  const words = text.split(" ");
+  const lines: string[] = [];
+  let current = "";
+  for (const word of words) {
+    if (!current) {
+      current = word;
+    } else if (`${current} ${word}`.length <= max) {
+      current = `${current} ${word}`;
+    } else {
+      lines.push(current);
+      current = word;
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function simplePdf(lines: Array<{ text: string; size?: number; gap?: number }>): Uint8Array {
+  const encoder = new TextEncoder();
+  const content: string[] = ["q", "1 1 1 rg", "0 0 612 792 re f", "Q"];
+  let y = 742;
+  for (const line of lines) {
+    const size = line.size ?? 10;
+    content.push("BT", `/F1 ${size} Tf`, `50 ${y} Td`, `(${pdfEscape(line.text)}) Tj`, "ET");
+    y -= line.gap ?? Math.max(14, size + 5);
+    if (y < 48) break;
+  }
+  const stream = `${content.join("\n")}\n`;
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    `<< /Length ${encoder.encode(stream).length} >>\nstream\n${stream}endstream`,
+  ];
+
+  let pdf = "%PDF-1.4\n";
+  const offsets: number[] = [];
+  for (let i = 0; i < objects.length; i += 1) {
+    offsets.push(encoder.encode(pdf).length);
+    pdf += `${i + 1} 0 obj\n${objects[i]}\nendobj\n`;
+  }
+  const xrefOffset = encoder.encode(pdf).length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) {
+    pdf += `${String(offset).padStart(10, "0")} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return encoder.encode(pdf);
+}
+
+function documentFilename(document: any): string {
+  const number = pdfSafeText(document?.document_number || "mediaforge-document")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `${number || "mediaforge-document"}.pdf`;
+}
+
+export function buildGeneratedBillingDocumentPdfAttachment(document: any): EmailAttachment {
+  const typeLabel = String(document?.document_type ?? "").includes("receipt") ? "Receipt" : "Invoice";
+  const issuedAt = document?.issued_at ? new Date(document.issued_at) : new Date();
+  const issued = Number.isFinite(issuedAt.getTime()) ? issuedAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
+  const currency = String(document?.currency ?? "thb").toUpperCase();
+  const amount = fmtNum(Number(document?.amount_thb ?? 0));
+  const lineItems = Array.isArray(document?.line_items) ? document.line_items : [];
+  const metadata = document?.metadata && typeof document.metadata === "object" ? document.metadata : {};
+  const rows: Array<{ text: string; size?: number; gap?: number }> = [
+    { text: `MediaForge ${typeLabel}`, size: 20, gap: 30 },
+    { text: `Document number: ${document?.document_number ?? "-"}`, size: 11 },
+    { text: `Issued date: ${issued}`, size: 11 },
+    { text: `Recipient: ${document?.email_to ?? "-"}`, size: 11 },
+    { text: `Title: ${document?.title ?? "-"}`, size: 11 },
+    { text: `Amount: ${amount} ${currency}`, size: 11 },
+    { text: `Credits: ${fmtNum(Number(document?.credits_added ?? 0))}`, size: 11, gap: 24 },
+    { text: "Line items", size: 13, gap: 18 },
+  ];
+
+  if (lineItems.length > 0) {
+    for (const item of lineItems.slice(0, 12)) {
+      const description = pdfSafeText(item?.description || "MediaForge credits");
+      const itemCredits = Number(item?.credits ?? 0);
+      const itemAmount = Number(item?.amount_thb ?? 0);
+      for (const wrapped of wrapPdfLine(`- ${description} | credits: ${fmtNum(itemCredits)} | amount: ${fmtNum(itemAmount)} ${currency}`, 86)) {
+        rows.push({ text: wrapped, size: 10 });
+      }
+    }
+  } else {
+    rows.push({ text: "- MediaForge billing document", size: 10 });
+  }
+
+  const note = pdfSafeText(metadata.note || metadata.reason || "");
+  if (note) {
+    rows.push({ text: "", gap: 10 });
+    rows.push({ text: "Note", size: 13, gap: 18 });
+    for (const wrapped of wrapPdfLine(note, 86)) rows.push({ text: wrapped, size: 10 });
+  }
+
+  rows.push({ text: "", gap: 12 });
+  rows.push({ text: "MediaForge Co., Ltd. | https://mediaforge.co", size: 9 });
+  rows.push({ text: "This PDF was generated automatically for billing records.", size: 9 });
+
+  return {
+    content: bytesToBase64(simplePdf(rows)),
+    filename: documentFilename(document),
+    type: "application/pdf",
+    disposition: "attachment",
+  };
+}
+
+async function buildBillingDocumentPdfAttachment(document: any): Promise<EmailAttachment> {
+  const pdfUrl = firstHttpsUrl(document?.invoice_pdf_url);
+  if (pdfUrl) {
+    try {
+      const response = await fetch(pdfUrl);
+      if (response.ok) {
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (bytes.length > 0 && bytes.length <= 7_500_000) {
+          return {
+            content: bytesToBase64(bytes),
+            filename: documentFilename(document),
+            type: "application/pdf",
+            disposition: "attachment",
+          };
+        }
+      }
+    } catch (error) {
+      console.warn("[billingDocuments] invoice_pdf_url fetch failed, using generated PDF:", error);
+    }
+  }
+
+  return buildGeneratedBillingDocumentPdfAttachment(document);
 }
 
 function titleFromPayment(payment: any): string {
@@ -161,6 +324,7 @@ export async function sendBillingDocumentEmail(
   const transactionsUrl = document.organization_id
     ? "https://mediaforge-admin-hub.vercel.app/org/console"
     : "https://mediaforge.co/app/transactions";
+  const pdfAttachment = await buildBillingDocumentPdfAttachment(document);
 
   const result = await sendTransactionalEmail("payment_receipt", emailTo, {
     first_name: firstName,
@@ -177,6 +341,7 @@ export async function sendBillingDocumentEmail(
     subject: document.document_type.includes("invoice")
       ? `MediaForge invoice ${document.document_number}`
       : `MediaForge receipt ${document.document_number}`,
+    attachments: [pdfAttachment],
   });
 
   await client.from("billing_documents").update({
@@ -190,7 +355,7 @@ export async function sendBillingDocumentEmail(
     client,
     document.id,
     result.success ? "email_sent" : "email_failed",
-    { to: emailTo, error: result.error ?? null },
+    { to: emailTo, error: result.error ?? null, attachment_filename: pdfAttachment.filename },
     { id: opts.actorId ?? null, email: opts.actorEmail ?? null },
   );
 
