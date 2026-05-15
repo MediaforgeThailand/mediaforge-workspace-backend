@@ -67,14 +67,17 @@ export interface SeedreamGenerateRequest {
   response_format?: "url" | "b64_json";
   /** Optional seed for reproducibility. */
   seed?: number;
-  /** Optional reference image URLs for image-to-image / image editing.
-   *  BytePlus ModelArk Seedream 4.5 + 5.0 both expect an ARRAY here
-   *  under the `image_urls` key (max 14 references, ≤10 MB each, jpg/
-   *  png/webp/bmp/tiff/gif). The legacy singular `image` key from
-   *  Seedream 4.0 is silently ignored on the 4.5 + 5.0 endpoints, so
-   *  the workspace builds the array form unconditionally — that's the
-   *  shape the user is expected to wire in via the canvas ref_image
-   *  port (or the standalone tool's reference image input). */
+  /** Image-EDIT mode (single ref). When set, BytePlus Seedream 4.5 +
+   *  5.0 treat this URL as the canonical input and preserve subject
+   *  + composition, even with a short prompt. Use this for the
+   *  dominant canvas case: one wired ref_image edge or one
+   *  @-mention. ≤10 MB, jpg/png/webp/bmp/tiff/gif. */
+  image?: string;
+  /** Style/mood BLEND mode (multi-ref). When set with an array of
+   *  URLs, the model draws loose inspiration only; subject and
+   *  composition are NOT preserved. Use for multi-ref blending
+   *  scenarios; with a single URL prefer `image` instead. Max 14
+   *  refs, same per-file constraints as `image`. */
   image_urls?: string[];
   /** Optional negative prompt — Seedream supports it on most variants. */
   negative_prompt?: string;
@@ -260,17 +263,36 @@ export async function executeSeedream(
         : undefined;
 
   // Image-to-image / image-edit references — BytePlus ModelArk
-  // Seedream 4.5 + 5.0 take an `image_urls` ARRAY (max 14). The
-  // canvas writes wired ref-image edges into `ref_image` (single
-  // URL when one connection, array when many). Standalone tool
-  // calls historically used `image_url` (singular). Mention path
-  // hands us `mention_image_urls`. Accept all three and normalise
-  // to an array, capped at the API's 14-image limit.
+  // Seedream 4.5 + 5.0 expose TWO distinct ref modes that the API
+  // distinguishes purely by field name:
   //
-  // Until 2026-04 this executor was sending `{ image: <url> }`
-  // (singular) — the 4.5 / 5.0 endpoint silently dropped that
-  // field, so wired refs had no effect. Switching to `image_urls`
-  // matches the published BytePlus spec.
+  //   `image`      (singular) → image-EDIT mode: the model uses the
+  //                              ref as the canonical input and
+  //                              preserves subject + composition,
+  //                              regardless of prompt strength.
+  //   `image_urls` (array)    → style/mood-BLEND mode: the model
+  //                              draws loose inspiration only, and
+  //                              with a short prompt it routinely
+  //                              ignores the ref entirely.
+  //
+  // Verified 2026-05-15 against seedream-5-0-260128 +
+  // seedream-4-5-251128 with the same ref and a short "reformat to
+  // 9:16" prompt: `image` reliably reproduced the source subject;
+  // `image_urls` returned an unrelated scene.
+  //
+  // The previous executor sent `{ image_urls: [url] }` for every
+  // case based on a misread of the BytePlus spec — refs were
+  // technically attached but the model behaved as if none were.
+  // Switch back to `image` for the single-ref case (the dominant
+  // canvas pattern: one ref_image edge or one @-mention); keep
+  // `image_urls` for the multi-ref case where mood-blend is the
+  // desired behaviour.
+  //
+  // The canvas writes wired ref-image edges into `ref_image`
+  // (single URL when one connection, array when many). Standalone
+  // tool calls historically used `image_url` (singular). Mention
+  // path hands us `mention_image_urls`. Accept all three and
+  // normalise to an array, capped at the API's 14-image limit.
   const collectRefUrls = (): string[] => {
     const acc: string[] = [];
     const push = (v: unknown) => {
@@ -318,7 +340,14 @@ export async function executeSeedream(
       // this field, regardless of what the published default says.
       watermark: false,
       ...(seed !== undefined ? { seed } : {}),
-      ...(refUrls.length > 0 ? { image_urls: refUrls } : {}),
+      // Single ref → image-edit mode (`image`). Multi-ref → mood
+      // blend (`image_urls`). See the comment block above
+      // `collectRefUrls` for the field-name semantics.
+      ...(refUrls.length === 1
+        ? { image: refUrls[0] }
+        : refUrls.length > 1
+          ? { image_urls: refUrls }
+          : {}),
       ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
     },
     apiKey,
