@@ -123,7 +123,7 @@ function normalizeExternalSource(raw: string): string {
 
   const facebookQuery = trimmed.replace(/^[?&]/, "");
   if (/^(?:fbid=|.*&fbid=)/i.test(facebookQuery)) {
-    return `https://www.facebook.com/photo/?${facebookQuery}`;
+    return `https://www.facebook.com/photo.php?${facebookQuery}`;
   }
 
   const youtubeQuery = trimmed.replace(/^[?&]/, "");
