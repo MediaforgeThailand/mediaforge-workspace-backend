@@ -137,15 +137,22 @@ export function rewriteMentionsInline(
   imageMentions.forEach((m, i) => {
     if (m.label) indexByLabel.set(m.label, i);
   });
+  // BytePlus Seedream indexes its `image_urls` array positionally and
+  // expects the prompt to reference them as "Image 1 / Image 2 / …".
+  // Use the same positional rewrite as OpenAI's gpt-image-2; the
+  // Banana-style `[Label]` anchors are only meaningful to Gemini Nano
+  // Banana, where the matching `[Context: …]` block teaches the model
+  // which attachment maps to which label.
+  const usePositional = provider === "openai" || provider === "seedream";
   let out = text.replace(MENTION_REGEX, (_full, label: string, nodeId: string) => {
     const idx = indexByNodeId.get(nodeId);
     if (idx === undefined) return label;
-    return provider === "openai" ? `Image ${idx + 1} (${label})` : `[${label}]`;
+    return usePositional ? `Image ${idx + 1} (${label})` : `[${label}]`;
   });
   out = out.replace(/@([^\s@[]+)/g, (full, name: string) => {
     const idx = indexByLabel.get(name);
     if (idx === undefined) return full;
-    return provider === "openai" ? `Image ${idx + 1} (${name})` : `[${name}]`;
+    return usePositional ? `Image ${idx + 1} (${name})` : `[${name}]`;
   });
   return out;
 }
@@ -169,6 +176,14 @@ export function appendMentionContext(
 ): string {
   const imageMentions = mentioned.filter((m) => effectiveImageRefUrl(m) !== null);
   if (imageMentions.length === 0) return text;
+  // Seedream (BytePlus ModelArk) indexes its `image_urls` array
+  // positionally and runs its own internal prompt-optimiser before
+  // diffusion. Appending a Banana-style `[Context: …]` block confuses
+  // that optimiser — it treats the structured annotation as part of
+  // the creative prompt and the rendered image stops tracking the
+  // user's actual intent. The inline rewrite already produced
+  // `Image N (Label)` anchors, which are all BytePlus needs.
+  if (provider === "seedream") return text;
   const lines = imageMentions.map((m, i) => {
     const role = (m.role ?? "general").toLowerCase();
     if (provider === "openai") {
