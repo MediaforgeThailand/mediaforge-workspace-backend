@@ -64,10 +64,6 @@ function getElevenLabsKey(): string {
 }
 
 function elevenLabsDubbingWatermark(): boolean {
-  const raw = Deno.env.get("ELEVENLABS_DUBBING_WATERMARK")?.trim().toLowerCase();
-  if (!raw) return false;
-  if (["false", "0", "no", "off"].includes(raw)) return false;
-  if (["true", "1", "yes", "on"].includes(raw)) return true;
   return false;
 }
 

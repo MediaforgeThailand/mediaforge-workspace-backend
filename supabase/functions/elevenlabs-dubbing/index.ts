@@ -63,6 +63,7 @@ type StartBody = {
   output_type?: unknown;
   source_language?: unknown;
   source_content_type?: unknown;
+  source_media_type?: unknown;
   source_name?: unknown;
   speaker_num?: unknown;
   project_id?: unknown;
@@ -111,10 +112,6 @@ function getElevenLabsKey(): string {
 }
 
 function elevenLabsDubbingWatermark(): boolean {
-  const raw = Deno.env.get("ELEVENLABS_DUBBING_WATERMARK")?.trim().toLowerCase();
-  if (!raw) return false;
-  if (["false", "0", "no", "off"].includes(raw)) return false;
-  if (["true", "1", "yes", "on"].includes(raw)) return true;
   return false;
 }
 
@@ -212,12 +209,15 @@ function firstString(...values: unknown[]): string {
   return "";
 }
 
-function outputTypeForMedia(contentType: string, url = ""): "audio" | "video" {
+function outputTypeForMedia(contentType: string, url = "", explicitType = ""): "audio" | "video" {
+  const lowerExplicit = explicitType.trim().toLowerCase();
+  if (lowerExplicit === "audio" || lowerExplicit === "mp3") return "audio";
+  if (lowerExplicit === "video" || lowerExplicit === "mp4") return "video";
   const lowerContentType = contentType.trim().toLowerCase();
   const lowerUrl = url.split(/[?#]/)[0].toLowerCase();
   if (
     lowerContentType.startsWith("audio/") ||
-    /\.(mp3|wav|m4a|aac|flac|ogg)$/i.test(lowerUrl)
+    /\.(mp3|wav|m4a|aac|flac|ogg|oga|opus|weba)$/i.test(lowerUrl)
   ) {
     return "audio";
   }
@@ -381,6 +381,12 @@ function buildDownloadUrl(req: Request, token: string): string {
   return url.toString();
 }
 
+function dubbedDownloadFilename(payload: DownloadTokenPayload): string {
+  const ext = payload.output_type === "video" ? "mp4" : "mp3";
+  const safeId = payload.dubbing_id.replace(/[^a-z0-9_-]+/gi, "").slice(0, 24) || "dubbing";
+  return `mediaforge_translate_${safeId}.${ext}`;
+}
+
 async function updateTranslateJob(args: {
   jobId: string;
   userId: string;
@@ -408,6 +414,7 @@ async function updateTranslateJob(args: {
 async function streamDubbedFile(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const token = url.searchParams.get("token") ?? "";
+  const downloadIntent = url.searchParams.get("download") === "1";
   const payload = await verifyDownloadToken(token);
   const upstreamHeaders: Record<string, string> = {
     "xi-api-key": getElevenLabsKey(),
@@ -424,6 +431,12 @@ async function streamDubbedFile(req: Request): Promise<Response> {
   for (const key of ["content-type", "content-length", "content-range", "accept-ranges"]) {
     const value = upstream.headers.get(key);
     if (value) headers.set(key, value);
+  }
+  if (!headers.has("content-type")) {
+    headers.set("Content-Type", payload.output_type === "video" ? "video/mp4" : "audio/mpeg");
+  }
+  if (downloadIntent) {
+    headers.set("Content-Disposition", `attachment; filename="${dubbedDownloadFilename(payload)}"`);
   }
   headers.set("Cache-Control", "private, max-age=300");
   if (!upstream.ok) {
@@ -466,8 +479,9 @@ serve(async (req) => {
       const sourceLanguage = textValue(start.source_language);
       const sourceLang = sourceLanguage ? languageCode(sourceLanguage, "source") : "auto";
       const sourceContentType = textValue(start.source_content_type);
+      const sourceMediaTypeHint = textValue(start.source_media_type);
       const sourceName = textValue(start.source_name);
-      const sourceMediaType = outputTypeForMedia(sourceContentType, videoUrl);
+      const sourceMediaType = outputTypeForMedia(sourceContentType, videoUrl, sourceMediaTypeHint);
       const outputType = requestedOutputType(start.output_type, sourceMediaType);
       const speakerNum = optionalPositiveInt(start.speaker_num);
       const projectId = textValue(start.project_id);
@@ -719,6 +733,7 @@ serve(async (req) => {
       const sourceMediaType = outputTypeForMedia(
         sourceContentType,
         firstString(jobParams.original_video_url, jobParams.video_url),
+        firstString(jobParams.source_media_type),
       );
       const outputType = requestedOutputType(jobParams.output_type, sourceMediaType);
       const watermark = outputType === "video" ? boolValue(jobParams.watermark, elevenLabsDubbingWatermark()) : false;
