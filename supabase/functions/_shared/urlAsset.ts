@@ -121,6 +121,11 @@ function normalizeExternalSource(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return "";
 
+  const facebookQuery = trimmed.replace(/^[?&]/, "");
+  if (/^(?:fbid=|.*&fbid=)/i.test(facebookQuery)) {
+    return `https://www.facebook.com/photo/?${facebookQuery}`;
+  }
+
   const youtubeQuery = trimmed.replace(/^[?&]/, "");
   if (/^(?:v=|.*&v=)/i.test(youtubeQuery)) {
     const params = new URLSearchParams(youtubeQuery);
