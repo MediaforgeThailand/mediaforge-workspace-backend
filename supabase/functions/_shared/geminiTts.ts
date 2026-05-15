@@ -20,6 +20,11 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  */
 const DEFAULT_GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview";
 const DEFAULT_GEMINI_TTS_VOICE = "Kore";
+const GEMINI_TTS_MAX_TEXT_CHARS = 5000;
+const GEMINI_TTS_CHUNK_MAX_CHARS = 1200;
+const GEMINI_TTS_SAMPLE_RATE = 24000;
+const GEMINI_TTS_CHANNELS = 1;
+const GEMINI_TTS_BITS_PER_SAMPLE = 16;
 const GEMINI_TTS_MODELS = new Set([
   "gemini-3.1-flash-tts-preview",
   "gemini-2.5-flash-preview-tts",
@@ -128,15 +133,67 @@ function pcmToWav(
   return wav;
 }
 
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+function lastSentenceBoundary(text: string, maxChars: number): number {
+  const max = Math.min(text.length - 1, maxChars);
+  for (let i = max; i >= 0; i -= 1) {
+    const ch = text[i];
+    if (ch === "." || ch === "!" || ch === "?") {
+      return i + 1;
+    }
+  }
+  return -1;
+}
+
+function splitTranscriptIntoChunks(text: string, maxChars = GEMINI_TTS_CHUNK_MAX_CHARS): string[] {
+  const cleaned = text.replace(/\r\n/g, "\n").trim();
+  if (cleaned.length <= maxChars) return [cleaned];
+
+  const chunks: string[] = [];
+  let rest = cleaned;
+  const minUsefulCut = Math.max(240, Math.floor(maxChars * 0.45));
+
+  while (rest.length > maxChars) {
+    const window = rest.slice(0, maxChars + 1);
+    const candidates = [
+      window.lastIndexOf("\n\n", maxChars),
+      window.lastIndexOf("\n", maxChars),
+      lastSentenceBoundary(window, maxChars),
+      window.lastIndexOf(" ", maxChars),
+    ].filter((idx) => idx >= minUsefulCut && idx <= maxChars);
+
+    const cut = candidates.length > 0 ? Math.max(...candidates) : maxChars;
+    const chunk = rest.slice(0, cut).trim();
+    if (chunk) chunks.push(chunk);
+    rest = rest.slice(cut).trimStart();
+  }
+
+  const tail = rest.trim();
+  if (tail) chunks.push(tail);
+  return chunks;
+}
+
 function buildGeminiTtsPrompt(text: string, stylePrompt: string): string {
   if (!stylePrompt) return text;
   return [
-    "Voice direction:",
+    "Synthesize speech from the transcript below.",
+    "Apply the voice direction only to delivery. Do not speak the direction.",
+    "Read every word in the transcript exactly once, in order. Do not summarize, skip, translate, add, or remove words.",
+    "",
+    "### VOICE DIRECTION",
     stylePrompt,
     "",
-    "Read only the transcript below. Do not say these instructions.",
-    "",
-    "Transcript:",
+    "### TRANSCRIPT",
     text,
   ].join("\n");
 }
@@ -153,36 +210,27 @@ function extractGeminiTtsAudio(result: Record<string, unknown>): string | null {
   return null;
 }
 
-export async function executeGeminiTts(
-  params: Record<string, unknown>,
-  supabaseClient: ReturnType<typeof createClient>,
-  userId: string,
-): Promise<ProviderResult> {
-  const apiKey = getGeminiTtsApiKey();
-  if (!apiKey) {
-    throw new Error("Gemini TTS not configured - set GEMINI_API_KEY or GOOGLE_AI_STUDIO_KEY in Supabase project secrets.");
-  }
+function extractGeminiTtsFinishReason(result: Record<string, unknown>): string {
+  return (result.candidates as Array<{ finishReason?: string }> | undefined)?.[0]?.finishReason ?? "unknown";
+}
 
-  const text = String(params.prompt ?? params.text ?? "").trim();
-  if (!text) throw new Error("Audio Generation requires a script (prompt).");
-  if (text.length > 5000) {
-    throw new Error("Script too long - max 5,000 characters per audio gen.");
-  }
-
-  const voice = normalizeGeminiTtsVoice(params.voice);
-  const model = normalizeGeminiTtsModel(params.model_name ?? params.model);
-  const stylePrompt = String(params.style_prompt ?? "").trim();
-  const spokenPrompt = buildGeminiTtsPrompt(text, stylePrompt);
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
-  let audioBase64: string | null = null;
-  let lastError = "Gemini returned no audio data.";
+async function synthesizeGeminiTtsChunk(
+  args: {
+    url: string;
+    text: string;
+    stylePrompt: string;
+    voice: string;
+    chunkIndex: number;
+    chunkCount: number;
+  },
+): Promise<{ pcm: Uint8Array; finishReason: string; attempts: number }> {
   const maxAttempts = 3;
+  let lastError = "Gemini returned no audio data.";
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const spokenPrompt = buildGeminiTtsPrompt(args.text, args.stylePrompt);
     const res = await fetchWithAttemptTimeout(
-      url,
+      args.url,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -192,7 +240,7 @@ export async function executeGeminiTts(
             responseModalities: ["AUDIO"],
             speechConfig: {
               voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: voice },
+                prebuiltVoiceConfig: { voiceName: args.voice },
               },
             },
           },
@@ -205,7 +253,9 @@ export async function executeGeminiTts(
     const bodyText = await res.text();
     if (!res.ok) {
       lastError = `Gemini TTS HTTP ${res.status}: ${bodyText.slice(0, 500)}`;
-      console.error(`[gemini-tts] attempt=${attempt} ${lastError}`);
+      console.error(
+        `[gemini-tts] chunk=${args.chunkIndex + 1}/${args.chunkCount} attempt=${attempt} ${lastError}`,
+      );
       if ((res.status === 429 || res.status >= 500) && attempt < maxAttempts) {
         await sleep(1000 * attempt);
         continue;
@@ -225,23 +275,79 @@ export async function executeGeminiTts(
       throw new Error(lastError);
     }
 
-    audioBase64 = extractGeminiTtsAudio(result);
-    if (audioBase64) break;
+    const finishReason = extractGeminiTtsFinishReason(result);
+    const audioBase64 = extractGeminiTtsAudio(result);
+    if (audioBase64) {
+      if (finishReason !== "unknown" && finishReason !== "STOP" && finishReason !== "FINISH_REASON_UNSPECIFIED") {
+        lastError = `Gemini TTS returned incomplete audio (finishReason=${finishReason}).`;
+        console.warn(
+          `[gemini-tts] chunk=${args.chunkIndex + 1}/${args.chunkCount} attempt=${attempt} ${lastError}`,
+        );
+        if (attempt < maxAttempts) {
+          await sleep(1000 * attempt);
+          continue;
+        }
+        throw new Error(`${lastError} Retried ${maxAttempts} times.`);
+      }
+      return { pcm: base64ToBytes(audioBase64), finishReason, attempts: attempt };
+    }
 
-    const finishReason =
-      (result.candidates as Array<{ finishReason?: string }> | undefined)?.[0]?.finishReason ?? "unknown";
     lastError = `Gemini TTS returned no audio data (finishReason=${finishReason}).`;
-    console.warn(`[gemini-tts] attempt=${attempt} ${lastError} body=${bodyText.slice(0, 500)}`);
+    console.warn(
+      `[gemini-tts] chunk=${args.chunkIndex + 1}/${args.chunkCount} attempt=${attempt} ${lastError} body=${bodyText.slice(0, 500)}`,
+    );
     if (attempt < maxAttempts) {
       await sleep(1000 * attempt);
     }
   }
 
-  if (!audioBase64) {
-    throw new Error(`${lastError} Retried ${maxAttempts} times.`);
+  throw new Error(`${lastError} Retried ${maxAttempts} times.`);
+}
+
+export async function executeGeminiTts(
+  params: Record<string, unknown>,
+  supabaseClient: ReturnType<typeof createClient>,
+  userId: string,
+): Promise<ProviderResult> {
+  const apiKey = getGeminiTtsApiKey();
+  if (!apiKey) {
+    throw new Error("Gemini TTS not configured - set GEMINI_API_KEY or GOOGLE_AI_STUDIO_KEY in Supabase project secrets.");
   }
 
-  const wavData = pcmToWav(base64ToBytes(audioBase64), 24000, 1, 16);
+  const text = String(params.prompt ?? params.text ?? "").trim();
+  if (!text) throw new Error("Audio Generation requires a script (prompt).");
+  if (text.length > GEMINI_TTS_MAX_TEXT_CHARS) {
+    throw new Error(`Script too long - max ${GEMINI_TTS_MAX_TEXT_CHARS.toLocaleString()} characters per audio gen.`);
+  }
+
+  const voice = normalizeGeminiTtsVoice(params.voice);
+  const model = normalizeGeminiTtsModel(params.model_name ?? params.model);
+  const stylePrompt = String(params.style_prompt ?? "").trim();
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const chunks = splitTranscriptIntoChunks(text);
+  const pcmChunks: Uint8Array[] = [];
+  const finishReasons: string[] = [];
+  const attemptsByChunk: number[] = [];
+
+  for (let i = 0; i < chunks.length; i += 1) {
+    const chunkResult = await synthesizeGeminiTtsChunk({
+      url,
+      text: chunks[i],
+      stylePrompt,
+      voice,
+      chunkIndex: i,
+      chunkCount: chunks.length,
+    });
+    pcmChunks.push(chunkResult.pcm);
+    finishReasons.push(chunkResult.finishReason);
+    attemptsByChunk.push(chunkResult.attempts);
+  }
+
+  const pcmData = concatBytes(pcmChunks);
+  const wavData = pcmToWav(pcmData, GEMINI_TTS_SAMPLE_RATE, GEMINI_TTS_CHANNELS, GEMINI_TTS_BITS_PER_SAMPLE);
+  const durationSeconds = pcmData.length / (GEMINI_TTS_SAMPLE_RATE * GEMINI_TTS_CHANNELS * (GEMINI_TTS_BITS_PER_SAMPLE / 8));
   const fileName = `${userId}/tts/mediaforge_${Date.now()}_gemini_${model.replace(/[^a-z0-9_-]/gi, "_")}.wav`;
   const { error: uploadErr } = await supabaseClient.storage
     .from("user_assets")
@@ -271,6 +377,11 @@ export async function executeGeminiTts(
       provider: "gemini_tts",
       model,
       text_length: text.length,
+      chunk_count: chunks.length,
+      chunk_lengths: chunks.map((chunk) => chunk.length),
+      chunk_attempts: attemptsByChunk,
+      finish_reasons: finishReasons,
+      duration_seconds: Math.round(durationSeconds * 100) / 100,
       style_prompt: stylePrompt || null,
     },
   });
@@ -283,6 +394,9 @@ export async function executeGeminiTts(
       provider: "gemini_tts",
       voice,
       model,
+      chunk_count: chunks.length,
+      text_length: text.length,
+      duration_seconds: Math.round(durationSeconds * 100) / 100,
       style_prompt: stylePrompt || null,
     },
   };
