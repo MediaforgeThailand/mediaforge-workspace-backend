@@ -27,6 +27,8 @@ import type { ProviderResult } from "./providerResult.ts";
  *     useful diagnostic for billing / safety / quota issues.
  */
 const OPENAI_IMAGE_2_ATTEMPT_TIMEOUT_MS = 145_000;
+const GPT_IMAGE_2_ENHANCE_PROMPT =
+  "Enhance and upscale the provided image while preserving the original composition, subject identity, colors, camera angle, and aspect ratio. Improve sharpness, clarity, texture, and fine detail without adding new objects or changing the scene.";
 
 export async function executeOpenAIImage2(
   params: Record<string, unknown>,
@@ -35,10 +37,14 @@ export async function executeOpenAIImage2(
   const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
   if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not configured");
 
-  const prompt = String(params.prompt ?? "");
+  const requestedModel = String(params.model_name ?? params.model ?? "gpt-image-2");
+  const isEnhanceMode =
+    requestedModel.toLowerCase() === "gpt-image-2-enhance" ||
+    String(params.mode ?? "").toLowerCase() === "enhance";
+  const prompt = String(params.prompt ?? (isEnhanceMode ? GPT_IMAGE_2_ENHANCE_PROMPT : ""));
   if (!prompt) throw new Error("A prompt is required.");
 
-  const model = String(params.model_name ?? params.model ?? "gpt-image-2");
+  const model = isEnhanceMode ? "gpt-image-2" : requestedModel;
   const requestedQuality = String(params.quality ?? "medium").toLowerCase();
   const quality =
     requestedQuality === "low" || requestedQuality === "medium" || requestedQuality === "high"
@@ -117,7 +123,7 @@ export async function executeOpenAIImage2(
     if (loaded === 0) {
       throw new Error("All reference images failed to load");
     }
-    console.log(`[openai-image-2] edit request refs=${loaded}`);
+    console.log(`[openai-image-2] edit request refs=${loaded} mode=${isEnhanceMode ? "enhance" : "edit"}`);
 
     response = await fetchWithAttemptTimeout(
       "https://api.openai.com/v1/images/edits",
@@ -216,6 +222,10 @@ export async function executeOpenAIImage2(
     result_url: publicUrl,
     outputs: { output_image: publicUrl },
     output_type: "image_url" as const,
-    provider_meta: { model },
+    provider_meta: {
+      model,
+      requested_model: requestedModel,
+      mode: isEnhanceMode ? "enhance" : (useEdits ? "edit" : "generate"),
+    },
   };
 }

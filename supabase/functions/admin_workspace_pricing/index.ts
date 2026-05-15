@@ -165,6 +165,31 @@ const GPT_IMAGE_2_ROWS: CreditCostWriteRow[] = ([
   }))
 );
 
+const GPT_IMAGE_2_ENHANCE_ROWS: CreditCostWriteRow[] = ([
+  ["1k", 1024, 1024],
+  ["2k", 2048, 2048],
+  ["4k", 3840, 2160],
+] as const).flatMap(([tier, width, height]) =>
+  (["low", "medium", "high", "auto"] as const).map((quality) => {
+    const billableQuality = quality === "auto" ? "high" : quality;
+    return {
+      feature: "upscale_image",
+      model: `gpt-image-2-enhance:${tier}:${quality}`,
+      label: `GPT Image 2 Enhance ${tier.toUpperCase()} ${QUALITY_LABEL[quality]}`,
+      cost: gptImage2Credits(width, height, billableQuality),
+      pricing_type: "per_operation",
+      provider: "openai",
+      price_key: `gpt-image-2-enhance:${tier}:${quality}`,
+      resolution: tier.toUpperCase(),
+      quality,
+      source: "official_docs",
+      source_url: "https://developers.openai.com/api/docs/guides/image-generation",
+      provider_unit: "per image edit",
+      notes: `OpenAI gpt-image-2 enhancement uses the image edits endpoint. Base credits estimate image output tokens for ${width}x${height} at ${billableQuality} quality; input image/text tokens are not yet metered separately in Workspace.`,
+    };
+  })
+);
+
 const NANO_BANANA_ROWS: CreditCostWriteRow[] = [
   { model: "nano-banana-2", mappedModel: "gemini-3.1-flash-image-preview", label: "Nano Banana 2", prices: { "1k": 0.067, "2k": 0.101, "4k": 0.151 } },
   { model: "nano-banana-pro", mappedModel: "gemini-3-pro-image-preview", label: "Nano Banana Pro", prices: { "1k": 0.134, "2k": 0.134, "4k": 0.24 } },
@@ -389,6 +414,7 @@ const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   ...GPT_IMAGE_2_ROWS,
   ...NANO_BANANA_ROWS,
   ...NANO_BANANA_FALLBACK_ROWS,
+  ...GPT_IMAGE_2_ENHANCE_ROWS,
   ...KLING_ROWS,
   ...KLING_REPLICATE_PARITY_ROWS,
   ...SEEDANCE_ROWS,

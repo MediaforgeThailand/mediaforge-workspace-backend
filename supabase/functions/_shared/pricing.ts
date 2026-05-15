@@ -36,6 +36,7 @@ export type ProviderKey =
   | "merge_audio"
   | "elevenlabs_dubbing"
   | "mp3_input"
+  | "url_asset"
   | "tripo3d"
   | "hyper3d"
   | "google_tts"
@@ -62,6 +63,7 @@ export const NODE_TYPE_REGISTRY: Record<string, ProviderDef> = {
   mergeAudioNode:        { provider: "merge_audio", feature: "merge_audio_video",    output_type: "video_url", is_async: true },
   voiceTranslateNode:    { provider: "elevenlabs_dubbing", feature: "voice_translate", output_type: "audio_url", is_async: true },
   mp3InputNode:          { provider: "mp3_input", feature: "mp3_input",              output_type: "audio_url", is_async: false },
+  urlAssetNode:          { provider: "url_asset", feature: "url_to_asset",           output_type: "image_url", is_async: false },
   audioGenNode:          { provider: "google_tts", feature: "text_to_speech",         output_type: "audio_url", is_async: false },
   imageTo3dNode:         { provider: "tripo3d",    feature: "model_3d",               output_type: "model_3d", is_async: true },
   videoToPromptNode:     { provider: "video_understanding", feature: "video_to_prompt", output_type: "text", is_async: false },
@@ -107,6 +109,24 @@ function openAiImagePriceKeys(params: Record<string, unknown>): string[] {
       `${baseModel}:${tier}:${quality}`,
     ]));
   }
+
+  return Array.from(new Set([
+    `${baseModel}:${size}:${quality}`,
+    `${baseModel}:${tier}:${quality}`,
+    baseModel,
+  ]));
+}
+
+function openAiImageEnhancePriceKeys(params: Record<string, unknown>): string[] {
+  const rawModel = String(params.model_name ?? params.model ?? "gpt-image-2-enhance").toLowerCase();
+  const baseModel = rawModel === "gpt-image-2" ? "gpt-image-2-enhance" : rawModel;
+  const rawQuality = String(params.quality ?? "medium").toLowerCase();
+  const quality = ["low", "medium", "high", "auto"].includes(rawQuality) ? rawQuality : "medium";
+  const rawSize = String(params.size ?? "1024x1024").toLowerCase();
+  const size = rawSize === "auto" ? "1024x1024" : rawSize;
+  const tier = normaliseResolutionTier(size);
+  const exactSku = baseModel.match(/^gpt-image-2-enhance:(1k|2k|4k):(low|medium|high|auto)$/);
+  if (exactSku) return [baseModel];
 
   return Array.from(new Set([
     `${baseModel}:${size}:${quality}`,
@@ -261,7 +281,7 @@ export async function lookupModelDiscountPercent(
   providerDef: ProviderDef,
   params: Record<string, unknown>,
 ): Promise<number> {
-  if (providerDef.provider === "mp3_input") return 0;
+  if (providerDef.provider === "mp3_input" || providerDef.provider === "url_asset") return 0;
 
   if (providerDef.provider === "banana") {
     const model = String(params.model_name ?? params.model ?? DEFAULT_IMAGE_MODEL);
@@ -276,6 +296,9 @@ export async function lookupModelDiscountPercent(
   }
 
   if (providerDef.provider === "openai") {
+    if (providerDef.feature === "upscale_image") {
+      return maxDiscountByModelKeys(supabase, "upscale_image", openAiImageEnhancePriceKeys(params));
+    }
     return maxDiscountByModelKeys(supabase, "generate_openai_image", openAiImagePriceKeys(params));
   }
 
@@ -396,8 +419,15 @@ export async function lookupBaseCost(
 
   /* ── Image (OpenAI gpt-image-2 / DALL-E) ── */
   if (providerDef.provider === "openai") {
-    const keys = openAiImagePriceKeys(params);
-    const match = await firstCostByModelKeys(supabase, "generate_openai_image", keys);
+    const isUpscaleEnhance = providerDef.feature === "upscale_image";
+    const keys = isUpscaleEnhance
+      ? openAiImageEnhancePriceKeys(params)
+      : openAiImagePriceKeys(params);
+    const match = await firstCostByModelKeys(
+      supabase,
+      isUpscaleEnhance ? "upscale_image" : "generate_openai_image",
+      keys,
+    );
 
     if (!match) {
       throw new PricingConfigError(
@@ -503,8 +533,8 @@ export async function lookupBaseCost(
     return data.cost;
   }
 
-  /* ── MP3 Input (pure source — zero cost) ── */
-  if (providerDef.provider === "mp3_input") {
+  /* ── Source/import utilities (zero cost) ── */
+  if (providerDef.provider === "mp3_input" || providerDef.provider === "url_asset") {
     return 0;
   }
 
@@ -853,6 +883,7 @@ function getMultiplierForNode(nodeType: string, featureMultipliers?: FeatureMult
     case "elevenlabs_dubbing": return featureMultipliers.audio ?? 1.0;
     case "video_understanding": return featureMultipliers.chat;
     case "mp3_input": return featureMultipliers.audio ?? DEFAULT_WORKSPACE_MULTIPLIER;
+    case "url_asset": return 1.0;
     default: return DEFAULT_WORKSPACE_MULTIPLIER;
   }
 }

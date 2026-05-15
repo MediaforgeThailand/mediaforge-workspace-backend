@@ -44,7 +44,7 @@ import {
   normalizeVeoOperationName,
   pollVeoOnce,
 } from "../_shared/veo.ts";
-import { extractProviderMediaUrl } from "../_shared/imageUtils.ts";
+import { extractImageDimensions, extractProviderMediaUrl } from "../_shared/imageUtils.ts";
 import {
   canUseReplicate,
   loadMagnificApiKey,
@@ -66,6 +66,7 @@ import {
   MAGNIFIC_VIDEO_UPSCALE_PATH,
 } from "../_shared/magnificUpscale.ts";
 import { executeVideoToPrompt } from "../_shared/videoToPrompt.ts";
+import { executeUrlAsset, validateUrlAssetParams } from "../_shared/urlAsset.ts";
 import { executeGoogleTts } from "../_shared/googleTts.ts";
 import { executeElevenLabsTts } from "../_shared/elevenLabsTts.ts";
 import { executeGeminiTts } from "../_shared/geminiTts.ts";
@@ -160,6 +161,8 @@ function getProviderForNodeType(
 ): string {
   const m = String(modelName ?? "").toLowerCase();
 
+  if (nodeType === "urlAssetNode") return "url_asset";
+
   if (nodeType === "bananaProNode" || nodeType === "imageGenNode") {
     if (m.startsWith("replicate-gpt-image") || m.startsWith("replicate-nano-banana")) return "replicate_image";
     if (m.startsWith("seedream")) return "seedream";
@@ -177,7 +180,10 @@ function getProviderForNodeType(
   if (nodeType === "seedDreamNode") return "seedream";
   if (nodeType === "seedDanceNode") return m.startsWith("replicate-seedance") ? "replicate_video" : "seedance";
   if (nodeType === "removeBackgroundNode") return "remove_bg";
-  if (nodeType === "upscaleImageNode") return "upscale_image";
+  if (nodeType === "upscaleImageNode") {
+    if (m.startsWith("gpt-image-2-enhance") || m === "gpt-image-2") return "openai";
+    return "upscale_image";
+  }
   if (nodeType === "mergeAudioNode") return "merge_audio";
   if (nodeType === "voiceTranslateNode") return "elevenlabs_dubbing";
   if (nodeType === "chatAiNode") return "chat_ai";
@@ -221,6 +227,8 @@ function workspaceProviderDef(
           ? "audio_url"
           : "image_url";
   const feature =
+    p === "openai" && nodeType === "upscaleImageNode" ? "upscale_image" :
+    p === "url_asset" ? "url_to_asset" :
     p === "openai" ? "generate_openai_image" :
     p === "replicate_image" ? "generate_openai_image" :
     p === "seedream" ? "generate_seedream_image" :
@@ -244,9 +252,9 @@ function workspaceProviderDef(
 }
 
 function shouldChargeWorkspaceProvider(provider: string): boolean {
-  // Workspace-run-node owns charging for generation providers. MP3 input is a
-  // utility/upload node and does not call a paid provider.
-  return provider !== "mp3_input";
+  // Workspace-run-node owns charging for generation providers. Input/import
+  // utilities do not call a paid AI provider.
+  return provider !== "mp3_input" && provider !== "url_asset";
 }
 
 function workspaceMultiplierForProvider(
@@ -280,6 +288,8 @@ function workspaceMultiplierForProvider(
     case "elevenlabs_dubbing":
     case "mp3_input":
       return multipliers.audio ?? multipliers.chat;
+    case "url_asset":
+      return 1;
     default:
       return multipliers.chat;
   }
@@ -1286,6 +1296,7 @@ function workspaceJobMaxAttempts(provider: string): number {
   // Sync image calls consume request/compute on every retry because there is no
   // task id to resume. Keep them conservative and hand off to fallback routes
   // instead of letting users stare at a running row for half an hour.
+  if (provider === "url_asset") return 2;
   if (provider === "banana") return 6;
   if (provider === "openai") return 3;
   if (provider === "remove_bg") return 4;
@@ -1861,6 +1872,9 @@ async function pollWorkspaceAsyncResult(args: {
           : { ...currentOutputs, [outputKey]: url };
       const nextProviderMeta = {
         ...providerMeta,
+        ...(pollResp.provider_meta && typeof pollResp.provider_meta === "object"
+          ? (pollResp.provider_meta as Record<string, unknown>)
+          : {}),
         ...(pollResp.model_url ? { model_url: pollResp.model_url } : {}),
         ...(pollResp.preview_image ? { rendered_image: pollResp.preview_image } : {}),
       };
@@ -1975,6 +1989,9 @@ async function pollWorkspaceAsyncResultOnce(args: {
     }
     const nextProviderMeta = {
       ...providerMeta,
+      ...(pollResp.provider_meta && typeof pollResp.provider_meta === "object"
+        ? (pollResp.provider_meta as Record<string, unknown>)
+        : {}),
       ...(pollResp.model_url ? { model_url: pollResp.model_url } : {}),
       ...(pollResp.preview_image ? { rendered_image: pollResp.preview_image } : {}),
     };
@@ -2055,6 +2072,104 @@ function inferAsyncPollProvider(
   if (endpoint.includes("hyper3d")) return "hyper3d";
   if (endpoint.includes("tripo3d")) return "tripo3d";
   return "kling";
+}
+
+function collectProviderMediaUrls(value: unknown, out: string[] = []): string[] {
+  if (typeof value === "string") {
+    if (/^https:\/\//i.test(value)) out.push(value);
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectProviderMediaUrls(item, out);
+    return out;
+  }
+  if (value && typeof value === "object") {
+    const row = value as Record<string, unknown>;
+    const preferredKeys = ["url", "image", "image_url", "output", "download_url"];
+    const seenPreferred = new Set(preferredKeys);
+    for (const key of preferredKeys) collectProviderMediaUrls(row[key], out);
+    for (const [key, nested] of Object.entries(row)) {
+      if (!seenPreferred.has(key)) collectProviderMediaUrls(nested, out);
+    }
+  }
+  return out;
+}
+
+function uniqueProviderMediaUrls(values: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    unique.push(trimmed);
+  }
+  return unique;
+}
+
+async function probeRemoteImageDimensions(url: string): Promise<{ width: number; height: number } | null> {
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { Range: "bytes=0-65535" },
+    });
+    if (!res.ok) return null;
+    const reader = res.body?.getReader();
+    if (!reader) return null;
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    const maxBytes = 65_536;
+    while (total < maxBytes) {
+      const { value, done } = await reader.read();
+      if (done || !value) break;
+      const remaining = maxBytes - total;
+      const chunk = value.byteLength > remaining ? value.slice(0, remaining) : value;
+      chunks.push(chunk);
+      total += chunk.byteLength;
+      if (value.byteLength > remaining) break;
+    }
+    await reader.cancel().catch(() => {});
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return extractImageDimensions(bytes);
+  } catch (err) {
+    console.warn("[magnific_upscale] dimension probe failed:", err);
+    return null;
+  }
+}
+
+async function chooseLargestImageCandidate(
+  candidates: string[],
+): Promise<{
+  url: string;
+  index: number;
+  width?: number;
+  height?: number;
+}> {
+  const fallbackIndex = Math.max(0, candidates.length - 1);
+  let best: {
+    url: string;
+    index: number;
+    width?: number;
+    height?: number;
+  } = { url: candidates[fallbackIndex] ?? "", index: fallbackIndex };
+  let bestArea = -1;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const dims = await probeRemoteImageDimensions(candidates[i]);
+    if (!dims) continue;
+    const area = dims.width * dims.height;
+    if (area > bestArea) {
+      bestArea = area;
+      best = { url: candidates[i], index: i, width: dims.width, height: dims.height };
+    }
+  }
+
+  return best;
 }
 
 function workspaceJobDeadlineMs(job: WorkspaceJobRow): number {
@@ -3557,6 +3672,17 @@ serve(async (req) => {
           );
         }
       }
+      if (provider === "url_asset") {
+        try {
+          validateUrlAssetParams(runRequest.params as Record<string, unknown>);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return new Response(
+            JSON.stringify({ error: msg }),
+            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+      }
       let jobCharge: WorkspaceCreditCharge | null = null;
       try {
         jobCharge = await consumeWorkspaceCredits({
@@ -4655,7 +4781,18 @@ serve(async (req) => {
         : Array.isArray(payload.generated)
           ? payload.generated
           : [];
+      const providerCandidates = uniqueProviderMediaUrls([
+        ...collectProviderMediaUrls(generated),
+        ...collectProviderMediaUrls(data),
+        ...collectProviderMediaUrls(payload),
+      ]);
+      const selectedCandidate = providerCandidates.length === 0
+        ? null
+        : isVideoUpscale
+          ? { url: providerCandidates[0], index: 0 }
+          : await chooseLargestImageCandidate(providerCandidates);
       const providerMediaUrl =
+        selectedCandidate?.url ||
         extractProviderMediaUrl(generated) ||
         extractProviderMediaUrl(data) ||
         extractProviderMediaUrl(payload);
@@ -4710,6 +4847,16 @@ serve(async (req) => {
           type: isVideoUpscale ? "video" : "image",
           output_type: isVideoUpscale ? "video_url" : "image_url",
           url: publicUrl,
+          provider_meta: {
+            candidate_count: providerCandidates.length,
+            selected_candidate_index: selectedCandidate?.index ?? null,
+            ...(selectedCandidate?.width && selectedCandidate?.height
+              ? {
+                  selected_width: selectedCandidate.width,
+                  selected_height: selectedCandidate.height,
+                }
+              : {}),
+          },
           message: normalised === "failed" ? errorMessage || "Magnific upscale task failed" : rawStatus,
         }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
@@ -5493,6 +5640,13 @@ serve(async (req) => {
         break;
       case "video_understanding":
         result = await executeVideoToPrompt(params);
+        break;
+      case "url_asset":
+        result = await executeUrlAsset(params, supabase, user.id, {
+          projectId: body.project_id ?? null,
+          workspaceId: body.workspace_id ?? null,
+          canvasId: body.canvas_id ?? null,
+        });
         break;
       case "tripo3d":
         result = await executeTripo3D(params);

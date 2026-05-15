@@ -176,7 +176,11 @@ export async function executeMagnificUpscale(
   const defaults = IMAGE_PRESET_DEFAULTS[preset];
   const body = {
     image,
-    scale_factor: intParam(params.scale_factor ?? params.scale, 2, 16, 2),
+    // Live task audit on 2026-05-15 showed Precision V2 returning a
+    // single 2x output even for submitted scale_factor=8. Clamp the
+    // request to the verified behavior so logs/pricing don't imply a
+    // higher multiplier until Magnific confirms the API behavior.
+    scale_factor: 2,
     flavor: flavorParam(params.flavor ?? defaults.flavor),
     sharpen: intParam(params.sharpen, 0, 100, defaults.sharpen),
     smart_grain: intParam(params.smart_grain, 0, 100, defaults.smart_grain),
