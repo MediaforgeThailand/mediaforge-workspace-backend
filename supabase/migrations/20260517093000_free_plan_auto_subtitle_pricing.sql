@@ -105,8 +105,8 @@ insert into public.credit_costs (
   'media',
   'word-timestamps',
   'official_docs_estimate',
-  'https://openai.com/api/pricing/',
+  'https://developers.openai.com/api/docs/models/gpt-4o-transcribe',
   'per source minute',
-  'Conservative per-minute floor for Auto Subtitle: captions-transcribe calls gpt-4o-transcribe for text, whisper-1 for timing, and a short GPT normalizer. Runtime bills by source media duration.',
+  'Conservative per-minute floor: 0.04 USD/min converted at 35 THB/USD and 50 Workspace credits/THB = 70 credits/min. captions-transcribe calls gpt-4o-transcribe for text, whisper-1 for timing, and a short GPT normalizer; runtime bills by source media duration.',
   0
 );

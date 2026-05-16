@@ -765,7 +765,27 @@ Deno.serve(async (req) => {
       }
 
       case "upsert_credit_cost": {
-        const { id, feature, model, label, cost, pricing_type, duration_seconds, has_audio, admin_user_email } = payload ?? {};
+        const {
+          id,
+          feature,
+          model,
+          label,
+          cost,
+          pricing_type,
+          duration_seconds,
+          has_audio,
+          provider,
+          price_key,
+          resolution,
+          quality,
+          source,
+          source_url,
+          source_ratio,
+          provider_unit,
+          notes,
+          discount_percent,
+          admin_user_email,
+        } = payload ?? {};
         if (!feature || !label || cost == null) throw new Error("feature, label, cost required");
         const row = {
           feature,
@@ -773,8 +793,18 @@ Deno.serve(async (req) => {
           label,
           cost: Number(cost),
           pricing_type: pricing_type || "per_operation",
-          duration_seconds: feature === "generate_freepik_video" ? (duration_seconds ?? null) : null,
-          has_audio: feature === "generate_freepik_video" ? (has_audio ?? false) : false,
+          duration_seconds: duration_seconds ?? null,
+          has_audio: has_audio ?? false,
+          provider: provider ?? null,
+          price_key: price_key ?? null,
+          resolution: resolution ?? null,
+          quality: quality ?? null,
+          source: source ?? null,
+          source_url: source_url ?? null,
+          source_ratio: source_ratio ?? null,
+          provider_unit: provider_unit ?? null,
+          notes: notes ?? null,
+          discount_percent: discount_percent ?? 0,
         };
         let savedId = id ?? null;
         if (id) {

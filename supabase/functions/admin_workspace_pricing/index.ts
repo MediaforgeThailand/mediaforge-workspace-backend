@@ -423,10 +423,10 @@ const AUTO_SUBTITLE_ROWS: CreditCostWriteRow[] = [
     resolution: "media",
     quality: "word-timestamps",
     source: "official_docs_estimate",
-    source_url: "https://openai.com/api/pricing/",
+    source_url: "https://developers.openai.com/api/docs/models/gpt-4o-transcribe",
     provider_unit: "per source minute",
     notes:
-      "Conservative per-minute floor for Auto Subtitle: captions-transcribe calls gpt-4o-transcribe for text, whisper-1 for timing, and a short GPT normalizer. Runtime bills by source media duration.",
+      "Conservative per-minute floor: 0.04 USD/min converted at 35 THB/USD and 50 Workspace credits/THB = 70 credits/min. captions-transcribe calls gpt-4o-transcribe for text, whisper-1 for timing, and a short GPT normalizer; runtime bills by source media duration.",
   },
 ];
 

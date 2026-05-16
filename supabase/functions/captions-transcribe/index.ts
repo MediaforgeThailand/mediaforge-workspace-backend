@@ -79,6 +79,18 @@ interface TranscriptNormalizerResult {
 
 type SegmentationMode = "sentence" | "words";
 
+const AUTO_SUBTITLE_DOMAIN_RAG = {
+  standaloneCuePrefixes: ["Motion Control"],
+  protectedThaiCompounds: [
+    "ภาพนิ่ง",
+    "คาแรกเตอร์",
+    "แอ็กชั่น",
+    "แอคชั่น",
+    "ออกมา",
+    "อากาศดีมาก",
+  ],
+};
+
 class OpenAIHttpError extends Error {
   status: number;
   details: unknown;
@@ -363,12 +375,19 @@ async function normalizeTranscriptWithGPT({
     ]
     : [];
 
+  const domainRagInstructions = [
+    `Known MediaForge feature names: ${AUTO_SUBTITLE_DOMAIN_RAG.standaloneCuePrefixes.join(", ")}.`,
+    "If Motion Control opens a Thai utterance as a feature/title label, make it its own cue before the Thai explanation.",
+    `Protected Thai compounds: ${AUTO_SUBTITLE_DOMAIN_RAG.protectedThaiCompounds.join(", ")}.`,
+    "Never split protected Thai compounds across cues. For example, keep \"ช่วยเปลี่ยนภาพนิ่ง\" together instead of ending one cue with \"ภาพ\" and starting the next cue with \"นิ่ง\".",
+  ];
+
   const thaiContextInstructions =
     textLooksThai(text) || languageLooksThai(language) ||
       languageLooksThai(requestedLanguage)
       ? [
         "Thai subtitle context: Thai speech often code-switches with English loanwords. Treat English loanwords as part of the Thai phrase around them.",
-        "When an English term starts a Thai clause, keep it with the following Thai predicate, for example \"AI ก็จะถ่ายทอด\" instead of splitting \"AI\" and \"ก็จะถ่ายทอด\".",
+        "When an English term starts a Thai clause, keep it with the following Thai predicate, for example \"AI ก็จะถ่ายทอด\" instead of splitting \"AI\" and \"ก็จะถ่ายทอด\", unless it is a known feature/title label such as Motion Control.",
         "Do not create standalone cues from Thai particles, auxiliaries, or connectors such as ก็, จะ, ได้, ให้, และ, ของ, จาก, ใน, ที่, เป็น.",
         "Keep Thai meaning units together: subject with predicate, verb phrase with object, and modifier phrase with the noun or action it modifies.",
         "For a phrase like \"AI ก็จะถ่ายทอดท่าทาง จังหวะ และแอ็กชั่น\", prefer cues like [\"AI ก็จะถ่ายทอด\", \"ท่าทาง จังหวะ และแอ็กชั่น\"], not [\"AI\", \"ก็จะถ่ายทอด\", \"ท่าทาง\"].",
@@ -384,6 +403,7 @@ async function normalizeTranscriptWithGPT({
     "Every English/code-switched ASCII token from the transcript must remain in the normalized text and one cue. Do not transliterate or omit these tokens.",
     "Create subtitle cues as single-line readable chunks in spoken order.",
     ...preserveTermInstructions,
+    ...domainRagInstructions,
     ...thaiContextInstructions,
     ...cueInstructions,
     "Do not split Thai compound words, loanwords, product names, or English terms across cues.",
