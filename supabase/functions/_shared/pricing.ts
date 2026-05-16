@@ -35,6 +35,7 @@ export type ProviderKey =
   | "upscale_image"
   | "merge_audio"
   | "elevenlabs_dubbing"
+  | "auto_subtitle"
   | "mp3_input"
   | "url_asset"
   | "tripo3d"
@@ -62,6 +63,7 @@ export const NODE_TYPE_REGISTRY: Record<string, ProviderDef> = {
   upscaleImageNode:      { provider: "upscale_image", feature: "upscale_image",      output_type: "image_url", is_async: true },
   mergeAudioNode:        { provider: "merge_audio", feature: "merge_audio_video",    output_type: "video_url", is_async: true },
   voiceTranslateNode:    { provider: "elevenlabs_dubbing", feature: "voice_translate", output_type: "audio_url", is_async: true },
+  autoSubtitleNode:      { provider: "auto_subtitle", feature: "auto_subtitle", output_type: "video_url", is_async: true },
   mp3InputNode:          { provider: "mp3_input", feature: "mp3_input",              output_type: "audio_url", is_async: false },
   urlAssetNode:          { provider: "url_asset", feature: "url_to_asset",           output_type: "image_url", is_async: false },
   audioGenNode:          { provider: "google_tts", feature: "text_to_speech",         output_type: "audio_url", is_async: false },
@@ -224,6 +226,11 @@ function voiceTranslateModelPriceKeys(rawModel: unknown): string[] {
   return Array.from(new Set([model, "elevenlabs-dubbing-voice-clone"]));
 }
 
+function autoSubtitleModelPriceKeys(rawModel: unknown): string[] {
+  const model = String(rawModel ?? "").trim() || "auto-suptitle-whisper";
+  return Array.from(new Set([model, "auto-suptitle-whisper"]));
+}
+
 async function firstCostByModelKeys(
   supabase: ReturnType<typeof createClient>,
   feature: string,
@@ -328,6 +335,11 @@ export async function lookupModelDiscountPercent(
   if (providerDef.provider === "elevenlabs_dubbing") {
     const model = String(params.model_name ?? params.model ?? "elevenlabs-dubbing-voice-clone");
     return maxDiscountByModelKeys(supabase, "voice_translate", voiceTranslateModelPriceKeys(model));
+  }
+
+  if (providerDef.provider === "auto_subtitle") {
+    const model = String(params.model_name ?? params.model ?? "auto-suptitle-whisper");
+    return maxDiscountByModelKeys(supabase, "auto_subtitle", autoSubtitleModelPriceKeys(model));
   }
 
   if (providerDef.provider === "video_understanding") {
@@ -502,6 +514,28 @@ export async function lookupBaseCost(
     if (!data) {
       throw new PricingConfigError(
         `Pricing configuration missing for voice translate model: ${model}`
+      );
+    }
+    const secondsRaw =
+      Number(params.source_duration_seconds ?? params.duration_seconds ?? params.duration ?? 60);
+    const seconds = Math.max(1, Math.ceil(Number.isFinite(secondsRaw) ? secondsRaw : 60));
+    if (data.pricing_type === "per_second") {
+      return Math.max(1, Math.ceil(data.cost * seconds));
+    }
+    if (data.pricing_type === "per_minute") {
+      return Math.max(1, Math.ceil((data.cost * seconds) / 60));
+    }
+    return data.cost;
+  }
+
+  /* Auto Subtitle (OpenAI transcription + browser render) */
+  if (providerDef.provider === "auto_subtitle") {
+    const model = String(params.model_name ?? params.model ?? "auto-suptitle-whisper");
+    const data = await firstCostByModelKeys(supabase, "auto_subtitle", autoSubtitleModelPriceKeys(model));
+
+    if (!data) {
+      throw new PricingConfigError(
+        `Pricing configuration missing for auto subtitle model: ${model}`
       );
     }
     const secondsRaw =
@@ -881,6 +915,7 @@ function getMultiplierForNode(nodeType: string, featureMultipliers?: FeatureMult
     case "gemini_tts": return featureMultipliers.audio ?? 1.0;
     case "elevenlabs_tts": return featureMultipliers.audio ?? 1.0;
     case "elevenlabs_dubbing": return featureMultipliers.audio ?? 1.0;
+    case "auto_subtitle": return featureMultipliers.audio ?? DEFAULT_WORKSPACE_MULTIPLIER;
     case "video_understanding": return featureMultipliers.chat;
     case "mp3_input": return featureMultipliers.audio ?? DEFAULT_WORKSPACE_MULTIPLIER;
     case "url_asset": return 1.0;

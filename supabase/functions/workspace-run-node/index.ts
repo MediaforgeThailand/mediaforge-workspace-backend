@@ -186,6 +186,7 @@ function getProviderForNodeType(
   }
   if (nodeType === "mergeAudioNode") return "merge_audio";
   if (nodeType === "voiceTranslateNode") return "elevenlabs_dubbing";
+  if (nodeType === "autoSubtitleNode") return "auto_subtitle";
   if (nodeType === "chatAiNode") return "chat_ai";
   if (nodeType === "videoToPromptNode") return "video_understanding";
   // 3D nodes: Hyper3D rides BytePlus ModelArk; Tripo3D is its own API.
@@ -216,7 +217,7 @@ function workspaceProviderDef(
 ): ProviderDef {
   const p = provider as ProviderKey;
   const output: ProviderDef["output_type"] =
-    p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "merge_audio" || p === "elevenlabs_dubbing"
+    p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "merge_audio" || p === "elevenlabs_dubbing" || p === "auto_subtitle"
       ? "video_url"
       : p === "tripo3d" || p === "hyper3d"
         ? "model_3d"
@@ -238,6 +239,7 @@ function workspaceProviderDef(
     p === "upscale_image" ? "upscale_image" :
     p === "merge_audio" ? "merge_audio_video" :
     p === "elevenlabs_dubbing" ? "voice_translate" :
+    p === "auto_subtitle" ? "auto_subtitle" :
     p === "chat_ai" ? "chat_ai" :
     p === "tripo3d" || p === "hyper3d" ? "model_3d" :
     p === "google_tts" || p === "gemini_tts" || p === "elevenlabs_tts" ? "text_to_speech" :
@@ -247,7 +249,7 @@ function workspaceProviderDef(
     provider: p,
     feature,
     output_type: output,
-    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "replicate_image" || p === "upscale_image" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio" || p === "elevenlabs_dubbing",
+    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "replicate_image" || p === "upscale_image" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio" || p === "elevenlabs_dubbing" || p === "auto_subtitle",
   };
 }
 
@@ -286,6 +288,7 @@ function workspaceMultiplierForProvider(
     case "gemini_tts":
     case "elevenlabs_tts":
     case "elevenlabs_dubbing":
+    case "auto_subtitle":
     case "mp3_input":
       return multipliers.audio ?? multipliers.chat;
     case "url_asset":
@@ -320,6 +323,14 @@ const DEFAULT_EDUCATION_BLOCKED_MODELS = [
   "dreamina-seedance-2-0-260128",
   "dreamina-seedance-2-0-fast-260128",
 ];
+const FREE_PLAN_MONTHLY_CREDITS = 1000;
+const FREE_PLAN_BLOCKED_NODE_TYPES = new Set([
+  "bananaProNode",
+  "imageGenNode",
+  "klingVideoNode",
+  "videoGenNode",
+  "upscaleImageNode",
+]);
 
 type WorkspaceCreditOwner =
   | {
@@ -2074,6 +2085,198 @@ function inferAsyncPollProvider(
   return "kling";
 }
 
+async function assertWorkspacePlanAllowsNode(args: {
+  supabase: ReturnType<typeof createClient>;
+  userId: string;
+  nodeType: string;
+}): Promise<void> {
+  if (!FREE_PLAN_BLOCKED_NODE_TYPES.has(args.nodeType)) return;
+
+  const { data: profile, error } = await args.supabase
+    .from("profiles")
+    .select("subscription_status, subscription_plan_id, current_plan_id")
+    .eq("user_id", args.userId)
+    .maybeSingle();
+  if (error) {
+    console.warn("[workspace-plan] profile lookup skipped:", error.message);
+    return;
+  }
+
+  const subscriptionStatus = String((profile as any)?.subscription_status ?? "").toLowerCase();
+  const planId =
+    typeof (profile as any)?.subscription_plan_id === "string"
+      ? String((profile as any).subscription_plan_id)
+      : typeof (profile as any)?.current_plan_id === "string"
+        ? String((profile as any).current_plan_id)
+        : null;
+
+  let planName = "";
+  if (planId) {
+    const { data: plan } = await args.supabase
+      .from("subscription_plans")
+      .select("name")
+      .eq("id", planId)
+      .maybeSingle();
+    planName = String((plan as any)?.name ?? "").toLowerCase();
+  }
+
+  const isFreePlan =
+    planName
+      ? planName === "free"
+      : !planId && subscriptionStatus === "free";
+  if (!isFreePlan) return;
+
+  throw new Error(
+    "FEATURE_LOCKED_FREE_PLAN: Image generation, video generation, and upscale require Starter or higher.",
+  );
+}
+
+function addOneMonth(date: Date): Date {
+  const next = new Date(date);
+  next.setMonth(next.getMonth() + 1);
+  return next;
+}
+
+async function ensureFreeMonthlyCredits(args: {
+  supabase: ReturnType<typeof createClient>;
+  userId: string;
+}): Promise<void> {
+  const { data: profile, error: profileError } = await args.supabase
+    .from("profiles")
+    .select("subscription_status, subscription_plan_id, current_plan_id, current_period_end")
+    .eq("user_id", args.userId)
+    .maybeSingle();
+  if (profileError) {
+    console.warn("[workspace-plan] free credit profile lookup skipped:", profileError.message);
+    return;
+  }
+
+  const subscriptionStatus = String((profile as any)?.subscription_status ?? "free").toLowerCase();
+  const planId =
+    typeof (profile as any)?.subscription_plan_id === "string"
+      ? String((profile as any).subscription_plan_id)
+      : typeof (profile as any)?.current_plan_id === "string"
+        ? String((profile as any).current_plan_id)
+        : null;
+  const currentPeriodEnd = (profile as any)?.current_period_end
+    ? new Date(String((profile as any).current_period_end))
+    : null;
+
+  let planName = "";
+  if (planId) {
+    const { data: plan } = await args.supabase
+      .from("subscription_plans")
+      .select("name")
+      .eq("id", planId)
+      .maybeSingle();
+    planName = String((plan as any)?.name ?? "").toLowerCase();
+  }
+
+  const isFreePlan = planName
+    ? planName === "free"
+    : !planId && subscriptionStatus === "free";
+  if (!isFreePlan) return;
+
+  const now = new Date();
+  if (currentPeriodEnd && Number.isFinite(currentPeriodEnd.getTime()) && currentPeriodEnd > now) return;
+
+  const periodEnd = addOneMonth(now);
+  const { data: oldFreeBatches, error: batchReadError } = await args.supabase
+    .from("credit_batches")
+    .select("id, remaining")
+    .eq("user_id", args.userId)
+    .eq("source_type", "free_plan")
+    .gt("remaining", 0);
+  if (batchReadError) {
+    console.warn("[workspace-plan] free credit batch lookup skipped:", batchReadError.message);
+    return;
+  }
+
+  const oldFreeRemaining = (oldFreeBatches ?? []).reduce(
+    (sum: number, row: any) => sum + Math.max(0, Math.floor(Number(row.remaining ?? 0))),
+    0,
+  );
+  const ids = (oldFreeBatches ?? []).map((row: any) => row.id).filter(Boolean);
+  if (ids.length > 0) {
+    const { error: clearError } = await args.supabase
+      .from("credit_batches")
+      .update({ remaining: 0 })
+      .in("id", ids);
+    if (clearError) {
+      console.warn("[workspace-plan] free credit reset skipped:", clearError.message);
+      return;
+    }
+  }
+
+  const { data: creditRow, error: creditReadError } = await args.supabase
+    .from("user_credits")
+    .select("balance,total_purchased")
+    .eq("user_id", args.userId)
+    .maybeSingle();
+  if (creditReadError) {
+    console.warn("[workspace-plan] free credit balance lookup skipped:", creditReadError.message);
+    return;
+  }
+
+  const currentBalance = Math.max(0, Math.floor(Number((creditRow as any)?.balance ?? 0)));
+  const newBalance = Math.max(0, currentBalance - oldFreeRemaining) + FREE_PLAN_MONTHLY_CREDITS;
+  const newTotalPurchased =
+    Math.max(0, Math.floor(Number((creditRow as any)?.total_purchased ?? 0))) + FREE_PLAN_MONTHLY_CREDITS;
+
+  const { error: creditError } = await args.supabase
+    .from("user_credits")
+    .upsert({
+      user_id: args.userId,
+      balance: newBalance,
+      total_purchased: newTotalPurchased,
+      updated_at: now.toISOString(),
+    }, { onConflict: "user_id" });
+  if (creditError) {
+    console.warn("[workspace-plan] free credit upsert skipped:", creditError.message);
+    return;
+  }
+
+  const referenceId = `free-plan-${now.toISOString().slice(0, 10)}`;
+  await args.supabase.from("credit_batches").insert({
+    user_id: args.userId,
+    amount: FREE_PLAN_MONTHLY_CREDITS,
+    remaining: FREE_PLAN_MONTHLY_CREDITS,
+    source_type: "free_plan",
+    reference_id: referenceId,
+    expires_at: periodEnd.toISOString(),
+  });
+  await args.supabase.from("credit_transactions").insert({
+    user_id: args.userId,
+    amount: FREE_PLAN_MONTHLY_CREDITS,
+    type: "subscription_grant",
+    feature: "free_plan",
+    description: "Free plan monthly credits",
+    reference_id: referenceId,
+    balance_after: newBalance,
+  });
+
+  const { data: freePlan } = await args.supabase
+    .from("subscription_plans")
+    .select("id")
+    .eq("name", "Free")
+    .eq("target", "user")
+    .eq("billing_cycle", "monthly")
+    .maybeSingle();
+  const profileUpdate: Record<string, unknown> = {
+    subscription_status: "free",
+    current_period_start: now.toISOString(),
+    current_period_end: periodEnd.toISOString(),
+  };
+  if ((freePlan as any)?.id) {
+    profileUpdate.subscription_plan_id = String((freePlan as any).id);
+    profileUpdate.current_plan_id = String((freePlan as any).id);
+  }
+  await args.supabase
+    .from("profiles")
+    .update(profileUpdate)
+    .eq("user_id", args.userId);
+}
+
 function collectProviderMediaUrls(value: unknown, out: string[] = []): string[] {
   if (typeof value === "string") {
     if (/^https:\/\//i.test(value)) out.push(value);
@@ -3641,6 +3844,23 @@ serve(async (req) => {
       // Tier-2 follow-ups list.
 
       const { action: _action, job_id: _jobId, ...runRequest } = body;
+      try {
+        await assertWorkspacePlanAllowsNode({
+          supabase,
+          userId: user.id,
+          nodeType,
+        });
+        await ensureFreeMonthlyCredits({
+          supabase,
+          userId: user.id,
+        });
+      } catch (planErr) {
+        const msg = planErr instanceof Error ? planErr.message : String(planErr);
+        return new Response(
+          JSON.stringify({ error: msg }),
+          { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
       const normalizedReplicateModel = normalizeDirectReplicateModelForPrimary(runRequest);
       if (normalizedReplicateModel) {
         console.warn(
@@ -5598,6 +5818,11 @@ serve(async (req) => {
 
     /* ─── Dispatch ────────────────────────────────────────── */
     enforcePrimaryProviderParams(provider, params);
+
+    await ensureFreeMonthlyCredits({
+      supabase,
+      userId: user.id,
+    });
 
     activeCreditCharge = await consumeWorkspaceCredits({
       supabase,

@@ -67,6 +67,7 @@ const WORKSPACE_CREDITS_PER_THB = 50;
 const FLOW_TO_WORKSPACE_RATIO = WORKSPACE_CREDITS_PER_THB / FLOW_CREDITS_PER_THB;
 const REPLICATE_PRICE_FACTOR = 1;
 const TEAM_ENTERPRISE_CREDIT_DISCOUNT_PERCENT = 20;
+const FREE_PLAN_MONTHLY_CREDITS = 1000;
 type CreditCostWriteRow = {
   feature: string;
   model: string | null;
@@ -410,6 +411,25 @@ const ELEVENLABS_DUBBING_ROWS: CreditCostWriteRow[] = [
   },
 ];
 
+const AUTO_SUBTITLE_ROWS: CreditCostWriteRow[] = [
+  {
+    feature: "auto_subtitle",
+    model: "auto-suptitle-whisper",
+    label: "Auto Subtitle (OpenAI transcription + render) / min",
+    cost: creditsFromUsd(0.04),
+    pricing_type: "per_minute",
+    provider: "openai",
+    price_key: "gpt-4o-transcribe+whisper-1+gpt-normalize",
+    resolution: "media",
+    quality: "word-timestamps",
+    source: "official_docs_estimate",
+    source_url: "https://openai.com/api/pricing/",
+    provider_unit: "per source minute",
+    notes:
+      "Conservative per-minute floor for Auto Subtitle: captions-transcribe calls gpt-4o-transcribe for text, whisper-1 for timing, and a short GPT normalizer. Runtime bills by source media duration.",
+  },
+];
+
 const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   ...GPT_IMAGE_2_ROWS,
   ...NANO_BANANA_ROWS,
@@ -431,6 +451,7 @@ const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   { feature: "text_to_speech", model: "gemini-2.5-pro-preview-tts", label: "Gemini 2.5 Pro Preview TTS / 1K chars", cost: 100, pricing_type: "per_1k_chars", provider: "google", price_key: "gemini-2.5-pro-preview-tts", source: "official_docs_estimate", source_url: "https://ai.google.dev/gemini-api/docs/pricing", provider_unit: "per 1K chars", notes: "Emergency estimate. Gemini Pro Preview TTS output audio is more expensive than Flash; runtime bills by text length, so use a conservative per-1K-character floor until audio-token metering is implemented." },
   ...ELEVENLABS_TTS_ROWS,
   ...ELEVENLABS_DUBBING_ROWS,
+  ...AUTO_SUBTITLE_ROWS,
   { feature: "text_to_speech", model: "google-tts-studio", label: "Google Cloud TTS Studio / 1K chars", cost: 280, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-studio", quality: "studio", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
   { feature: "text_to_speech", model: "google-tts-neural2", label: "Google Cloud TTS Neural2 / 1K chars", cost: 28, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-neural2", quality: "neural2", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
   { feature: "text_to_speech", model: "google-tts-wavenet", label: "Google Cloud TTS WaveNet / 1K chars", cost: 7, pricing_type: "per_1k_chars", provider: "google", price_key: "google-tts-wavenet", quality: "wavenet", source: "official_docs", source_url: "https://cloud.google.com/text-to-speech/pricing", provider_unit: "per 1K chars" },
@@ -498,6 +519,188 @@ async function listRows(
   const { data, error } = await q;
   if (error) throw new Error(`${table} read failed: ${error.message}`);
   return { data: data ?? [] };
+}
+
+async function ensureWorkspaceFreePlan(client: SupabaseClient): Promise<{ data: { id: string | null } }> {
+  const payload = {
+    name: "Free",
+    target: "user",
+    billing_cycle: "monthly",
+    price_thb: 0,
+    upfront_credits: 1000,
+    flow_quota: null,
+    discount_official: 0,
+    discount_community: 0,
+    is_active: true,
+    sort_order: 0,
+    stripe_price_id: null,
+    stripe_price_id_monthly: null,
+    stripe_price_id_annual: null,
+    annual_price_thb: 0,
+    annual_credits: 12000,
+    credit_discount_percent: 0,
+    generator_quota: 1,
+    generator_quota_label: "1 generator engine",
+    is_featured: false,
+  };
+
+  const { data: existing, error: readError } = await client
+    .from("subscription_plans")
+    .select("id")
+    .eq("name", "Free")
+    .eq("target", "user")
+    .eq("billing_cycle", "monthly")
+    .limit(1)
+    .maybeSingle();
+  if (readError) throw new Error(`subscription_plans read failed: ${readError.message}`);
+
+  if (existing?.id) {
+    const { error } = await client
+      .from("subscription_plans")
+      .update(payload)
+      .eq("id", existing.id);
+    if (error) throw new Error(`subscription_plans update failed: ${error.message}`);
+    return { data: { id: String(existing.id) } };
+  }
+
+  const { data, error } = await client
+    .from("subscription_plans")
+    .insert(payload)
+    .select("id")
+    .single();
+  if (error) throw new Error(`subscription_plans insert failed: ${error.message}`);
+  return { data: { id: data?.id ? String(data.id) : null } };
+}
+
+function addOneMonth(date: Date): Date {
+  const next = new Date(date);
+  next.setMonth(next.getMonth() + 1);
+  return next;
+}
+
+async function ensureFreeMonthlyCredits(
+  client: SupabaseClient,
+  userId: string,
+): Promise<void> {
+  const { data: profile, error: profileError } = await client
+    .from("profiles")
+    .select("subscription_status, subscription_plan_id, current_plan_id, current_period_end")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (profileError) throw new Error(`profiles read failed: ${profileError.message}`);
+
+  const subscriptionStatus = String((profile as any)?.subscription_status ?? "free").toLowerCase();
+  const currentPeriodEnd = (profile as any)?.current_period_end
+    ? new Date(String((profile as any).current_period_end))
+    : null;
+  const planId = typeof (profile as any)?.subscription_plan_id === "string"
+    ? String((profile as any).subscription_plan_id)
+    : typeof (profile as any)?.current_plan_id === "string"
+      ? String((profile as any).current_plan_id)
+      : null;
+
+  let planName = "";
+  if (planId) {
+    const { data: plan } = await client
+      .from("subscription_plans")
+      .select("name")
+      .eq("id", planId)
+      .maybeSingle();
+    planName = String((plan as any)?.name ?? "").toLowerCase();
+  }
+
+  const isFreePlan = planName
+    ? planName === "free"
+    : !planId && subscriptionStatus === "free";
+  if (!isFreePlan) return;
+
+  const now = new Date();
+  if (currentPeriodEnd && Number.isFinite(currentPeriodEnd.getTime()) && currentPeriodEnd > now) return;
+
+  const { data: freePlan } = await ensureWorkspaceFreePlan(client);
+  const periodStart = now;
+  const periodEnd = addOneMonth(periodStart);
+
+  const { data: oldFreeBatches, error: batchReadError } = await client
+    .from("credit_batches")
+    .select("id, remaining")
+    .eq("user_id", userId)
+    .eq("source_type", "free_plan")
+    .gt("remaining", 0);
+  if (batchReadError) throw new Error(`credit_batches read failed: ${batchReadError.message}`);
+
+  const oldFreeRemaining = (oldFreeBatches ?? []).reduce(
+    (sum: number, row: any) => sum + Math.max(0, Math.floor(Number(row.remaining ?? 0))),
+    0,
+  );
+
+  if ((oldFreeBatches ?? []).length > 0) {
+    const ids = (oldFreeBatches ?? []).map((row: any) => row.id).filter(Boolean);
+    const { error: clearError } = await client
+      .from("credit_batches")
+      .update({ remaining: 0 })
+      .in("id", ids);
+    if (clearError) throw new Error(`credit_batches free reset failed: ${clearError.message}`);
+  }
+
+  const { data: creditRow, error: creditReadError } = await client
+    .from("user_credits")
+    .select("balance,total_purchased")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (creditReadError) throw new Error(`user_credits read failed: ${creditReadError.message}`);
+
+  const currentBalance = Math.max(0, Math.floor(Number((creditRow as any)?.balance ?? 0)));
+  const newBalance = Math.max(0, currentBalance - oldFreeRemaining) + FREE_PLAN_MONTHLY_CREDITS;
+  const newTotalPurchased =
+    Math.max(0, Math.floor(Number((creditRow as any)?.total_purchased ?? 0))) + FREE_PLAN_MONTHLY_CREDITS;
+
+  const { error: upsertCreditError } = await client
+    .from("user_credits")
+    .upsert({
+      user_id: userId,
+      balance: newBalance,
+      total_purchased: newTotalPurchased,
+      updated_at: now.toISOString(),
+    }, { onConflict: "user_id" });
+  if (upsertCreditError) throw new Error(`user_credits free grant failed: ${upsertCreditError.message}`);
+
+  const { error: insertBatchError } = await client
+    .from("credit_batches")
+    .insert({
+      user_id: userId,
+      amount: FREE_PLAN_MONTHLY_CREDITS,
+      remaining: FREE_PLAN_MONTHLY_CREDITS,
+      source_type: "free_plan",
+      reference_id: `free-plan-${periodStart.toISOString().slice(0, 10)}`,
+      expires_at: periodEnd.toISOString(),
+    });
+  if (insertBatchError) throw new Error(`credit_batches free grant failed: ${insertBatchError.message}`);
+
+  await client.from("credit_transactions").insert({
+    user_id: userId,
+    amount: FREE_PLAN_MONTHLY_CREDITS,
+    type: "subscription_grant",
+    feature: "free_plan",
+    description: "Free plan monthly credits",
+    reference_id: `free-plan-${periodStart.toISOString().slice(0, 10)}`,
+    balance_after: newBalance,
+  });
+
+  const profileUpdate: Record<string, unknown> = {
+    subscription_status: "free",
+    current_period_start: periodStart.toISOString(),
+    current_period_end: periodEnd.toISOString(),
+  };
+  if (freePlan.id) {
+    profileUpdate.subscription_plan_id = freePlan.id;
+    profileUpdate.current_plan_id = freePlan.id;
+  }
+  const { error: profileUpdateError } = await client
+    .from("profiles")
+    .update(profileUpdate)
+    .eq("user_id", userId);
+  if (profileUpdateError) throw new Error(`profiles free period update failed: ${profileUpdateError.message}`);
 }
 
 // Pull markup_multiplier_* rows out of subscription_settings and shape
@@ -635,6 +838,7 @@ async function getWorkspaceCreditBalance(
 
   let educationScope: Record<string, unknown> | null = null;
   const creditUserId = authData.user.id;
+  await ensureFreeMonthlyCredits(client, creditUserId);
   const { data: personalCredits, error: personalCreditError } = await client
     .from("user_credits")
     .select("balance,total_purchased,total_used")
@@ -1058,6 +1262,7 @@ async function seedWorkspacePricingCatalog(
   client: SupabaseClient,
   audit: { adminUserId: string | null },
 ): Promise<{ data: { written: number; deleted_legacy: number; ratio: number; rows: unknown[] } }> {
+  await ensureWorkspaceFreePlan(client);
   const deletedLegacy = await cleanupLegacyPricingRows(client);
   const rows: unknown[] = [];
   for (const row of RECOMMENDED_WORKSPACE_PRICING) {
@@ -1531,6 +1736,9 @@ Deno.serve(async (req: Request) => {
 
       case "seed_workspace_pricing_catalog":
         return json(await seedWorkspacePricingCatalog(admin, auditCtx));
+
+      case "ensure_workspace_free_plan":
+        return json(await ensureWorkspaceFreePlan(admin));
 
       case "import_flow_credit_costs":
         return json(await importFlowCreditCosts(admin, auditCtx));
