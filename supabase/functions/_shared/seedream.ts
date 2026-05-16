@@ -92,6 +92,16 @@ export interface SeedreamGenerateRequest {
    *  unconditionally; the workspace UI no longer exposes a toggle since
    *  no creator-facing flow benefits from a watermarked output. */
   watermark?: boolean;
+  /** Batch image generation. When `"auto"`, the model decides whether
+   *  to return multiple thematically-related images and how many,
+   *  based on the prompt. `"disabled"` caps the response at one image.
+   *  Only supported on seedream-5-0-lite, 4-5, and 4-0 per BytePlus
+   *  docs (2026-05-15). Default `disabled`. */
+  sequential_image_generation?: "auto" | "disabled";
+  /** Server-side prompt rewriting. `"standard"` rewrites for higher
+   *  quality (slower), `"fast"` rewrites with lower latency, `"off"`
+   *  sends the prompt verbatim. Default `off`. */
+  optimize_prompt?: "off" | "standard" | "fast";
 }
 
 export interface SeedreamImageItem {
@@ -323,9 +333,27 @@ export async function executeSeedream(
   const negativePrompt =
     typeof params.negative_prompt === "string" ? params.negative_prompt : undefined;
 
+  // Batch image generation (BytePlus doc 2026-05-15): when "auto" the
+  // model decides whether to return multiple thematically-related
+  // images and how many, based on the prompt. "disabled" caps at one
+  // image. Default disabled to preserve existing single-image
+  // behaviour for callers that don't set it.
+  const sequentialMode: "auto" | "disabled" =
+    params.sequential_image_generation === "auto" ? "auto" : "disabled";
+  // Server-side prompt rewriting. "off" sends verbatim; "standard"
+  // rewrites for higher quality (slower); "fast" rewrites with lower
+  // latency. Only forwarded when non-default to avoid sending an
+  // unknown field on legacy callers.
+  const optimizePrompt: "off" | "standard" | "fast" =
+    params.optimize_prompt === "standard"
+      ? "standard"
+      : params.optimize_prompt === "fast"
+        ? "fast"
+        : "off";
+
   console.log(
     `[seedream] generate model=${entry.model} size=${size} seed=${seed ?? "auto"} ` +
-      `refs=${refUrls.length}`,
+      `refs=${refUrls.length} batch=${sequentialMode} optimize=${optimizePrompt}`,
   );
 
   const items = await generateSeedreamImage(
@@ -334,7 +362,13 @@ export async function executeSeedream(
       prompt,
       size,
       response_format: "url",
-      n: 1,
+      // When sequential_image_generation is "auto", BytePlus decides
+      // the image count from the prompt — omit `n` so the model is
+      // not capped at 1. When "disabled", explicit `n: 1` keeps the
+      // single-image baseline regardless of prompt phrasing.
+      ...(sequentialMode === "auto" ? {} : { n: 1 }),
+      sequential_image_generation: sequentialMode,
+      ...(optimizePrompt !== "off" ? { optimize_prompt: optimizePrompt } : {}),
       // Force watermark off — BytePlus ships the international Ark
       // endpoint with watermarking enabled for Seedream calls that omit
       // this field, regardless of what the published default says.
@@ -353,12 +387,14 @@ export async function executeSeedream(
     apiKey,
   );
 
-  const url = items[0]?.url;
-  if (!url) {
-    throw new Error("Seedream returned no URL in the first image item.");
+  const itemUrls = items
+    .map((it) => it?.url)
+    .filter((u): u is string => typeof u === "string" && u.length > 0);
+  if (itemUrls.length === 0) {
+    throw new Error("Seedream returned no URLs in the response data.");
   }
 
-  // Mirror the BytePlus-hosted image into `ai-media` so the frontend
+  // Mirror each BytePlus-hosted image into `ai-media` so the frontend
   // sees the same Supabase signed-URL shape every other image executor
   // (Banana / OpenAI / Freepik) produces. BytePlus output URLs are
   // short-lived CDN links; without mirroring, the result row points at
@@ -366,49 +402,57 @@ export async function executeSeedream(
   // undefined — which silently collapsed the downstream image-gen
   // node body to a thin line because neither the image branch nor the
   // empty placeholder matched.
-  let publicUrl = url;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`download HTTP ${res.status}`);
-    if (!res.body) throw new Error("download response missing body");
-    const contentType =
-      res.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
-    const ext =
-      contentType.includes("webp") ? "webp" :
-      contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" :
-      contentType.includes("gif") ? "gif" :
-      "png";
-    const fileName = `pipeline/seedream_${Date.now()}.${ext}`;
-    const { error: uploadError } = await supabase.storage
-      .from("ai-media")
-      .upload(fileName, res.body, { contentType, upsert: true });
-    if (uploadError) throw uploadError;
-    const { data: urlData, error: signError } = await supabase.storage
-      .from("ai-media")
-      .createSignedUrl(fileName, 60 * 60 * 24 * 7);
-    if (!signError && urlData?.signedUrl) {
-      publicUrl = urlData.signedUrl;
-    } else {
-      const { data: pubData } = supabase.storage
+  const publicUrls: string[] = [];
+  for (let i = 0; i < itemUrls.length; i++) {
+    const srcUrl = itemUrls[i];
+    let publicUrl = srcUrl;
+    try {
+      const res = await fetch(srcUrl);
+      if (!res.ok) throw new Error(`download HTTP ${res.status}`);
+      if (!res.body) throw new Error("download response missing body");
+      const contentType =
+        res.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
+      const ext =
+        contentType.includes("webp") ? "webp" :
+        contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" :
+        contentType.includes("gif") ? "gif" :
+        "png";
+      const fileName = `pipeline/seedream_${Date.now()}_${i}.${ext}`;
+      const { error: uploadError } = await supabase.storage
         .from("ai-media")
-        .getPublicUrl(fileName);
-      publicUrl = pubData.publicUrl;
+        .upload(fileName, res.body, { contentType, upsert: true });
+      if (uploadError) throw uploadError;
+      const { data: urlData, error: signError } = await supabase.storage
+        .from("ai-media")
+        .createSignedUrl(fileName, 60 * 60 * 24 * 7);
+      if (!signError && urlData?.signedUrl) {
+        publicUrl = urlData.signedUrl;
+      } else {
+        const { data: pubData } = supabase.storage
+          .from("ai-media")
+          .getPublicUrl(fileName);
+        publicUrl = pubData.publicUrl;
+      }
+      console.log(
+        `[seedream] mirrored image ${i + 1}/${itemUrls.length} to storage path=${fileName}`,
+      );
+    } catch (err) {
+      console.warn(
+        `[seedream] storage mirror failed for image ${i + 1}/${itemUrls.length}, falling back to BytePlus URL: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
     }
-    console.log(`[seedream] mirrored image to storage path=${fileName}`);
-  } catch (err) {
-    console.warn(
-      `[seedream] storage mirror failed, falling back to BytePlus URL: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
+    publicUrls.push(publicUrl);
   }
 
   return {
-    result_url: publicUrl,
+    result_url: publicUrls[0],
     outputs: {
-      output_image: publicUrl,
+      output_image: publicUrls[0],
     },
     output_type: "image_url",
+    output_count: publicUrls.length,
     provider_meta: {
       provider: "seedream",
       model: modelSlug,
@@ -417,6 +461,8 @@ export async function executeSeedream(
       size,
       revised_prompt: items[0]?.revised_prompt,
       reference_image_count: refUrls.length,
+      batch_mode: sequentialMode,
+      batch_urls: publicUrls,
     },
   };
 }

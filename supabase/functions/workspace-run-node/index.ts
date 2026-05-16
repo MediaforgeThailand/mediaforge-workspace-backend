@@ -854,6 +854,12 @@ async function consumeWorkspaceCredits(args: {
   provider: string;
   params: Record<string, unknown>;
   userEmail?: string | null;
+  /** Multiplier on the per-call unit price. Used by SeedDream batch
+   *  mode to charge the post-execution extras: pre-charge stays at 1
+   *  unit, then a second call with `unitCount = output_count - 1`
+   *  covers the additional images the model returned. Defaults to 1
+   *  so existing single-output flows are unchanged. */
+  unitCount?: number;
 }): Promise<WorkspaceCreditCharge | null> {
   if (args.body.skip_credit_charge || !shouldChargeWorkspaceProvider(args.provider)) {
     return null;
@@ -863,7 +869,8 @@ async function consumeWorkspaceCredits(args: {
   const multipliers = await fetchFeatureMultipliers(args.supabase);
   const fullAmount = Math.max(1, Math.ceil(baseAmount * workspaceMultiplierForProvider(def, multipliers)));
   const discountPercent = await lookupModelDiscountPercent(args.supabase, def, args.params);
-  const amount = applyModelDiscountToCredits(fullAmount, discountPercent);
+  const unitCount = Math.max(1, Math.floor(args.unitCount ?? 1));
+  const amount = applyModelDiscountToCredits(fullAmount, discountPercent) * unitCount;
   if (amount <= 0) return null;
   const feature = workspaceCreditFeature(def, args.params);
 
@@ -5933,17 +5940,86 @@ serve(async (req) => {
       `-> ${responseType}${result.task_id ? " task=" + result.task_id : ""}`,
     );
 
+    // SeedDream batch mode can return N>1 images per call. The
+    // upfront `consumeWorkspaceCredits` only charged for 1 unit (the
+    // pre-execution path can't predict the model's batch decision).
+    // Top up the remaining (N-1) units now that the executor has
+    // confirmed the actual output count. Failure here is logged but
+    // doesn't fail the request — the user already has all N images
+    // and we'd rather under-charge than reject delivered output.
+    // Extras are not refunded by the catch-block below because they
+    // are only charged after the executor succeeded; the rare
+    // post-success error path leaves them on the user's ledger.
+    // The primary charge can come from either:
+    //   - this request (foreground sync path): `activeCreditCharge` set
+    //   - upstream enqueue handler (worker replay path):
+    //     `body.precharged_credits > 0` + `body.skip_credit_charge=true`
+    // Either way, if SeedDream returned multiple images we still owe
+    // the user (N-1) more units. Detect upstream via either signal.
+    const upstreamPrimaryCharge =
+      activeCreditCharge?.amount ??
+      (Number.isFinite(Number(body.precharged_credits))
+        ? Number(body.precharged_credits)
+        : 0);
+
+    let batchExtraCredits = 0;
+    if (
+      upstreamPrimaryCharge > 0 &&
+      typeof result.output_count === "number" &&
+      result.output_count > 1
+    ) {
+      const extraUnits = result.output_count - 1;
+      // Use the existing reference as the base when available; in the
+      // worker-replay path activeCreditCharge is null because
+      // skip_credit_charge=true short-circuits consumeWorkspaceCredits,
+      // so fall through to body.job_id (the workspace job id) /
+      // body.node_id which the primary enqueue charge already used.
+      const baseReferenceId =
+        activeCreditCharge?.referenceId ??
+        body.job_id ??
+        body.node_id ??
+        crypto.randomUUID();
+      try {
+        const extraCharge = await consumeWorkspaceCredits({
+          supabase,
+          userId: user.id,
+          userEmail: user.email ?? null,
+          body: {
+            ...body,
+            // Force a real charge for the extras even in the worker
+            // replay (where `skip_credit_charge: true` is set so the
+            // upstream pre-charge isn't double-billed). Extras were
+            // not yet charged anywhere — this is their first and only
+            // ledger entry.
+            skip_credit_charge: false,
+            job_id: `${baseReferenceId}-batch-extra-${extraUnits}`,
+          },
+          nodeType,
+          provider,
+          params,
+          unitCount: extraUnits,
+        });
+        if (extraCharge) {
+          batchExtraCredits = extraCharge.amount;
+          console.log(
+            `[workspace-run-node] batch extra credits charged: +${extraCharge.amount} (output_count=${result.output_count}, units=${extraUnits})`,
+          );
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[workspace-run-node] batch extra-credit charge failed for output_count=${result.output_count}: ${msg}. Delivering result anyway.`,
+        );
+      }
+    }
+
     // Record an analytics event. Wrapped helper is best-effort and never
     // throws — a failed insert must not fail the user's run. Logs every
     // output_type now (text included) so chat-AI usage gets billed for
     // CMO-agency seats. Helper maps text → feature="chat_ai" to align
     // with credit_costs naming, and pulls token counts out of
     // provider_meta when the executor exposes them.
-    const creditsSpent =
-      activeCreditCharge?.amount ??
-      (Number.isFinite(Number(body.precharged_credits))
-        ? Number(body.precharged_credits)
-        : 0);
+    const creditsSpent = upstreamPrimaryCharge + batchExtraCredits;
     await recordGenerationEvent({
       supabase,
       userId: user.id,
