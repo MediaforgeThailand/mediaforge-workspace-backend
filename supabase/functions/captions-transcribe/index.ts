@@ -117,6 +117,20 @@ function languageLooksLikeSpacelessScript(value?: string | null): boolean {
   );
 }
 
+function textLooksThai(value?: string | null): boolean {
+  return /[\u0E00-\u0E7F]/.test(value ?? "");
+}
+
+function languageLooksThai(value?: string | null): boolean {
+  const key = normalizeSpace(value).toLowerCase().replace(/_/g, "-");
+  return (
+    key === "th" ||
+    key === "tha" ||
+    key === "thai" ||
+    key.startsWith("th-")
+  );
+}
+
 async function parseOpenAIError(resp: Response): Promise<unknown> {
   const errorText = await resp.text();
   try {
@@ -267,6 +281,18 @@ function extractAsciiTerms(value?: string | null): string[] {
   return Array.from(terms);
 }
 
+function extractAsciiPromptTerms(value?: string | null): string[] {
+  const terms = new Map<string, string>();
+  const matches = (value ?? "").match(/[A-Za-z][A-Za-z0-9+._-]*/g) ?? [];
+  for (const match of matches) {
+    const normalized = comparableTranscriptText(match);
+    if (normalized.length >= 2 && !terms.has(normalized)) {
+      terms.set(normalized, match);
+    }
+  }
+  return Array.from(terms.values());
+}
+
 function normalizerPreservesTranscript(
   result: TranscriptNormalizerResult,
   sourceText: string,
@@ -327,6 +353,28 @@ async function normalizeTranscriptWithGPT({
       "Use the requested word-grouping style while keeping each cue readable.",
     ];
 
+  const asciiPromptTerms = extractAsciiPromptTerms(text).slice(0, 24);
+  const preserveTermInstructions = asciiPromptTerms.length
+    ? [
+      `Detected English/code-switch terms to preserve exactly: ${
+        asciiPromptTerms.join(", ")
+      }.`,
+      "Keep those terms inside the natural spoken phrase. Do not make a detected term a standalone cue unless the speaker clearly said it as a standalone utterance.",
+    ]
+    : [];
+
+  const thaiContextInstructions =
+    textLooksThai(text) || languageLooksThai(language) ||
+      languageLooksThai(requestedLanguage)
+      ? [
+        "Thai subtitle context: Thai speech often code-switches with English loanwords. Treat English loanwords as part of the Thai phrase around them.",
+        "When an English term starts a Thai clause, keep it with the following Thai predicate, for example \"AI ก็จะถ่ายทอด\" instead of splitting \"AI\" and \"ก็จะถ่ายทอด\".",
+        "Do not create standalone cues from Thai particles, auxiliaries, or connectors such as ก็, จะ, ได้, ให้, และ, ของ, จาก, ใน, ที่, เป็น.",
+        "Keep Thai meaning units together: subject with predicate, verb phrase with object, and modifier phrase with the noun or action it modifies.",
+        "For a phrase like \"AI ก็จะถ่ายทอดท่าทาง จังหวะ และแอ็กชั่น\", prefer cues like [\"AI ก็จะถ่ายทอด\", \"ท่าทาง จังหวะ และแอ็กชั่น\"], not [\"AI\", \"ก็จะถ่ายทอด\", \"ท่าทาง\"].",
+      ]
+      : [];
+
   const instructions = [
     "You are a subtitle transcript normalizer for MediaForge Auto Subtitle.",
     "Return strict JSON only: {\"text\":\"...\",\"cues\":[\"...\"]}.",
@@ -335,6 +383,8 @@ async function normalizeTranscriptWithGPT({
     "Preserve brand/product terms such as Motion Control, AI, MediaForge, and Workspace.",
     "Every English/code-switched ASCII token from the transcript must remain in the normalized text and one cue. Do not transliterate or omit these tokens.",
     "Create subtitle cues as single-line readable chunks in spoken order.",
+    ...preserveTermInstructions,
+    ...thaiContextInstructions,
     ...cueInstructions,
     "Do not split Thai compound words, loanwords, product names, or English terms across cues.",
     "Do not add explanations, speaker labels, timestamps, markdown, or extra fields.",
