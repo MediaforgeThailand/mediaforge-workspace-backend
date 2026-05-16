@@ -1,11 +1,12 @@
 /**
  * captions-transcribe edge function
  *
- * Proxies the OpenAI Whisper API for caption / subtitle generation in
- * OpenReel Video. Receives a multipart form-data POST with the audio blob
- * (extracted client-side) plus optional `language` and `prompt` fields.
- * Returns Whisper's verbose_json shape including word-level timestamps so
- * the client can render karaoke-style word highlight captions.
+ * Proxies OpenAI speech-to-text for caption / subtitle generation.
+ * The primary transcript comes from gpt-4o-transcribe for better language
+ * accuracy. Whisper is still queried for verbose word/segment timestamps,
+ * because the newer transcription models do not provide word timestamps.
+ * For Thai and other spaceless scripts, the client uses the GPT transcript
+ * as text and Whisper timing only as rough alignment.
  *
  * Auth: requires a valid Supabase user JWT.
  * Secrets: OPENAI_API_KEY must be set via `supabase secrets set`.
@@ -14,6 +15,14 @@ import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 import { getAuthUser, unauthorized } from "../_shared/auth.ts";
 
 const OPENAI_KEY = Deno.env.get("OPENAI_API_KEY");
+const TRANSCRIPT_MODEL = Deno.env.get("CAPTIONS_TRANSCRIBE_MODEL")?.trim() ||
+  "gpt-4o-transcribe";
+const TIMING_MODEL = "whisper-1";
+const NORMALIZE_MODEL = Deno.env.get("CAPTIONS_NORMALIZE_MODEL")?.trim() ||
+  "gpt-5";
+const NORMALIZE_WITH_GPT =
+  (Deno.env.get("CAPTIONS_NORMALIZE_WITH_GPT") ?? "true").toLowerCase() !==
+    "false";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -55,6 +64,278 @@ interface WhisperVerboseResponse {
   segments?: WhisperSegment[];
 }
 
+interface OpenAITranscriptionResponse {
+  text?: string;
+  language?: string;
+  duration?: number;
+  words?: WhisperWord[];
+  segments?: WhisperSegment[];
+}
+
+interface TranscriptNormalizerResult {
+  text: string;
+  cues?: string[];
+}
+
+type SegmentationMode = "sentence" | "words";
+
+class OpenAIHttpError extends Error {
+  status: number;
+  details: unknown;
+
+  constructor(message: string, status: number, details: unknown) {
+    super(message);
+    this.name = "OpenAIHttpError";
+    this.status = status;
+    this.details = details;
+  }
+}
+
+function normalizeSpace(value?: string | null): string {
+  return (value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function textLooksLikeSpacelessScript(value?: string | null): boolean {
+  return /[\u0E00-\u0E7F\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]/.test(
+    value ?? "",
+  );
+}
+
+function languageLooksLikeSpacelessScript(value?: string | null): boolean {
+  const key = normalizeSpace(value).toLowerCase().replace(/_/g, "-");
+  return (
+    key === "th" ||
+    key === "tha" ||
+    key === "thai" ||
+    key.startsWith("th-") ||
+    key === "ja" ||
+    key.startsWith("ja-") ||
+    key === "zh" ||
+    key.startsWith("zh-") ||
+    key === "ko" ||
+    key.startsWith("ko-")
+  );
+}
+
+async function parseOpenAIError(resp: Response): Promise<unknown> {
+  const errorText = await resp.text();
+  try {
+    return JSON.parse(errorText);
+  } catch {
+    return errorText;
+  }
+}
+
+function errorDetailText(details: unknown): string {
+  if (typeof details === "string") return details.slice(0, 500);
+  const maybe = details as { error?: { message?: string }; message?: string };
+  return (
+    maybe?.error?.message ??
+    maybe?.message ??
+    JSON.stringify(details).slice(0, 500)
+  );
+}
+
+async function callOpenAITranscription({
+  audio,
+  filename,
+  model,
+  responseFormat,
+  language,
+  prompt,
+  includeWordTimestamps,
+}: {
+  audio: File;
+  filename: string;
+  model: string;
+  responseFormat: "json" | "verbose_json";
+  language: string;
+  prompt: string | null;
+  includeWordTimestamps: boolean;
+}): Promise<OpenAITranscriptionResponse> {
+  const openaiForm = new FormData();
+  openaiForm.append("file", audio, filename);
+  openaiForm.append("model", model);
+  openaiForm.append("response_format", responseFormat);
+  if (includeWordTimestamps) {
+    openaiForm.append("timestamp_granularities[]", "word");
+  }
+  if (language && language !== "auto") {
+    openaiForm.append("language", language);
+  }
+  if (prompt) {
+    openaiForm.append("prompt", prompt);
+  }
+
+  let resp: Response;
+  try {
+    resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_KEY}` },
+      body: openaiForm,
+    });
+  } catch (err) {
+    throw new Error(`OpenAI request failed: ${(err as Error).message}`);
+  }
+
+  if (!resp.ok) {
+    const details = await parseOpenAIError(resp);
+    throw new OpenAIHttpError(
+      `OpenAI transcription API error (HTTP ${resp.status}): ${
+        errorDetailText(details)
+      }`,
+      resp.status,
+      details,
+    );
+  }
+
+  try {
+    return await resp.json();
+  } catch (err) {
+    throw new Error(
+      `Failed to parse OpenAI transcription response: ${(err as Error).message}`,
+    );
+  }
+}
+
+function extractOpenAIResponseText(data: unknown): string {
+  const response = data as {
+    output_text?: string;
+    output?: Array<{
+      type?: string;
+      content?: Array<{ type?: string; text?: string }>;
+    }>;
+  };
+
+  if (typeof response.output_text === "string") return response.output_text;
+
+  const chunks: string[] = [];
+  for (const item of response.output ?? []) {
+    if (item.type !== "message") continue;
+    for (const part of item.content ?? []) {
+      if (part.type === "output_text" && typeof part.text === "string") {
+        chunks.push(part.text);
+      }
+    }
+  }
+  return chunks.join("");
+}
+
+function parseNormalizerResult(raw: string): TranscriptNormalizerResult | null {
+  const text = raw.trim();
+  if (!text) return null;
+  const jsonText = (() => {
+    const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+    if (fenced?.[1]) return fenced[1].trim();
+    const first = text.indexOf("{");
+    const last = text.lastIndexOf("}");
+    if (first >= 0 && last > first) return text.slice(first, last + 1);
+    return text;
+  })();
+
+  try {
+    const parsed = JSON.parse(jsonText) as { text?: unknown; cues?: unknown };
+    if (typeof parsed.text === "string" && parsed.text.trim()) {
+      const cues = Array.isArray(parsed.cues)
+        ? parsed.cues
+          .filter((cue): cue is string => typeof cue === "string")
+          .map((cue) => normalizeSpace(cue))
+          .filter(Boolean)
+          .slice(0, 120)
+        : undefined;
+      return { text: normalizeSpace(parsed.text), cues };
+    }
+  } catch {
+    // Keep fallback below.
+  }
+  return { text: normalizeSpace(text) };
+}
+
+async function normalizeTranscriptWithGPT({
+  text,
+  language,
+  requestedLanguage,
+  prompt,
+  segmentationMode,
+}: {
+  text: string;
+  language?: string;
+  requestedLanguage: string;
+  prompt: string | null;
+  segmentationMode: SegmentationMode;
+}): Promise<TranscriptNormalizerResult | null> {
+  if (!OPENAI_KEY || !NORMALIZE_WITH_GPT || !normalizeSpace(text)) return null;
+  if (
+    !textLooksLikeSpacelessScript(text) &&
+    !languageLooksLikeSpacelessScript(language) &&
+    !languageLooksLikeSpacelessScript(requestedLanguage)
+  ) {
+    return null;
+  }
+
+  const cueInstructions = segmentationMode === "sentence"
+    ? [
+      "Create cues by natural sentence, phrase, and speech-pause boundaries.",
+      "Do not force a fixed word count. Keep a phrase together when the speaker says it continuously.",
+      "Split only when there is a natural pause, punctuation, a completed clause, or a sentence is too long for one line.",
+    ]
+    : [
+      "Each cue should be short, usually 2-4 natural words or one short phrase.",
+      "Use the requested word-grouping style while keeping each cue readable.",
+    ];
+
+  const instructions = [
+    "You are a subtitle transcript normalizer for MediaForge Auto Subtitle.",
+    "Return strict JSON only: {\"text\":\"...\",\"cues\":[\"...\"]}.",
+    "Do not translate. Keep the original spoken language and code-switching.",
+    "Fix obvious ASR mistakes, spacing, punctuation, and Thai spelling.",
+    "Preserve brand/product terms such as Motion Control, AI, MediaForge, and Workspace.",
+    "Create subtitle cues as single-line readable chunks in spoken order.",
+    ...cueInstructions,
+    "Do not split Thai compound words, loanwords, product names, or English terms across cues.",
+    "Do not add explanations, speaker labels, timestamps, markdown, or extra fields.",
+  ].join(" ");
+
+  const userContent = [
+    `Detected language: ${language ?? "unknown"}`,
+    `Requested language: ${requestedLanguage || "auto"}`,
+    `Subtitle segmentation: ${segmentationMode}`,
+    prompt ? `User prompt/context: ${prompt}` : "",
+    "Transcript:",
+    text,
+  ].filter(Boolean).join("\n");
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: NORMALIZE_MODEL,
+      instructions,
+      input: [{ role: "user", content: userContent }],
+      reasoning: { effort: "low" },
+      text: { verbosity: "low" },
+      store: false,
+    }),
+  });
+
+  if (!resp.ok) {
+    const details = await parseOpenAIError(resp);
+    throw new OpenAIHttpError(
+      `OpenAI transcript normalizer error (HTTP ${resp.status}): ${
+        errorDetailText(details)
+      }`,
+      resp.status,
+      details,
+    );
+  }
+
+  const data = await resp.json();
+  return parseNormalizerResult(extractOpenAIResponseText(data));
+}
+
 serve(async (req) => {
   // CORS preflight
   if (req.method === "OPTIONS") {
@@ -82,8 +363,8 @@ serve(async (req) => {
     );
   }
 
-  // Parse the multipart form. The Whisper API only accepts audio under
-  // 25 MB so we reject anything bigger up front.
+  // Parse the multipart form. OpenAI's transcription endpoints accept audio
+  // up to 25 MB, so reject anything bigger up front.
   let formData: FormData;
   try {
     formData = await req.formData();
@@ -107,7 +388,7 @@ serve(async (req) => {
   if (audio.size > MAX_SIZE) {
     return new Response(
       JSON.stringify({
-        error: `Audio too large (${(audio.size / 1024 / 1024).toFixed(1)}MB). Whisper accepts up to 25MB.`,
+        error: `Audio too large (${(audio.size / 1024 / 1024).toFixed(1)}MB). OpenAI transcription accepts up to 25MB.`,
       }),
       { status: 413, headers: jsonHeaders },
     );
@@ -118,83 +399,122 @@ serve(async (req) => {
   // Word-level timestamps are the whole point — always request them but allow
   // the caller to disable via `granularity=segment` if they don't want them.
   const granularity = (formData.get("granularity") as string | null) || "word";
+  const rawSegmentationMode = (formData.get("segmentation_mode") as string | null) || "sentence";
+  const segmentationMode: SegmentationMode =
+    rawSegmentationMode === "words" ? "words" : "sentence";
 
-  // Build the OpenAI request
-  const openaiForm = new FormData();
-  // Preserve original filename if present, otherwise default to audio.wav.
   const filename = audio.name || "audio.wav";
-  openaiForm.append("file", audio, filename);
-  openaiForm.append("model", "whisper-1");
-  openaiForm.append("response_format", "verbose_json");
-  if (granularity === "word") {
-    openaiForm.append("timestamp_granularities[]", "word");
-  }
-  if (language && language !== "auto") {
-    openaiForm.append("language", language);
-  }
-  if (prompt) {
-    openaiForm.append("prompt", prompt);
-  }
-
   const startedAt = Date.now();
-  let resp: Response;
-  try {
-    resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_KEY}` },
-      body: openaiForm,
-    });
-  } catch (err) {
+  const [transcriptResult, timingResult] = await Promise.allSettled([
+    callOpenAITranscription({
+      audio,
+      filename,
+      model: TRANSCRIPT_MODEL,
+      responseFormat: "json",
+      language,
+      prompt,
+      includeWordTimestamps: false,
+    }),
+    callOpenAITranscription({
+      audio,
+      filename,
+      model: TIMING_MODEL,
+      responseFormat: "verbose_json",
+      language,
+      prompt,
+      includeWordTimestamps: granularity === "word",
+    }),
+  ]);
+
+  const transcriptData =
+    transcriptResult.status === "fulfilled" ? transcriptResult.value : null;
+  const timingData =
+    timingResult.status === "fulfilled"
+      ? (timingResult.value as WhisperVerboseResponse)
+      : null;
+
+  if (!transcriptData && !timingData) {
+    const reason =
+      transcriptResult.status === "rejected"
+        ? transcriptResult.reason
+        : timingResult.status === "rejected"
+          ? timingResult.reason
+          : null;
+    const status = reason instanceof OpenAIHttpError ? reason.status : 502;
     return new Response(
       JSON.stringify({
-        error: `OpenAI request failed: ${(err as Error).message}`,
+        error: "OpenAI transcription failed",
+        status,
+        details:
+          reason instanceof Error
+            ? reason.message
+            : "Both transcript and timing transcription calls failed",
       }),
-      { status: 502, headers: jsonHeaders },
+      { status, headers: jsonHeaders },
     );
   }
 
-  if (!resp.ok) {
-    const errorText = await resp.text();
-    let errorBody: unknown;
+  if (transcriptResult.status === "rejected") {
+    console.warn(
+      `[captions-transcribe] ${TRANSCRIPT_MODEL} failed; falling back to ${TIMING_MODEL}: ${
+        transcriptResult.reason instanceof Error
+          ? transcriptResult.reason.message
+          : String(transcriptResult.reason)
+      }`,
+    );
+  }
+  if (timingResult.status === "rejected") {
+    console.warn(
+      `[captions-transcribe] ${TIMING_MODEL} timing failed; returning transcript only: ${
+        timingResult.reason instanceof Error
+          ? timingResult.reason.message
+          : String(timingResult.reason)
+      }`,
+    );
+  }
+
+  const transcriptText = normalizeSpace(transcriptData?.text ?? timingData?.text);
+  let normalizedResult: TranscriptNormalizerResult | null = null;
+  if (transcriptText) {
     try {
-      errorBody = JSON.parse(errorText);
-    } catch {
-      errorBody = errorText;
+      normalizedResult = await normalizeTranscriptWithGPT({
+        text: transcriptText,
+        language: timingData?.language ?? transcriptData?.language,
+        requestedLanguage: language,
+        prompt,
+        segmentationMode,
+      });
+    } catch (err) {
+      console.warn(
+        `[captions-transcribe] ${NORMALIZE_MODEL} normalizer failed; using raw transcript: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
     }
-    return new Response(
-      JSON.stringify({
-        error: "OpenAI Whisper API error",
-        status: resp.status,
-        details: errorBody,
-      }),
-      { status: resp.status, headers: jsonHeaders },
-    );
   }
 
-  let data: WhisperVerboseResponse;
-  try {
-    data = await resp.json();
-  } catch (err) {
-    return new Response(
-      JSON.stringify({
-        error: `Failed to parse Whisper response: ${(err as Error).message}`,
-      }),
-      { status: 502, headers: jsonHeaders },
-    );
-  }
+  const finalText = normalizedResult?.text ?? transcriptText;
+  const finalLanguage =
+    timingData?.language ?? transcriptData?.language ??
+    (language !== "auto" ? language : undefined);
 
   const elapsed = Date.now() - startedAt;
   console.log(
-    `[captions-transcribe] user=${user.id} duration=${data.duration ?? 0}s lang=${data.language ?? "?"} words=${data.words?.length ?? 0} elapsed=${elapsed}ms`,
+    `[captions-transcribe] user=${user.id} transcript_model=${transcriptData ? TRANSCRIPT_MODEL : "failed"} timing_model=${timingData ? TIMING_MODEL : "failed"} normalizer=${normalizedResult ? NORMALIZE_MODEL : "skipped"} segmentation=${segmentationMode} cues=${normalizedResult?.cues?.length ?? 0} duration=${timingData?.duration ?? transcriptData?.duration ?? 0}s lang=${finalLanguage ?? "?"} words=${timingData?.words?.length ?? 0} elapsed=${elapsed}ms`,
   );
 
   return new Response(
     JSON.stringify({
-      words: data.words ?? [],
-      segments: data.segments ?? [],
-      language: data.language,
-      text: data.text,
-      duration: data.duration,
+      words: timingData?.words ?? [],
+      segments: timingData?.segments ?? [],
+      language: finalLanguage,
+      text: finalText,
+      duration: timingData?.duration ?? transcriptData?.duration,
+      suggested_cues: normalizedResult?.cues ?? null,
+      segmentation_mode: segmentationMode,
+      transcript_model: transcriptData ? TRANSCRIPT_MODEL : null,
+      timing_model: timingData ? TIMING_MODEL : null,
+      normalizer_model: normalizedResult ? NORMALIZE_MODEL : null,
     }),
     { headers: jsonHeaders },
   );
