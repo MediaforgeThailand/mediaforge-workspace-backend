@@ -2,11 +2,14 @@
 /// <reference lib="dom" />
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
+  coerceOpenAIEditSize,
   detectOpenAIImageFile,
   fetchImageBuffer,
   openAIReferenceImageError,
   OPENAI_IMAGE_MAX_BYTES,
+  toSupabaseRenderUrlForOpenAI,
 } from "./imageUtils.ts";
+import { prepareReferenceImage } from "./imageValidation.ts";
 import {
   fetchWithAttemptTimeout,
   isProviderBillingLike,
@@ -50,7 +53,11 @@ export async function executeOpenAIImage2(
     requestedQuality === "low" || requestedQuality === "medium" || requestedQuality === "high"
       ? requestedQuality
       : "medium";
-  const size = String(params.size ?? "1024x1024");
+  // Coerce to one of OpenAI's four supported sizes. Frontends
+  // sometimes pass arbitrary aspect ratios (1024x1280 etc.) which
+  // gpt-image-1 rejects with `Invalid size '...'` — surfaced to the
+  // user as a generic provider error.
+  const size = coerceOpenAIEditSize(String(params.size ?? "1024x1024"));
   const outputFormat = String(params.output_format ?? "png");
   const rawOutputCompression = Number(params.output_compression ?? 100);
   const outputCompression = Number.isFinite(rawOutputCompression)
@@ -95,20 +102,29 @@ export async function executeOpenAIImage2(
     let loaded = 0;
     for (let i = 0; i < refUrls.length; i++) {
       try {
-        const bytes = await fetchImageBuffer(refUrls[i]);
-        if (bytes.byteLength > OPENAI_IMAGE_MAX_BYTES) {
+        // Route Supabase Storage JPEGs through /render/image — imgproxy
+        // bakes EXIF orientation into pixels and strips metadata, which
+        // OpenAI's decoder requires (iPhone JPEGs with orientation=6
+        // fail validation otherwise). Non-Supabase URLs pass through.
+        const fetchUrl = toSupabaseRenderUrlForOpenAI(refUrls[i]);
+        const rawBytes = await fetchImageBuffer(fetchUrl);
+        if (rawBytes.byteLength > OPENAI_IMAGE_MAX_BYTES) {
           throw openAIReferenceImageError(i, "file is larger than 50MB. Please upload a smaller PNG, JPG, or WEBP image.");
         }
-        const detected = detectOpenAIImageFile(bytes);
+        const detected = detectOpenAIImageFile(rawBytes);
         if (!detected) {
           throw openAIReferenceImageError(
             i,
             "file is not a supported PNG, JPG, or WEBP image. It may be a video, GIF, AVIF/HEIC, SVG, expired HTML response, or a corrupt image.",
           );
         }
-        const { mime, ext } = detected;
-        const blob = new Blob([bytes], { type: mime });
-        form.append(fieldName, blob, `ref_${i}.${ext}`);
+        // Defense-in-depth for refs the render route didn't touch
+        // (non-Supabase URLs, or PNG/WEBP that still carry oddities).
+        // Detects + re-encodes JPEGs with EXIF orientation, progressive
+        // encoding, CMYK, or oversize dimensions.
+        const prepared = await prepareReferenceImage(rawBytes, detected, i);
+        const blob = new Blob([prepared.bytes], { type: prepared.mime });
+        form.append(fieldName, blob, `ref_${i}.${prepared.ext}`);
         loaded++;
       } catch (err) {
         if (err instanceof Error && err.message.startsWith("Reference image ")) {
