@@ -69,6 +69,55 @@ export function openAIReferenceImageError(index: number, message: string): Error
   return new Error(`Reference image ${index + 1} is invalid for GPT Image 2: ${message}`);
 }
 
+// OpenAI gpt-image-1 /v1/images/edits only accepts these size values
+// (verified 2026-05-16 — anything else returns
+// `"Invalid size 'WxH'. Supported sizes are 1024x1024, 1024x1536,
+//  1536x1024, and auto."`). Frontends sometimes send custom aspect
+// ratios like 1024x1280; we coerce by aspect ratio rather than rejecting.
+export const OPENAI_EDIT_SIZES = ["auto", "1024x1024", "1024x1536", "1536x1024"] as const;
+export type OpenAIEditSize = typeof OPENAI_EDIT_SIZES[number];
+
+export function coerceOpenAIEditSize(requested: string): OpenAIEditSize {
+  if ((OPENAI_EDIT_SIZES as readonly string[]).includes(requested)) {
+    return requested as OpenAIEditSize;
+  }
+  const m = requested.match(/^(\d+)x(\d+)$/);
+  if (!m) return "1024x1024";
+  const w = Number(m[1]);
+  const h = Number(m[2]);
+  if (!w || !h) return "1024x1024";
+  if (Math.abs(w - h) / Math.max(w, h) < 0.05) return "1024x1024";
+  return w > h ? "1536x1024" : "1024x1536";
+}
+
+// Supabase Storage /storage/v1/object/{sign,public,authenticated}/...
+// URLs can be rewritten to /storage/v1/render/image/{...} to route
+// through imgproxy, which bakes EXIF orientation into pixels and
+// strips metadata. OpenAI's gpt-image-1 decoder rejects JPEGs with
+// non-trivial EXIF orientation (the iPhone default) — rerouting fixes
+// it for free, no decode/re-encode in our edge function.
+//
+// We only rewrite JPEG URLs: PNGs and WEBPs don't carry orientation
+// risk, and forcing them through imgproxy would re-encode to JPEG and
+// strip alpha. Non-Supabase URLs and already-rendered URLs are
+// returned unchanged.
+export function toSupabaseRenderUrlForOpenAI(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (!/\.supabase\.co$/i.test(parsed.hostname)) return url;
+    const m = parsed.pathname.match(/^\/storage\/v1\/object\/(sign|public|authenticated)\/(.+)$/);
+    if (!m) return url;
+    if (!/\.(jpe?g)$/i.test(decodeURIComponent(m[2]).split("?")[0])) return url;
+    parsed.pathname = `/storage/v1/render/image/${m[1]}/${m[2]}`;
+    if (!parsed.searchParams.has("width")) parsed.searchParams.set("width", "2048");
+    if (!parsed.searchParams.has("height")) parsed.searchParams.set("height", "2048");
+    if (!parsed.searchParams.has("resize")) parsed.searchParams.set("resize", "contain");
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
 export interface ImageDimensions { width: number; height: number }
 
 export function extractImageDimensions(buf: Uint8Array): ImageDimensions | null {
