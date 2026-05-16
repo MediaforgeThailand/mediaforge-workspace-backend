@@ -251,6 +251,48 @@ function parseNormalizerResult(raw: string): TranscriptNormalizerResult | null {
   return { text: normalizeSpace(text) };
 }
 
+function comparableTranscriptText(value?: string | null): string {
+  return normalizeSpace(value)
+    .toLowerCase()
+    .replace(/[\s"'`.,;:!?…。，、！？()[\]{}<>|\/\\\-–—_*+=~@#$%^&]+/g, "");
+}
+
+function extractAsciiTerms(value?: string | null): string[] {
+  const terms = new Set<string>();
+  const matches = (value ?? "").match(/[A-Za-z][A-Za-z0-9+._-]*/g) ?? [];
+  for (const match of matches) {
+    const normalized = comparableTranscriptText(match);
+    if (normalized.length >= 2) terms.add(normalized);
+  }
+  return Array.from(terms);
+}
+
+function normalizerPreservesTranscript(
+  result: TranscriptNormalizerResult,
+  sourceText: string,
+): boolean {
+  const sourceComparable = comparableTranscriptText(sourceText);
+  if (!sourceComparable) return true;
+
+  const resultComparable = comparableTranscriptText(result.text);
+  if (!resultComparable) return false;
+
+  if (
+    sourceComparable.length >= 24 &&
+    resultComparable.length < sourceComparable.length * 0.72
+  ) {
+    return false;
+  }
+
+  const resultSurface = comparableTranscriptText(
+    [result.text, ...(result.cues ?? [])].join(" "),
+  );
+  const missingAsciiTerm = extractAsciiTerms(sourceText).some((term) =>
+    !resultSurface.includes(term)
+  );
+  return !missingAsciiTerm;
+}
+
 async function normalizeTranscriptWithGPT({
   text,
   language,
@@ -276,8 +318,9 @@ async function normalizeTranscriptWithGPT({
   const cueInstructions = segmentationMode === "sentence"
     ? [
       "Create cues by natural sentence, phrase, and speech-pause boundaries.",
-      "Do not force a fixed word count. Keep a phrase together when the speaker says it continuously.",
-      "Split only when there is a natural pause, punctuation, a completed clause, or a sentence is too long for one line.",
+      "Do not force a fixed word count, but avoid long paragraph cues.",
+      "Prefer short spoken phrases that can fit on one subtitle line.",
+      "Split when there is a natural pause, punctuation, completed clause, or a phrase becomes too long for one line.",
     ]
     : [
       "Each cue should be short, usually 2-4 natural words or one short phrase.",
@@ -290,6 +333,7 @@ async function normalizeTranscriptWithGPT({
     "Do not translate. Keep the original spoken language and code-switching.",
     "Fix obvious ASR mistakes, spacing, punctuation, and Thai spelling.",
     "Preserve brand/product terms such as Motion Control, AI, MediaForge, and Workspace.",
+    "Every English/code-switched ASCII token from the transcript must remain in the normalized text and one cue. Do not transliterate or omit these tokens.",
     "Create subtitle cues as single-line readable chunks in spoken order.",
     ...cueInstructions,
     "Do not split Thai compound words, loanwords, product names, or English terms across cues.",
@@ -490,6 +534,12 @@ serve(async (req) => {
           err instanceof Error ? err.message : String(err)
         }`,
       );
+    }
+    if (normalizedResult && !normalizerPreservesTranscript(normalizedResult, transcriptText)) {
+      console.warn(
+        `[captions-transcribe] ${NORMALIZE_MODEL} normalizer dropped transcript content; using raw transcript`,
+      );
+      normalizedResult = null;
     }
   }
 
