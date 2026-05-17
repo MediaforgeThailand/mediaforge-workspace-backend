@@ -67,7 +67,7 @@ const WORKSPACE_CREDITS_PER_THB = 50;
 const FLOW_TO_WORKSPACE_RATIO = WORKSPACE_CREDITS_PER_THB / FLOW_CREDITS_PER_THB;
 const REPLICATE_PRICE_FACTOR = 1;
 const TEAM_ENTERPRISE_CREDIT_DISCOUNT_PERCENT = 20;
-const FREE_PLAN_MONTHLY_CREDITS = 1000;
+const FREE_PLAN_MONTHLY_CREDITS = 500;
 type CreditCostWriteRow = {
   feature: string;
   model: string | null;
@@ -527,7 +527,7 @@ async function ensureWorkspaceFreePlan(client: SupabaseClient): Promise<{ data: 
     target: "user",
     billing_cycle: "monthly",
     price_thb: 0,
-    upfront_credits: 1000,
+    upfront_credits: FREE_PLAN_MONTHLY_CREDITS,
     flow_quota: null,
     discount_official: 0,
     discount_community: 0,
@@ -537,7 +537,7 @@ async function ensureWorkspaceFreePlan(client: SupabaseClient): Promise<{ data: 
     stripe_price_id_monthly: null,
     stripe_price_id_annual: null,
     annual_price_thb: 0,
-    annual_credits: 12000,
+    annual_credits: FREE_PLAN_MONTHLY_CREDITS * 12,
     credit_discount_percent: 0,
     generator_quota: 1,
     generator_quota_label: "1 generator engine",

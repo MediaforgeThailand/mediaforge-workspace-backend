@@ -1,8 +1,8 @@
 -- Workspace Free plan + Auto Subtitle pricing.
 --
--- Free gets 1,000 credits/month but runtime gates image/video/upscale to
--- Starter or higher. The gate lives in workspace-run-node and the frontend
--- dialog; this row makes the plan visible in Pricing and admin surfaces.
+-- Free gets 500 starter credits/month and all workspace generators are
+-- available as long as the account has credits. This row makes the plan
+-- visible in Pricing and admin surfaces.
 
 insert into public.subscription_plans (
   name,
@@ -30,7 +30,7 @@ select
   'user',
   'monthly',
   0,
-  1000,
+  500,
   null,
   0,
   0,
@@ -40,7 +40,7 @@ select
   null,
   null,
   0,
-  12000,
+  6000,
   0,
   1,
   '1 generator engine',
@@ -55,11 +55,11 @@ where not exists (
 
 update public.subscription_plans
    set price_thb = 0,
-       upfront_credits = 1000,
+       upfront_credits = 500,
        is_active = true,
        sort_order = 0,
        annual_price_thb = 0,
-       annual_credits = 12000,
+       annual_credits = 6000,
        credit_discount_percent = 0,
        generator_quota = 1,
        generator_quota_label = '1 generator engine',

@@ -323,7 +323,7 @@ const DEFAULT_EDUCATION_BLOCKED_MODELS = [
   "dreamina-seedance-2-0-260128",
   "dreamina-seedance-2-0-fast-260128",
 ];
-const FREE_PLAN_MONTHLY_CREDITS = 1000;
+const FREE_PLAN_MONTHLY_CREDITS = 500;
 const FREE_PLAN_BLOCKED_NODE_TYPES = new Set<string>();
 
 type WorkspaceCreditOwner =
