@@ -2084,45 +2084,9 @@ async function assertWorkspacePlanAllowsNode(args: {
   userId: string;
   nodeType: string;
 }): Promise<void> {
+  // Free accounts can use every workspace feature. Credits remain the
+  // limiting mechanism; plan status no longer blocks node execution.
   if (!FREE_PLAN_BLOCKED_NODE_TYPES.has(args.nodeType)) return;
-
-  const { data: profile, error } = await args.supabase
-    .from("profiles")
-    .select("subscription_status, subscription_plan_id, current_plan_id")
-    .eq("user_id", args.userId)
-    .maybeSingle();
-  if (error) {
-    console.warn("[workspace-plan] profile lookup skipped:", error.message);
-    return;
-  }
-
-  const subscriptionStatus = String((profile as any)?.subscription_status ?? "").toLowerCase();
-  const planId =
-    typeof (profile as any)?.subscription_plan_id === "string"
-      ? String((profile as any).subscription_plan_id)
-      : typeof (profile as any)?.current_plan_id === "string"
-        ? String((profile as any).current_plan_id)
-        : null;
-
-  let planName = "";
-  if (planId) {
-    const { data: plan } = await args.supabase
-      .from("subscription_plans")
-      .select("name")
-      .eq("id", planId)
-      .maybeSingle();
-    planName = String((plan as any)?.name ?? "").toLowerCase();
-  }
-
-  const isFreePlan =
-    planName
-      ? planName === "free"
-      : !planId && subscriptionStatus === "free";
-  if (!isFreePlan) return;
-
-  throw new Error(
-    "FEATURE_LOCKED_FREE_PLAN: Image generation, video generation, and upscale require Starter or higher.",
-  );
 }
 
 function addOneMonth(date: Date): Date {
