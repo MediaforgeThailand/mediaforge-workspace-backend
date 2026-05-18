@@ -1452,11 +1452,8 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 
-  // ── ADMIN-JWT GATE TEMPORARILY DISABLED ───────────────────────
-  // See companion note in admin_workspace_pricing/index.ts. Re-enable
-  // once `ADMIN_AUTH_SUPABASE_ANON_KEY` is set.
-  //   const adminPayload = await verifyAdminJwt(req);
-  //   if (!adminPayload) return unauthorizedResponse(CORS_HEADERS);
+  const adminPayload = await verifyAdminJwt(req);
+  if (!adminPayload) return unauthorizedResponse(CORS_HEADERS);
 
   let body: Record<string, unknown>;
   try {
