@@ -76,16 +76,19 @@ function activeSalesTotal(rows: any[]): number {
     .reduce((sum, row) => sum + Number(row.net_amount_thb ?? row.gross_amount_thb ?? row.commission_base_amount_thb ?? 0), 0);
 }
 
-async function uniqueUpgradeCode(client: any, user: any, fallbackCode?: string | null) {
-  if (fallbackCode) return normalizeCode(fallbackCode);
-  const seed = normalizeCode(`MF-${asString(user.email).split("@")[0] || user.id.slice(0, 8)}`);
+async function mintUpgradeCode(client: any, user: any, existingCode?: string | null) {
+  // Derive a NEW code from the partner's referral code, never reuse it.
+  // MF-AAH -> MF-AAH-20; falls back to seed if the partner has no code yet.
+  const base = existingCode
+    ? normalizeCode(`${existingCode}-20`)
+    : normalizeCode(`MF-${asString(user.email).split("@")[0] || user.id.slice(0, 8)}-20`);
   for (let i = 0; i < 10; i += 1) {
-    const code = i === 0 ? seed : `${seed}-${i + 1}`;
+    const code = i === 0 ? base : `${base}-${i + 1}`;
     const { data, error } = await client.from("referral_codes").select("id").eq("code", code).maybeSingle();
     if (error) throw new Error(`code lookup failed: ${error.message}`);
     if (!data) return code;
   }
-  return normalizeCode(`MF-${crypto.randomUUID().slice(0, 8)}`);
+  return normalizeCode(`MF-${crypto.randomUUID().slice(0, 8)}-20`);
 }
 
 async function maybeGrantSalesUpgradeCode(
@@ -99,8 +102,11 @@ async function maybeGrantSalesUpgradeCode(
   if (!partner || partner.suspended_at || salesTotalThb < UPGRADE_SALES_THRESHOLD_THB || unlocked) return codes;
 
   try {
-    const target = codes.find((code) => code.is_active !== false) ?? codes[0] ?? null;
-    const code = await uniqueUpgradeCode(client, user, target?.code ?? null);
+    // Insert a NEW code alongside the existing referral code so the
+    // partner's old `?ref=` links keep working as referral-only and
+    // the discount code is a separate share-friendly handle.
+    const existing = codes.find((code) => code.is_active !== false) ?? codes[0] ?? null;
+    const code = await mintUpgradeCode(client, user, existing?.code ?? null);
     const payload = {
       user_id: user.id,
       code,
@@ -113,11 +119,28 @@ async function maybeGrantSalesUpgradeCode(
       updated_at: new Date().toISOString(),
     };
 
-    const query = target?.id
-      ? client.from("referral_codes").update(payload).eq("id", target.id)
-      : client.from("referral_codes").insert(payload);
-    const { error } = await query;
-    if (error) throw new Error(error.message);
+    const { data: inserted, error: insertError } = await client
+      .from("referral_codes")
+      .insert(payload)
+      .select("id")
+      .single();
+    if (insertError) throw new Error(insertError.message);
+
+    await client.from("affiliate_audit_log").insert({
+      actor_id: user.id,
+      action: "workspace_affiliate_upgrade_code_granted",
+      entity_type: "referral_code",
+      entity_id: inserted?.id ?? code,
+      diff: {
+        source: "self_serve_sales_threshold",
+        partner_user_id: user.id,
+        sales_total_thb: salesTotalThb,
+        threshold_thb: UPGRADE_SALES_THRESHOLD_THB,
+        discount_percent: UPGRADE_DISCOUNT_PERCENT,
+        existing_code: existing?.code ?? null,
+        new_code: code,
+      },
+    });
 
     const { data: refreshed, error: refreshError } = await client
       .from("referral_codes")
