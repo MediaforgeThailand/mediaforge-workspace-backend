@@ -74,7 +74,15 @@ async function ensureAffiliateReferralFromMetadata(
       attribution_source: metadata?.affiliate_attribution_source ?? sourceTag,
       commission_rate: Number(metadata?.affiliate_commission_rate ?? 0.3),
     });
-    if (error && error.code !== "23505") {
+    if (error && error.code === "23505") {
+      // First-touch attribution: the referred user already had a
+      // referrals row from an earlier creator's link or signup code.
+      // Log so ops can monitor how often a paid checkout creator code
+      // loses to a prior touch.
+      console.warn(
+        `[STRIPE-WEBHOOK] affiliate first-touch override (${sourceTag}) — referred=${referredUserId} attempted partner=${partnerUserId} code=${codeId}`,
+      );
+    } else if (error) {
       console.error(`[STRIPE-WEBHOOK] affiliate referral insert (${sourceTag}) error:`, error);
     }
   } catch (e) {
