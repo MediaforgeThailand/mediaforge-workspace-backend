@@ -219,10 +219,24 @@ async function submitApplication(user: any, body: Record<string, unknown>) {
   const client = adminClient();
   const { data: existing, error: existingError } = await client
     .from("partner_applications")
-    .select("id,status")
+    .select("id,status,submitted_at,reviewed_at")
     .eq("user_id", user.id)
     .maybeSingle();
   if (existingError) throw new Error(`application read failed: ${existingError.message}`);
+
+  // Cooldowns: there is at most one application per user (UNIQUE), so
+  // "rate limit" here means "stop the same row from being thrashed".
+  if (existing) {
+    const submittedAt = existing.submitted_at ? new Date(existing.submitted_at).getTime() : 0;
+    const reviewedAt = existing.reviewed_at ? new Date(existing.reviewed_at).getTime() : 0;
+    const now = Date.now();
+    if (existing.status === "submitted" && submittedAt && now - submittedAt < 30 * 60_000) {
+      throw new Error("Your application is already in review. Please wait at least 30 minutes before resubmitting.");
+    }
+    if (existing.status === "rejected" && reviewedAt && now - reviewedAt < 24 * 60 * 60_000) {
+      throw new Error("Your application was reviewed recently. Please wait 24 hours before resubmitting.");
+    }
+  }
 
   const payload = {
     user_id: user.id,
