@@ -1,9 +1,23 @@
 -- Block payout requests when the partner's bank info is missing or
 -- still a placeholder. Defense-in-depth alongside the admin function
 -- fix that stops 'Pending' from being written in the first place.
+--
+-- Why we touch two signatures:
+--   * 20260420211049_* created request_payout(NUMERIC, JSONB)
+--   * 20260420211511_* added a competing request_payout(INTEGER, JSONB)
+--     overload six minutes later — and that integer-typed overload is
+--     the one PostgREST dispatches to when supabase-js sends a plain
+--     integer literal (500) from the frontend.
+--   We consolidate on the INTEGER signature (the one in real use) and
+--   DROP the NUMERIC overload so the guard cannot be bypassed by
+--   ambiguous-resolution drift in the future.
+
+-- Remove the unused NUMERIC overload so PostgREST cannot resolve to a
+-- guard-less function via type ambiguity.
+DROP FUNCTION IF EXISTS public.request_payout(NUMERIC, JSONB);
 
 CREATE OR REPLACE FUNCTION public.request_payout(
-  p_amount_thb NUMERIC,
+  p_amount_thb INTEGER,
   p_bank_snapshot JSONB
 ) RETURNS UUID
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
@@ -86,5 +100,5 @@ BEGIN
   RETURN v_payout_id;
 END; $$;
 
-COMMENT ON FUNCTION public.request_payout(NUMERIC, JSONB) IS
+COMMENT ON FUNCTION public.request_payout(INTEGER, JSONB) IS
   'Partner-facing payout request. Rejects when the partner_applications bank fields are empty or still contain the legacy "Pending" placeholder admin tooling used to write before 2026-05-18.';
