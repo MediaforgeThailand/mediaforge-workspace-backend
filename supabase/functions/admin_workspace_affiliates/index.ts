@@ -371,14 +371,21 @@ async function manualCreatePartner(client: SupabaseClient, body: Record<string, 
   const commissionRate = Math.max(0, Math.min(1, asNumber(body.commission_rate, 0.3)));
   const discountPercent = clampPercent(body.discount_percent, 20);
 
+  const bankName = asString(body.bank_name);
+  const bankAccountNo = asString(body.bank_account_no);
+  const bankAccountName = asString(body.bank_account_name) || fullName;
+  if (!bankName || !bankAccountNo) {
+    throw new Error("bank_name and bank_account_no are required — collect bank details before inviting the creator");
+  }
+
   const applicationPayload = {
     user_id: user.id,
     legal_first_name: name.first,
     legal_last_name: name.last,
     phone_e164: asString(body.phone, "-"),
-    bank_name: asString(body.bank_name, "Pending"),
-    bank_account_no: asString(body.bank_account_no, "Pending"),
-    bank_account_name: asString(body.bank_account_name, fullName),
+    bank_name: bankName,
+    bank_account_no: bankAccountNo,
+    bank_account_name: bankAccountName,
     social_profile_url: asString(body.social_profile_url),
     social_platform: asString(body.social_platform),
     follower_count: Math.max(0, Math.trunc(asNumber(body.follower_count, 0))),
