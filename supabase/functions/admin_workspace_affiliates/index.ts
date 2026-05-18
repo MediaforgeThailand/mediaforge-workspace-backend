@@ -68,6 +68,15 @@ function defaultCodeSeed(app: any): string {
   return normalizeCode(base || `MF-${crypto.randomUUID().slice(0, 8)}`);
 }
 
+function splitName(fullName: string, fallbackEmail = "") {
+  const fallback = fallbackEmail.split("@")[0] || "Creator";
+  const parts = (fullName || fallback).trim().split(/\s+/).filter(Boolean);
+  return {
+    first: parts[0] || fallback,
+    last: parts.slice(1).join(" ") || "-",
+  };
+}
+
 async function hydrateAuthUsers(client: SupabaseClient, rows: any[], field = "user_id") {
   const ids = [...new Set(rows.map((row) => row?.[field]).filter(Boolean))];
   const byId = new Map<string, { email: string | null; display_name: string | null }>();
@@ -98,7 +107,9 @@ async function ensureStripeCoupon(
   discountPercent: number,
 ): Promise<string | null> {
   if (discountPercent <= 0) return null;
-  if (codeRow?.stripe_coupon_id) return String(codeRow.stripe_coupon_id);
+  if (codeRow?.stripe_coupon_id && Number(codeRow.discount_percent ?? 0) === discountPercent) {
+    return String(codeRow.stripe_coupon_id);
+  }
 
   const coupon = await stripe.coupons.create({
     name: `MediaForge creator ${code} - ${discountPercent}% off`,
@@ -150,7 +161,7 @@ async function listPartners(client: SupabaseClient) {
       ? client.from("referral_codes").select("*").in("user_id", ids).eq("code_type", "partner_affiliate")
       : Promise.resolve({ data: [], error: null } as any),
     ids.length
-      ? client.from("commission_events").select("partner_user_id, commission_amount_thb, status").in("partner_user_id", ids)
+      ? client.from("commission_events").select("partner_user_id, commission_amount_thb, net_amount_thb, gross_amount_thb, status").in("partner_user_id", ids)
       : Promise.resolve({ data: [], error: null } as any),
   ]);
   if (codesError) throw new Error(`codes read failed: ${codesError.message}`);
@@ -163,14 +174,17 @@ async function listPartners(client: SupabaseClient) {
     codesByUser.set(code.user_id, list);
   }
 
-  const totalsByUser = new Map<string, { holding: number; available: number; paid: number; total: number }>();
+  const totalsByUser = new Map<string, { holding: number; available: number; paid: number; total: number; sales: number }>();
   for (const event of commissions ?? []) {
-    const current = totalsByUser.get(event.partner_user_id) ?? { holding: 0, available: 0, paid: 0, total: 0 };
+    const current = totalsByUser.get(event.partner_user_id) ?? { holding: 0, available: 0, paid: 0, total: 0, sales: 0 };
     const amount = Number(event.commission_amount_thb ?? 0);
     current.total += amount;
     if (event.status === "holding") current.holding += amount;
     if (event.status === "available") current.available += amount;
     if (event.status === "paid") current.paid += amount;
+    if (!["void", "clawback"].includes(String(event.status ?? ""))) {
+      current.sales += Number(event.net_amount_thb ?? event.gross_amount_thb ?? 0);
+    }
     totalsByUser.set(event.partner_user_id, current);
   }
 
@@ -179,7 +193,7 @@ async function listPartners(client: SupabaseClient) {
       partners: hydrated.map((row) => ({
         ...row,
         codes: codesByUser.get(row.user_id) ?? [],
-        commission_totals: totalsByUser.get(row.user_id) ?? { holding: 0, available: 0, paid: 0, total: 0 },
+        commission_totals: totalsByUser.get(row.user_id) ?? { holding: 0, available: 0, paid: 0, total: 0, sales: 0 },
       })),
     },
   };
@@ -333,6 +347,93 @@ async function upsertCode(client: SupabaseClient, body: Record<string, unknown>)
   return { data: { code: data } };
 }
 
+async function findUserByEmail(client: SupabaseClient, email: string) {
+  const needle = email.trim().toLowerCase();
+  for (let page = 1; page <= 20; page += 1) {
+    const { data, error } = await client.auth.admin.listUsers({ page, perPage: 1000 });
+    if (error) throw new Error(`auth users lookup failed: ${error.message}`);
+    const user = data.users.find((item) => (item.email ?? "").toLowerCase() === needle);
+    if (user) return user;
+    if (data.users.length < 1000) break;
+  }
+  return null;
+}
+
+async function manualCreatePartner(client: SupabaseClient, body: Record<string, unknown>, actor: { id: string; email: string }) {
+  const email = asString(body.email).toLowerCase();
+  if (!email || !email.includes("@")) throw new Error("valid creator email is required");
+
+  const user = await findUserByEmail(client, email);
+  if (!user) throw new Error("Creator must create a MediaForge account before admin can invite them");
+
+  const fullName = asString(body.full_name) || asString(user.user_metadata?.display_name) || asString(user.user_metadata?.full_name) || email.split("@")[0];
+  const name = splitName(fullName, email);
+  const commissionRate = Math.max(0, Math.min(1, asNumber(body.commission_rate, 0.3)));
+  const discountPercent = clampPercent(body.discount_percent, 20);
+
+  const applicationPayload = {
+    user_id: user.id,
+    legal_first_name: name.first,
+    legal_last_name: name.last,
+    phone_e164: asString(body.phone, "-"),
+    bank_name: asString(body.bank_name, "Pending"),
+    bank_account_no: asString(body.bank_account_no, "Pending"),
+    bank_account_name: asString(body.bank_account_name, fullName),
+    social_profile_url: asString(body.social_profile_url),
+    social_platform: asString(body.social_platform),
+    follower_count: Math.max(0, Math.trunc(asNumber(body.follower_count, 0))),
+    status: "approved",
+    reviewed_by: actor.id,
+    reviewed_at: new Date().toISOString(),
+    rejection_reason: null,
+    needs_info_message: null,
+    submitted_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
+  const { data: app, error: appError } = await client
+    .from("partner_applications")
+    .upsert(applicationPayload, { onConflict: "user_id" })
+    .select("*")
+    .maybeSingle();
+  if (appError) throw new Error(`manual application save failed: ${appError.message}`);
+  if (!app) throw new Error("manual application save returned empty");
+
+  const { data: partner, error: partnerError } = await client
+    .from("partners")
+    .upsert({
+      user_id: user.id,
+      application_id: app.id,
+      commission_rate: commissionRate,
+      tier: discountPercent >= 20 ? "creator_20" : "standard",
+      approved_at: new Date().toISOString(),
+      suspended_at: null,
+      suspended_reason: null,
+    }, { onConflict: "user_id" })
+    .select("*")
+    .maybeSingle();
+  if (partnerError) throw new Error(`manual partner save failed: ${partnerError.message}`);
+
+  const defaultCode = normalizeCode(body.code || `MF-${email.split("@")[0]}`);
+  const codeResult = await upsertCode(client, {
+    partner_user_id: user.id,
+    code: defaultCode,
+    discount_percent: discountPercent,
+    campaign_label: asString(body.campaign_label, "Invited creator"),
+    is_active: true,
+  });
+
+  await client.from("affiliate_audit_log").insert({
+    actor_id: actor.id,
+    action: "workspace_affiliate_partner_manual_created",
+    entity_type: "partner",
+    entity_id: user.id,
+    diff: { actor_email: actor.email, email, code: defaultCode, discount_percent: discountPercent },
+  });
+
+  return { data: { application: app, partner, code: codeResult.data.code } };
+}
+
 async function toggleCode(client: SupabaseClient, body: Record<string, unknown>) {
   const codeId = asString(body.code_id);
   if (!codeId) throw new Error("code_id is required");
@@ -373,6 +474,8 @@ Deno.serve(async (req) => {
         return json(await rejectApplication(client, body, actor));
       case "upsert_workspace_affiliate_code":
         return json(await upsertCode(client, body));
+      case "manual_create_workspace_affiliate_partner":
+        return json(await manualCreatePartner(client, body, actor));
       case "toggle_workspace_affiliate_code":
         return json(await toggleCode(client, body));
       default:

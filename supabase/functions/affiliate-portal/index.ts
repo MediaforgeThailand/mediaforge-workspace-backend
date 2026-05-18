@@ -15,6 +15,9 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 };
 
+const UPGRADE_SALES_THRESHOLD_THB = 100_000;
+const UPGRADE_DISCOUNT_PERCENT = 20;
+
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -39,6 +42,18 @@ function splitName(fullName: string) {
   };
 }
 
+function normalizeCode(raw: unknown): string {
+  const cleaned = asString(raw)
+    .toUpperCase()
+    .replace(/[^A-Z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  if (!/^[A-Z0-9][A-Z0-9-]{2,39}$/.test(cleaned)) {
+    throw new Error("Affiliate code must be 3-40 characters using letters, numbers, or hyphens");
+  }
+  return cleaned;
+}
+
 async function getAuthedUser(req: Request) {
   const auth = req.headers.get("Authorization") ?? "";
   if (!auth.startsWith("Bearer ")) return null;
@@ -55,20 +70,88 @@ function adminClient() {
   return createClient(SUPABASE_URL, SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 }
 
-async function getStatus(userId: string) {
+function activeSalesTotal(rows: any[]): number {
+  return rows
+    .filter((row) => !["void", "clawback"].includes(String(row.status ?? "")))
+    .reduce((sum, row) => sum + Number(row.net_amount_thb ?? row.gross_amount_thb ?? row.commission_base_amount_thb ?? 0), 0);
+}
+
+async function uniqueUpgradeCode(client: any, user: any, fallbackCode?: string | null) {
+  if (fallbackCode) return normalizeCode(fallbackCode);
+  const seed = normalizeCode(`MF-${asString(user.email).split("@")[0] || user.id.slice(0, 8)}`);
+  for (let i = 0; i < 10; i += 1) {
+    const code = i === 0 ? seed : `${seed}-${i + 1}`;
+    const { data, error } = await client.from("referral_codes").select("id").eq("code", code).maybeSingle();
+    if (error) throw new Error(`code lookup failed: ${error.message}`);
+    if (!data) return code;
+  }
+  return normalizeCode(`MF-${crypto.randomUUID().slice(0, 8)}`);
+}
+
+async function maybeGrantSalesUpgradeCode(
+  client: any,
+  user: any,
+  partner: any | null,
+  codes: any[],
+  salesTotalThb: number,
+) {
+  const unlocked = codes.some((code) => code.is_active !== false && Number(code.discount_percent ?? 0) >= UPGRADE_DISCOUNT_PERCENT);
+  if (!partner || partner.suspended_at || salesTotalThb < UPGRADE_SALES_THRESHOLD_THB || unlocked) return codes;
+
+  try {
+    const target = codes.find((code) => code.is_active !== false) ?? codes[0] ?? null;
+    const code = await uniqueUpgradeCode(client, user, target?.code ?? null);
+    const payload = {
+      user_id: user.id,
+      code,
+      code_type: "partner_affiliate",
+      is_active: true,
+      campaign_label: "100K sales upgrade",
+      discount_percent: UPGRADE_DISCOUNT_PERCENT,
+      stripe_coupon_id: null,
+      discount_duration: "once",
+      updated_at: new Date().toISOString(),
+    };
+
+    const query = target?.id
+      ? client.from("referral_codes").update(payload).eq("id", target.id)
+      : client.from("referral_codes").insert(payload);
+    const { error } = await query;
+    if (error) throw new Error(error.message);
+
+    const { data: refreshed, error: refreshError } = await client
+      .from("referral_codes")
+      .select("*")
+      .eq("user_id", user.id)
+      .eq("code_type", "partner_affiliate")
+      .order("created_at");
+    if (refreshError) throw new Error(refreshError.message);
+    return refreshed ?? codes;
+  } catch (error) {
+    console.warn("[affiliate-portal] sales upgrade code grant skipped:", error);
+    return codes;
+  }
+}
+
+async function getStatus(user: any) {
+  const userId = user.id;
   const client = adminClient();
   const [application, partner, codes, commissions] = await Promise.all([
     client.from("partner_applications").select("*").eq("user_id", userId).maybeSingle(),
     client.from("partners").select("*").eq("user_id", userId).maybeSingle(),
     client.from("referral_codes").select("*").eq("user_id", userId).eq("code_type", "partner_affiliate").order("created_at"),
-    client.from("commission_events").select("*").eq("partner_user_id", userId).order("created_at", { ascending: false }).limit(50),
+    client.from("commission_events").select("*").eq("partner_user_id", userId).order("created_at", { ascending: false }).limit(1000),
   ]);
   if (application.error) throw new Error(`application read failed: ${application.error.message}`);
   if (partner.error) throw new Error(`partner read failed: ${partner.error.message}`);
   if (codes.error) throw new Error(`codes read failed: ${codes.error.message}`);
   if (commissions.error) throw new Error(`commissions read failed: ${commissions.error.message}`);
 
-  const totals = (commissions.data ?? []).reduce((acc: any, row: any) => {
+  const commissionRows = commissions.data ?? [];
+  const salesTotalThb = activeSalesTotal(commissionRows);
+  const resolvedCodes = await maybeGrantSalesUpgradeCode(client, user, partner.data ?? null, codes.data ?? [], salesTotalThb);
+
+  const totals = commissionRows.reduce((acc: any, row: any) => {
     const amount = Number(row.commission_amount_thb ?? 0);
     acc.total += amount;
     if (row.status === "holding") acc.holding += amount;
@@ -81,9 +164,18 @@ async function getStatus(userId: string) {
     data: {
       application: application.data ?? null,
       partner: partner.data ?? null,
-      codes: codes.data ?? [],
-      commissions: commissions.data ?? [],
+      codes: resolvedCodes,
+      commissions: commissionRows.slice(0, 50),
       totals,
+      sales_total_thb: salesTotalThb,
+      upgrade: {
+        threshold_thb: UPGRADE_SALES_THRESHOLD_THB,
+        discount_percent: UPGRADE_DISCOUNT_PERCENT,
+        sales_total_thb: salesTotalThb,
+        remaining_thb: Math.max(0, UPGRADE_SALES_THRESHOLD_THB - salesTotalThb),
+        eligible: salesTotalThb >= UPGRADE_SALES_THRESHOLD_THB,
+        unlocked: resolvedCodes.some((code) => code.is_active !== false && Number(code.discount_percent ?? 0) >= UPGRADE_DISCOUNT_PERCENT),
+      },
     },
   };
 }
@@ -144,7 +236,7 @@ Deno.serve(async (req) => {
 
     switch (action) {
       case "get_affiliate_status":
-        return json(await getStatus(user.id));
+        return json(await getStatus(user));
       case "submit_affiliate_application":
         return json(await submitApplication(user, body));
       default:
