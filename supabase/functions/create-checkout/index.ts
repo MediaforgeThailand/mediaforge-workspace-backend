@@ -99,6 +99,118 @@ function paymentMethodTypes(method: CheckoutPaymentMethod): Array<"promptpay" | 
   return ["promptpay"];
 }
 
+type AffiliateContext = {
+  code: string;
+  codeId: string;
+  partnerUserId: string;
+  discountPercent: number;
+  commissionRate: number;
+  stripeCouponId: string | null;
+};
+
+function normalizeAffiliateCode(raw: unknown): string {
+  return String(raw ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+async function ensureAffiliateCoupon(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  stripe: Stripe,
+  affiliate: AffiliateContext,
+) {
+  if (affiliate.discountPercent <= 0) return null;
+  if (affiliate.stripeCouponId) return affiliate.stripeCouponId;
+
+  const coupon = await stripe.coupons.create({
+    name: `MediaForge creator ${affiliate.code} - ${affiliate.discountPercent}% off`,
+    percent_off: affiliate.discountPercent,
+    duration: "once",
+    metadata: {
+      source: "workspace_affiliate",
+      affiliate_code: affiliate.code,
+      affiliate_code_id: affiliate.codeId,
+      affiliate_partner_user_id: affiliate.partnerUserId,
+    },
+  });
+
+  await supabaseAdmin
+    .from("referral_codes")
+    .update({ stripe_coupon_id: coupon.id, updated_at: new Date().toISOString() })
+    .eq("id", affiliate.codeId);
+
+  affiliate.stripeCouponId = coupon.id;
+  return coupon.id;
+}
+
+async function resolveAffiliateCode(
+  supabaseAdmin: ReturnType<typeof createClient>,
+  stripe: Stripe,
+  rawCode: unknown,
+  buyerUserId: string,
+): Promise<AffiliateContext | null> {
+  const code = normalizeAffiliateCode(rawCode);
+  if (!code) return null;
+
+  const { data: codeRow, error: codeError } = await supabaseAdmin
+    .from("referral_codes")
+    .select("id,user_id,code,code_type,is_active,discount_percent,stripe_coupon_id")
+    .ilike("code", code)
+    .eq("code_type", "partner_affiliate")
+    .maybeSingle();
+  if (codeError) throw new Error("Creator code lookup failed");
+  if (!codeRow || codeRow.is_active !== true) throw new Error("Creator code not found or inactive");
+  if (codeRow.user_id === buyerUserId) throw new Error("You cannot use your own creator code");
+
+  const { data: partner, error: partnerError } = await supabaseAdmin
+    .from("partners")
+    .select("user_id,commission_rate,suspended_at")
+    .eq("user_id", codeRow.user_id)
+    .maybeSingle();
+  if (partnerError) throw new Error("Creator account lookup failed");
+  if (!partner || partner.suspended_at) throw new Error("Creator code is not active");
+
+  const affiliate: AffiliateContext = {
+    code: String(codeRow.code),
+    codeId: String(codeRow.id),
+    partnerUserId: String(codeRow.user_id),
+    discountPercent: Math.max(0, Math.min(100, Number(codeRow.discount_percent ?? 0))),
+    commissionRate: Number(partner.commission_rate ?? 0.3),
+    stripeCouponId: codeRow.stripe_coupon_id ? String(codeRow.stripe_coupon_id) : null,
+  };
+
+  if (affiliate.discountPercent > 0) {
+    await ensureAffiliateCoupon(supabaseAdmin, stripe, affiliate);
+  }
+
+  return affiliate;
+}
+
+function withAffiliateMetadata(
+  metadata: Record<string, string>,
+  affiliate: AffiliateContext | null,
+  discountPercent: number,
+  discountSource: string,
+) {
+  const next: Record<string, string> = { ...metadata };
+  if (discountPercent > 0) {
+    next.discount_pct = String(discountPercent);
+    next.discount_source = discountSource;
+  }
+  if (affiliate) {
+    next.affiliate_code = affiliate.code;
+    next.affiliate_code_id = affiliate.codeId;
+    next.affiliate_partner_user_id = affiliate.partnerUserId;
+    next.affiliate_discount_pct = String(affiliate.discountPercent);
+    next.affiliate_commission_rate = String(affiliate.commissionRate);
+    next.affiliate_attribution_source = "checkout_code";
+  }
+  return next;
+}
+
 function promptPayQrPayload(intent: Stripe.PaymentIntent) {
   const qr = intent.next_action?.promptpay_display_qr_code;
   return {
@@ -170,6 +282,9 @@ serve(async (req) => {
     const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY") || "", {
       apiVersion: "2026-02-25.clover" as any,
     });
+    const affiliateCode = (body as { affiliateCode?: unknown; creatorCode?: unknown }).affiliateCode
+      ?? (body as { creatorCode?: unknown }).creatorCode
+      ?? null;
 
     if (checkoutType === "team_seats") {
       if (!["monthly", "annual"].includes(String(billingInterval))) throw new Error("Invalid billingInterval");
@@ -480,6 +595,14 @@ serve(async (req) => {
       }
     }
 
+    const affiliate = await resolveAffiliateCode(supabaseAdmin, stripe, affiliateCode, user.id);
+    const effectiveDiscountPct = affiliate?.discountPercent && affiliate.discountPercent > 0
+      ? affiliate.discountPercent
+      : (applyFirstTimeDiscount ? FIRST_TIME_DISCOUNT_PCT : 0);
+    const discountSource = affiliate?.discountPercent && affiliate.discountPercent > 0
+      ? "affiliate_code"
+      : (applyFirstTimeDiscount ? "first_time_lite" : "");
+
     // Get or create Stripe customer
     const { data: profile } = await supabaseAdmin
       .from("profiles")
@@ -536,6 +659,12 @@ serve(async (req) => {
       upfront_credits: upfrontCredits.toString(),
       type: "subscription_oneoff",
     };
+    const checkoutMetadata = withAffiliateMetadata(
+      metadata,
+      affiliate,
+      effectiveDiscountPct,
+      discountSource,
+    );
 
     // ── In-app PaymentIntent flow (Stripe Elements, PromptPay + Card) ──
     if (!isThaiCurrency) {
@@ -544,12 +673,9 @@ serve(async (req) => {
         planBillingInterval === "annual" && plan.annual_price_thb != null
           ? Number(plan.annual_price_thb)
           : Number(plan.price_thb);
-      const discountedThb = applyFirstTimeDiscount
-        ? baseThb * (1 - FIRST_TIME_DISCOUNT_PCT / 100)
-        : baseThb;
-      const localized = currencyAmountFromThb(discountedThb, currency, currencyConfig);
+      const localized = currencyAmountFromThb(baseThb, currency, currencyConfig);
       const recurringMetadata: Record<string, string> = {
-        ...metadata,
+        ...checkoutMetadata,
         type: "subscription_recurring",
         currency,
         amount_original: String(localized.amountMajor),
@@ -558,8 +684,8 @@ serve(async (req) => {
         thb_per_currency_unit: String(localized.config.thbPerUnit),
         price_buffer_percent: String(localized.config.bufferPercent),
         country_hint: localized.config.countryHint,
-        ...(applyFirstTimeDiscount
-          ? { first_time_discount_pct: String(FIRST_TIME_DISCOUNT_PCT), original_amount_thb: String(baseThb) }
+        ...(effectiveDiscountPct > 0
+          ? { original_amount_thb: String(baseThb) }
           : {}),
       };
 
@@ -568,7 +694,10 @@ serve(async (req) => {
           { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
 
-      const session = await stripe.checkout.sessions.create({
+      const couponId = affiliate?.discountPercent && affiliate.discountPercent > 0
+        ? affiliate.stripeCouponId
+        : (applyFirstTimeDiscount ? FIRST_TIME_COUPON : null);
+      const sessionParams: any = {
         customer: customerId,
         client_reference_id: user.id,
         line_items: [
@@ -590,7 +719,10 @@ serve(async (req) => {
         subscription_data: { metadata: recurringMetadata },
         success_url: `${origin}/app/pricing?payment=success`,
         cancel_url: `${origin}/app/pricing?payment=cancelled`,
-      });
+      };
+      if (couponId) sessionParams.discounts = [{ coupon: couponId }];
+
+      const session = await stripe.checkout.sessions.create(sessionParams);
 
       return new Response(JSON.stringify({
         url: session.url,
@@ -619,13 +751,16 @@ serve(async (req) => {
       }
 
       // PaymentIntent doesn't natively support coupons — discount the amount inline.
-      const amountSatang = applyFirstTimeDiscount
-        ? Math.round(baseAmountSatang * (1 - FIRST_TIME_DISCOUNT_PCT / 100))
+      const amountSatang = effectiveDiscountPct > 0
+        ? Math.round(baseAmountSatang * (1 - effectiveDiscountPct / 100))
         : baseAmountSatang;
 
-      const piMetadata = applyFirstTimeDiscount
-        ? { ...metadata, first_time_discount_pct: String(FIRST_TIME_DISCOUNT_PCT), original_amount_satang: String(baseAmountSatang) }
-        : metadata;
+      const piMetadata = {
+        ...checkoutMetadata,
+        amount_paid_thb: String(amountSatang / 100),
+        original_amount_thb: String(baseThb),
+        ...(effectiveDiscountPct > 0 ? { original_amount_satang: String(baseAmountSatang) } : {}),
+      };
 
       const pi = await stripe.paymentIntents.create({
         amount: amountSatang,
@@ -681,9 +816,15 @@ serve(async (req) => {
       return new Response(JSON.stringify({ error: "Plan misconfigured (invalid price)" }),
         { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     }
-    const sessionAmountSatang = applyFirstTimeDiscount
-      ? Math.max(100, Math.round(sessionBaseAmountSatang * (1 - FIRST_TIME_DISCOUNT_PCT / 100)))
+    const sessionAmountSatang = effectiveDiscountPct > 0
+      ? Math.max(100, Math.round(sessionBaseAmountSatang * (1 - effectiveDiscountPct / 100)))
       : sessionBaseAmountSatang;
+    const sessionMetadata = {
+      ...checkoutMetadata,
+      amount_paid_thb: String(sessionAmountSatang / 100),
+      original_amount_thb: String(sessionBaseThb),
+      ...(effectiveDiscountPct > 0 ? { original_amount_satang: String(sessionBaseAmountSatang) } : {}),
+    };
     const sessionParams: any = {
       customer: customerId,
       client_reference_id: user.id,
@@ -702,20 +843,16 @@ serve(async (req) => {
       ],
       mode: "payment",
       payment_method_types: paymentMethodTypes(paymentMethod),
-      metadata,
+      metadata: sessionMetadata,
       invoice_creation: {
         enabled: true,
         invoice_data: {
-          metadata: applyFirstTimeDiscount
-            ? { ...metadata, first_time_discount_pct: String(FIRST_TIME_DISCOUNT_PCT) }
-            : metadata,
+          metadata: sessionMetadata,
         },
       },
       payment_intent_data: {
         // Mirror metadata onto PaymentIntent so payment_intent.succeeded webhook works for async PromptPay
-        metadata: applyFirstTimeDiscount
-          ? { ...metadata, first_time_discount_pct: String(FIRST_TIME_DISCOUNT_PCT) }
-          : metadata,
+        metadata: sessionMetadata,
       },
     };
 
@@ -744,6 +881,9 @@ serve(async (req) => {
       "Missing packageId",
       "Invalid billingInterval",
       "Invalid checkout request",
+      "Creator code not found or inactive",
+      "Creator code is not active",
+      "You cannot use your own creator code",
       "Team checkout requires in-app payment",
       "Team checkout is available for personal accounts or existing team admins",
       `Team checkout requires ${TEAM_MIN_SEATS}-${TEAM_MAX_SEATS} seats`,

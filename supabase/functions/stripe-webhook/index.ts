@@ -54,6 +54,46 @@ async function auditLog(
 // Track A — award flat 100 THB to the REFERRER on user_referral
 // attribution confirmation. No-op for partner_affiliate and for
 // already-granted referrals. Safe to call on every successful payment.
+async function ensureAffiliateReferralFromMetadata(
+  sb: ReturnType<typeof createClient>,
+  referredUserId: string,
+  metadata: Record<string, string | undefined> | null | undefined,
+  sourceTag: string,
+): Promise<void> {
+  const codeId = metadata?.affiliate_code_id;
+  const partnerUserId = metadata?.affiliate_partner_user_id;
+  if (!codeId || !partnerUserId || partnerUserId === referredUserId) return;
+
+  try {
+    const { error } = await sb.from("referrals").insert({
+      referrer_user_id: partnerUserId,
+      referred_user_id: referredUserId,
+      code_id: codeId,
+      code_type: "partner_affiliate",
+      attribution_status: "pending",
+      attribution_source: metadata?.affiliate_attribution_source ?? sourceTag,
+      commission_rate: Number(metadata?.affiliate_commission_rate ?? 0.3),
+    });
+    if (error && error.code !== "23505") {
+      console.error(`[STRIPE-WEBHOOK] affiliate referral insert (${sourceTag}) error:`, error);
+    }
+  } catch (e) {
+    console.error(`[STRIPE-WEBHOOK] affiliate referral insert (${sourceTag}) exception:`, e);
+  }
+}
+
+function paidThbFromStripeAmount(
+  amount: number | null | undefined,
+  currency: string | null | undefined,
+  metadata: Record<string, string | undefined> | null | undefined,
+): number {
+  const currencyCode = String(currency ?? "thb").toLowerCase();
+  const major = majorFromStripeAmount(amount, currencyCode);
+  if (currencyCode === "thb") return major;
+  const rate = Number(metadata?.thb_per_currency_unit ?? metadata?.exchange_rate_thb ?? 1);
+  return Number.isFinite(rate) && rate > 0 ? Math.round(major * rate * 100) / 100 : major;
+}
+
 async function awardUserReferralBonusIfEligible(
   sb: ReturnType<typeof createClient>,
   referredUserId: string,
@@ -471,7 +511,8 @@ serve(async (req) => {
         if (txError) console.error("[STRIPE-WEBHOOK] credit_transactions insert error:", txError);
 
         // Use package price from DB instead of session.amount_total (which includes Stripe fees/tax)
-        let amountThb = (session.amount_total || 0) / 100;
+        let amountThb = Number(session.metadata?.amount_paid_thb ?? 0)
+          || paidThbFromStripeAmount(session.amount_total, session.currency, session.metadata);
         if (topupPackageId) {
           const { data: topupPkg } = await supabase
             .from("topup_packages")
@@ -524,7 +565,8 @@ serve(async (req) => {
         let creditsToAdd = parseInt(session.metadata?.upfront_credits || "0", 10);
         let planName = session.metadata?.plan_name || "Unknown";
         let planTarget = session.metadata?.plan_target || "user";
-        let amountThb = (session.amount_total || 0) / 100;
+        let amountThb = Number(session.metadata?.amount_paid_thb ?? 0)
+          || paidThbFromStripeAmount(session.amount_total, session.currency, session.metadata);
 
         // If plan_id exists, fetch from subscription_plans for accuracy
         if (planId) {
@@ -537,7 +579,6 @@ serve(async (req) => {
             creditsToAdd = plan.upfront_credits;
             planName = plan.name;
             planTarget = plan.target;
-            amountThb = plan.price_thb;
           }
         }
 
@@ -685,12 +726,10 @@ serve(async (req) => {
               `skipping commission — will be handled by invoice.paid`
             );
           } else {
+            await ensureAffiliateReferralFromMetadata(supabase, userId, session.metadata, "checkout.session.completed");
             const cycleIndex = await computeCycleIndex(supabase, userId);
 
-            if (cycleIndex > 12) {
-              console.log(`[STRIPE-WEBHOOK] Cycle ${cycleIndex} > 12, skipping commission`);
-            } else {
-              const grossThb = amountThb;
+            const grossThb = amountThb;
               const netThb = amountThb;
 
               const { data: commissionId, error: accrueError } = await supabase.rpc("accrue_commission", {
@@ -738,9 +777,8 @@ serve(async (req) => {
                 } catch (e) {
                   console.warn("[STRIPE-WEBHOOK] checkout commission email lookup failed:", e);
                 }
-              } else {
-                console.log(`[STRIPE-WEBHOOK] No commission (no partner referral)`);
-              }
+            } else {
+              console.log(`[STRIPE-WEBHOOK] No commission (no partner referral)`);
             }
           }
         } catch (e) {
@@ -1057,13 +1095,11 @@ serve(async (req) => {
           if (!invoice.id) {
             console.warn(`[STRIPE-WEBHOOK] Renewal invoice has no ID, skipping commission`);
           } else {
+            await ensureAffiliateReferralFromMetadata(supabase, profile.user_id, subscriptionMeta, "invoice.paid");
             const cycleIndex = await computeCycleIndex(supabase, profile.user_id);
 
-            if (cycleIndex > 12) {
-              console.log(`[STRIPE-WEBHOOK] Renewal cycle ${cycleIndex} > 12, skipping`);
-            } else {
-              const grossThb = (invoice.amount_paid || 0) / 100;
-              const netThb = grossThb;
+            const grossThb = paidThbFromStripeAmount(invoice.amount_paid, invoice.currency, subscriptionMeta);
+            const netThb = grossThb;
 
               if (netThb > 0) {
                 const { data: commissionId, error: accrueError } = await supabase.rpc("accrue_commission", {
@@ -1090,7 +1126,6 @@ serve(async (req) => {
                     stripe_invoice_id: invoice.id,
                   });
                 }
-              }
             }
           }
         } catch (e) {
@@ -1279,13 +1314,14 @@ serve(async (req) => {
                 : plan.upfront_credits
             )
           : creditsToGrant;
-        const amountThb = plan
+        const catalogAmountThb = plan
           ? Number(
               finalBillingCycle === "annual" && plan.annual_price_thb != null
                 ? plan.annual_price_thb
                 : plan.price_thb
             )
           : (intent.amount || 0) / 100;
+        const amountThb = Number(intent.metadata?.amount_paid_thb ?? 0) || ((intent.amount || 0) / 100);
 
         // Re-validate after DB lookup
         if (!Number.isFinite(finalCredits) || finalCredits <= 0) {
@@ -1337,7 +1373,7 @@ serve(async (req) => {
           ...receiptFieldsFromIntent(intent),
           amount_thb: amountThb,
           currency: intent.metadata?.currency ?? intent.currency ?? "thb",
-          amount_original: Number(intent.metadata?.amount_original ?? amountThb),
+          amount_original: Number(intent.metadata?.amount_original ?? intent.metadata?.original_amount_thb ?? catalogAmountThb ?? amountThb),
           exchange_rate_thb: Number(intent.metadata?.thb_per_currency_unit ?? 1),
           price_buffer_percent: Number(intent.metadata?.price_buffer_percent ?? 0),
           checkout_metadata: intent.metadata ?? {},
@@ -1351,8 +1387,9 @@ serve(async (req) => {
 
         // Commission accrual
         try {
+          await ensureAffiliateReferralFromMetadata(supabase, userId, intent.metadata, "payment_intent.succeeded");
           const cycleIndex = await computeCycleIndex(supabase, userId);
-          if (cycleIndex <= 12 && amountThb > 0) {
+          if (amountThb > 0) {
             const { data: commissionId, error: accrueError } = await supabase.rpc("accrue_commission", {
               p_referred_user_id: userId,
               p_stripe_invoice_id: intent.id, // PI id used as idempotency key for one-off
