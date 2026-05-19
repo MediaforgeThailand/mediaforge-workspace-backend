@@ -10,17 +10,24 @@
 --   reconciliation catches it within 24 hours and writes to
 --   affiliate_audit_log so the admin team sees the drift.
 --
--- Three invariants per partner (rounded to 2 decimal THB, drift threshold > 0.01):
---   A. partners.lifetime_paid_thb == SUM(payout_requests.amount_thb
---      WHERE status='paid' AND partner_user_id = X)
---   B. SUM(commission_events.commission_amount_thb WHERE status='paid' AND partner_user_id = X)
---      == SUM(payout_requests.amount_thb WHERE status='paid' AND partner_user_id = X)
---   C. partners.lifetime_commission_thb == SUM(commission_events.commission_amount_thb
---      WHERE status IN ('holding','available','paid') AND partner_user_id = X)
---      — i.e., everything that hasn't been clawed back or voided.
+-- Four invariants (rounded to 2 decimal THB, drift threshold > 0.01):
+--   Partner-level (entity_type='partner'):
+--     A. partners.lifetime_paid_thb == SUM(payout_requests.amount_thb
+--        WHERE status='paid' AND partner_user_id = X)
+--     B. SUM(commission_events.commission_amount_thb WHERE status='paid' AND partner_user_id = X)
+--        == SUM(payout_requests.amount_thb WHERE status='paid' AND partner_user_id = X)
+--     C. partners.lifetime_commission_thb == SUM(commission_events.commission_amount_thb
+--        WHERE status IN ('holding','available','paid') AND partner_user_id = X)
+--        — i.e., everything that hasn't been clawed back or voided.
+--   Payout-level (entity_type='payout'):
+--     D. payout_requests.amount_thb == SUM(commission_events.commission_amount_thb
+--        WHERE id = ANY(commission_ids)) for each paid payout.
+--        Invariant B catches mismatches at the aggregate level but two opposite
+--        per-payout errors can cancel out across a partner; invariant D pins
+--        the error to the specific payout row so admin knows which one to fix.
 --
 -- A drift writes a row to affiliate_audit_log with action='reconciliation_drift',
--- entity_type='partner', entity_id=user_id, and a diff payload that names the
+-- the appropriate entity_type/entity_id, and a diff payload that names the
 -- invariant, expected, actual, and signed delta. No data is mutated.
 
 CREATE OR REPLACE FUNCTION public.affiliate_reconcile()
@@ -120,6 +127,48 @@ BEGIN
           'expected', v_sum_active_commissions,
           'actual', v_stored_commission,
           'delta', v_stored_commission - v_sum_active_commissions
+        )
+      );
+      v_drift_count := v_drift_count + 1;
+    END IF;
+  END LOOP;
+
+  -- Invariant D: per-paid-payout integrity — each payout's amount_thb must
+  -- equal the sum of its commission_ids' commission_amount_thb. Aggregate
+  -- invariant B can be fooled by two opposite-direction per-payout errors
+  -- cancelling out; D pins the drift to the specific payout row.
+  --
+  -- We sum across all matching commission_events regardless of current
+  -- status — the integrity check is "what was paid out matches what the
+  -- payout was built from", not "what's the current status of those
+  -- commissions". A clawback after payout is a separate event.
+  FOR r IN
+    SELECT pr.id AS payout_id,
+           pr.partner_user_id,
+           pr.amount_thb,
+           pr.commission_ids,
+           COALESCE((
+             SELECT SUM(ce.commission_amount_thb)
+             FROM public.commission_events ce
+             WHERE ce.id = ANY(pr.commission_ids)
+           ), 0) AS commissions_sum
+    FROM public.payout_requests pr
+    WHERE pr.status = 'paid'
+  LOOP
+    IF ABS(ROUND(r.amount_thb, 2) - ROUND(r.commissions_sum, 2)) > 0.01 THEN
+      INSERT INTO public.affiliate_audit_log (actor_id, action, entity_type, entity_id, diff)
+      VALUES (
+        NULL,
+        'reconciliation_drift',
+        'payout',
+        r.payout_id::text,
+        jsonb_build_object(
+          'invariant', 'D_per_payout_integrity',
+          'payout_id', r.payout_id,
+          'partner_user_id', r.partner_user_id,
+          'expected', ROUND(r.commissions_sum, 2),
+          'actual', ROUND(r.amount_thb, 2),
+          'delta', ROUND(r.amount_thb - r.commissions_sum, 2)
         )
       );
       v_drift_count := v_drift_count + 1;

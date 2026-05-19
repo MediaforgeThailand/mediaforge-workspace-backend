@@ -258,6 +258,125 @@ END $$;
 ROLLBACK;
 
 -- ─────────────────────────────────────────────────────────────
+-- TEST 6: Invariant D — per-payout integrity. Two paid payouts with
+--         opposite-direction errors that CANCEL OUT at the partner level
+--         (so invariant B would not fire), but each individual payout
+--         drifts and invariant D catches both.
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_referred UUID;
+  v_app_id UUID;
+  v_code_id UUID;
+  v_referral_id UUID;
+  v_event_ids UUID[];
+  v_payout_1 UUID;
+  v_payout_2 UUID;
+  v_drift_count_b INT;
+  v_drift_count_d INT;
+  v_drift_1 jsonb;
+  v_drift_2 jsonb;
+BEGIN
+  SELECT user_id INTO v_partner
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  SELECT user_id INTO v_referred FROM public.user_credits
+    WHERE user_id <> v_partner ORDER BY user_id LIMIT 1;
+
+  IF v_partner IS NULL OR v_referred IS NULL THEN
+    RAISE EXCEPTION 'TEST 6 SETUP FAILED';
+  END IF;
+
+  INSERT INTO public.partner_applications (
+    user_id, legal_first_name, legal_last_name, phone_e164,
+    bank_name, bank_account_no, bank_account_name, status
+  ) VALUES (v_partner, 'Per', 'Payout', '+66999999999', 'SCB', '0123456789', 'Per', 'approved')
+  RETURNING id INTO v_app_id;
+
+  -- Partner totals contrived so A, B, C all balance:
+  --   lifetime_paid_thb = 800 = sum of both paid payouts (500+300)
+  --   lifetime_commission_thb = 800 = sum of all 4 paid commissions
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at, lifetime_paid_thb, lifetime_commission_thb)
+    VALUES (v_partner, v_app_id, 0.3, now(), 800, 800);
+  INSERT INTO public.referral_codes (user_id, code, code_type, is_active, discount_percent)
+    VALUES (v_partner, 'MF-PER-PAYOUT', 'partner_affiliate', true, 0) RETURNING id INTO v_code_id;
+  INSERT INTO public.referrals (referrer_user_id, referred_user_id, code_id, code_type, attribution_status)
+    VALUES (v_partner, v_referred, v_code_id, 'partner_affiliate', 'confirmed') RETURNING id INTO v_referral_id;
+
+  -- 4 paid commission_events totalling 800 (2 of 200 each, 2 of 200 each)
+  WITH ins AS (
+    INSERT INTO public.commission_events (
+      partner_user_id, referred_user_id, referral_id,
+      stripe_invoice_id, gross_amount_thb, net_amount_thb,
+      commission_rate, commission_amount_thb, billing_cycle,
+      cycle_index, status, hold_until, available_at, paid_at
+    )
+    SELECT v_partner, v_referred, v_referral_id,
+           'in_perpay_' || gs::text, 1000, 1000,
+           0.3, 200, 'month', gs, 'paid',
+           now() - interval '40 days', now() - interval '10 days', now() - interval '1 day'
+    FROM generate_series(1, 4) gs
+    RETURNING id
+  )
+  SELECT array_agg(id) INTO v_event_ids FROM ins;
+
+  -- Payout #1: amount=500 BUT commission_ids=[c1, c2] sums to 400 → over by 100
+  INSERT INTO public.payout_requests (
+    partner_user_id, amount_thb, bank_snapshot, status, commission_ids
+  ) VALUES (v_partner, 500, '{}'::jsonb, 'paid', ARRAY[v_event_ids[1], v_event_ids[2]])
+  RETURNING id INTO v_payout_1;
+
+  -- Payout #2: amount=300 BUT commission_ids=[c3, c4] sums to 400 → under by 100
+  INSERT INTO public.payout_requests (
+    partner_user_id, amount_thb, bank_snapshot, status, commission_ids
+  ) VALUES (v_partner, 300, '{}'::jsonb, 'paid', ARRAY[v_event_ids[3], v_event_ids[4]])
+  RETURNING id INTO v_payout_2;
+
+  PERFORM public.affiliate_reconcile();
+
+  -- Invariant B must NOT fire: sum(paid payouts)=800 == sum(paid commissions)=800
+  SELECT count(*) INTO v_drift_count_b FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_partner::text
+      AND diff->>'invariant' = 'B_paid_commissions_vs_paid_payouts';
+
+  -- Invariant D must fire TWICE — one row per drifting payout
+  SELECT count(*) INTO v_drift_count_d FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND diff->>'invariant' = 'D_per_payout_integrity'
+      AND entity_id IN (v_payout_1::text, v_payout_2::text);
+
+  SELECT diff INTO v_drift_1 FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_payout_1::text
+      AND diff->>'invariant' = 'D_per_payout_integrity'
+    ORDER BY created_at DESC LIMIT 1;
+
+  SELECT diff INTO v_drift_2 FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_payout_2::text
+      AND diff->>'invariant' = 'D_per_payout_integrity'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift_count_b = 0
+     AND v_drift_count_d = 2
+     AND (v_drift_1->>'delta')::numeric = 100
+     AND (v_drift_2->>'delta')::numeric = -100 THEN
+    RAISE NOTICE '✅ TEST 6 PASS: invariant D caught two opposite-direction errors that B alone would have missed';
+  ELSE
+    RAISE EXCEPTION 'TEST 6 FAIL: B_drifts=%, D_drifts=%/2, payout_1_delta=%, payout_2_delta=%',
+      v_drift_count_b, v_drift_count_d, v_drift_1->>'delta', v_drift_2->>'delta';
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
 -- TEST 5: Cron is scheduled
 -- ─────────────────────────────────────────────────────────────
 BEGIN;
