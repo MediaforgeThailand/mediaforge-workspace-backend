@@ -76,21 +76,6 @@ function activeSalesTotal(rows: any[]): number {
     .reduce((sum, row) => sum + Number(row.net_amount_thb ?? row.gross_amount_thb ?? row.commission_base_amount_thb ?? 0), 0);
 }
 
-async function mintUpgradeCode(client: any, user: any, existingCode?: string | null) {
-  // Derive a NEW code from the partner's referral code, never reuse it.
-  // MF-AAH -> MF-AAH-20; falls back to seed if the partner has no code yet.
-  const base = existingCode
-    ? normalizeCode(`${existingCode}-20`)
-    : normalizeCode(`MF-${asString(user.email).split("@")[0] || user.id.slice(0, 8)}-20`);
-  for (let i = 0; i < 10; i += 1) {
-    const code = i === 0 ? base : `${base}-${i + 1}`;
-    const { data, error } = await client.from("referral_codes").select("id").eq("code", code).maybeSingle();
-    if (error) throw new Error(`code lookup failed: ${error.message}`);
-    if (!data) return code;
-  }
-  return normalizeCode(`MF-${crypto.randomUUID().slice(0, 8)}-20`);
-}
-
 async function maybeGrantSalesUpgradeCode(
   client: any,
   user: any,
@@ -101,59 +86,35 @@ async function maybeGrantSalesUpgradeCode(
   const unlocked = codes.some((code) => code.is_active !== false && Number(code.discount_percent ?? 0) >= UPGRADE_DISCOUNT_PERCENT);
   if (!partner || partner.suspended_at || salesTotalThb < UPGRADE_SALES_THRESHOLD_THB || unlocked) return codes;
 
-  try {
-    // Insert a NEW code alongside the existing referral code so the
-    // partner's old `?ref=` links keep working as referral-only and
-    // the discount code is a separate share-friendly handle.
-    const existing = codes.find((code) => code.is_active !== false) ?? codes[0] ?? null;
-    const code = await mintUpgradeCode(client, user, existing?.code ?? null);
-    const payload = {
-      user_id: user.id,
-      code,
-      code_type: "partner_affiliate",
-      is_active: true,
-      campaign_label: "100K sales upgrade",
-      discount_percent: UPGRADE_DISCOUNT_PERCENT,
-      stripe_coupon_id: null,
-      discount_duration: "once",
-      updated_at: new Date().toISOString(),
-    };
+  // Atomic grant via SECURITY DEFINER RPC. Replaces the prior 3-call
+  // sequence (INSERT code → INSERT audit → SELECT refreshed) that could
+  // orphan a code without an audit row (or vice versa) if a step failed.
+  const { data: rpcResult, error: rpcError } = await client.rpc("grant_sales_upgrade_code", {
+    p_user_id: user.id,
+    p_email: user.email ?? "",
+    p_sales_total_thb: salesTotalThb,
+    p_threshold_thb: UPGRADE_SALES_THRESHOLD_THB,
+    p_discount_percent: UPGRADE_DISCOUNT_PERCENT,
+  });
 
-    const { data: inserted, error: insertError } = await client
-      .from("referral_codes")
-      .insert(payload)
-      .select("id")
-      .single();
-    if (insertError) throw new Error(insertError.message);
-
-    await client.from("affiliate_audit_log").insert({
-      actor_id: user.id,
-      action: "workspace_affiliate_upgrade_code_granted",
-      entity_type: "referral_code",
-      entity_id: inserted?.id ?? code,
-      diff: {
-        source: "self_serve_sales_threshold",
-        partner_user_id: user.id,
-        sales_total_thb: salesTotalThb,
-        threshold_thb: UPGRADE_SALES_THRESHOLD_THB,
-        discount_percent: UPGRADE_DISCOUNT_PERCENT,
-        existing_code: existing?.code ?? null,
-        new_code: code,
-      },
-    });
-
-    const { data: refreshed, error: refreshError } = await client
-      .from("referral_codes")
-      .select("*")
-      .eq("user_id", user.id)
-      .eq("code_type", "partner_affiliate")
-      .order("created_at");
-    if (refreshError) throw new Error(refreshError.message);
-    return refreshed ?? codes;
-  } catch (error) {
-    console.warn("[affiliate-portal] sales upgrade code grant skipped:", error);
+  if (rpcError) {
+    console.warn("[affiliate-portal] grant_sales_upgrade_code RPC failed:", rpcError);
     return codes;
   }
+  // RPC returns NULL when no grant happened (gates failed or idempotent skip).
+  if (!rpcResult) return codes;
+
+  const { data: refreshed, error: refreshError } = await client
+    .from("referral_codes")
+    .select("*")
+    .eq("user_id", user.id)
+    .eq("code_type", "partner_affiliate")
+    .order("created_at");
+  if (refreshError) {
+    console.warn("[affiliate-portal] post-grant refresh failed:", refreshError);
+    return codes;
+  }
+  return refreshed ?? codes;
 }
 
 async function getStatus(user: any) {
