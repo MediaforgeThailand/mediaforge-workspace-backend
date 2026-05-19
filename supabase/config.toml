@@ -180,3 +180,6 @@ verify_jwt = false
 
 [functions.captions-transcribe]
 verify_jwt = true
+
+[functions.affiliate-drift-notifier]
+verify_jwt = false
