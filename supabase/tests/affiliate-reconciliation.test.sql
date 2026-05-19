@@ -1,0 +1,696 @@
+-- Tests for the affiliate_reconcile() cron from
+-- 20260519043838_affiliate_reconciliation_cron.sql.
+--
+-- Verifies:
+--   1. No drift → no audit_log rows written, returns 0
+--   2. Drift A (lifetime_paid_thb out of sync) → detected, audit row written
+--   3. Drift B (paid_commissions ≠ paid_payouts) → detected
+--   4. Drift C (lifetime_commission_thb out of sync) → detected
+--   5. Cron job is scheduled
+--
+-- All assertions fail-loud via RAISE EXCEPTION.
+
+\set ON_ERROR_STOP on
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 1: No drift — clean partner returns 0, no audit row
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_referred UUID;
+  v_app_id UUID;
+  v_drift_before INT;
+  v_drift_after INT;
+  v_count INT;
+BEGIN
+  SELECT user_id INTO v_partner
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  IF v_partner IS NULL THEN
+    RAISE EXCEPTION 'TEST 1 SETUP FAILED';
+  END IF;
+
+  INSERT INTO public.partner_applications (
+    user_id, legal_first_name, legal_last_name, phone_e164,
+    bank_name, bank_account_no, bank_account_name, status
+  ) VALUES (v_partner, 'Clean', 'Reconcile', '+66999999999', 'SCB', '0123456789', 'Clean', 'approved')
+  RETURNING id INTO v_app_id;
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at, lifetime_paid_thb, lifetime_commission_thb)
+    VALUES (v_partner, v_app_id, 0.3, now(), 0, 0);
+
+  SELECT count(*) INTO v_drift_before FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift' AND entity_id = v_partner::text;
+
+  v_count := public.affiliate_reconcile();
+
+  SELECT count(*) INTO v_drift_after FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift' AND entity_id = v_partner::text;
+
+  IF v_drift_after = v_drift_before THEN
+    RAISE NOTICE '✅ TEST 1 PASS: clean partner produced no drift rows';
+  ELSE
+    RAISE EXCEPTION 'TEST 1 FAIL: clean partner produced % drift rows', v_drift_after - v_drift_before;
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 2: Drift A — lifetime_paid_thb stored = 300 but no paid payouts
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_app_id UUID;
+  v_drift jsonb;
+BEGIN
+  SELECT user_id INTO v_partner
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  IF v_partner IS NULL THEN
+    RAISE EXCEPTION 'TEST 2 SETUP FAILED';
+  END IF;
+
+  INSERT INTO public.partner_applications (
+    user_id, legal_first_name, legal_last_name, phone_e164,
+    bank_name, bank_account_no, bank_account_name, status
+  ) VALUES (v_partner, 'Drift', 'A', '+66999999999', 'SCB', '0123456789', 'Drift', 'approved')
+  RETURNING id INTO v_app_id;
+  -- Intentional drift: stored 300 but no actual paid payout
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at, lifetime_paid_thb, lifetime_commission_thb)
+    VALUES (v_partner, v_app_id, 0.3, now(), 300, 0);
+
+  PERFORM public.affiliate_reconcile();
+
+  SELECT diff INTO v_drift FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_partner::text
+      AND diff->>'invariant' = 'A_lifetime_paid_vs_paid_payouts'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift IS NOT NULL
+     AND (v_drift->>'actual')::numeric = 300
+     AND (v_drift->>'expected')::numeric = 0
+     AND (v_drift->>'delta')::numeric = 300 THEN
+    RAISE NOTICE '✅ TEST 2 PASS: drift A detected with correct payload';
+  ELSE
+    RAISE EXCEPTION 'TEST 2 FAIL: drift row = %', v_drift;
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 3: Drift B — paid commissions (600) != paid payouts (300)
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_referred UUID;
+  v_app_id UUID;
+  v_code_id UUID;
+  v_referral_id UUID;
+  v_drift jsonb;
+BEGIN
+  SELECT user_id INTO v_partner
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  SELECT user_id INTO v_referred FROM public.user_credits
+    WHERE user_id <> v_partner ORDER BY user_id LIMIT 1;
+
+  IF v_partner IS NULL OR v_referred IS NULL THEN
+    RAISE EXCEPTION 'TEST 3 SETUP FAILED';
+  END IF;
+
+  INSERT INTO public.partner_applications (
+    user_id, legal_first_name, legal_last_name, phone_e164,
+    bank_name, bank_account_no, bank_account_name, status
+  ) VALUES (v_partner, 'Drift', 'B', '+66999999999', 'SCB', '0123456789', 'Drift', 'approved')
+  RETURNING id INTO v_app_id;
+  -- Make A invariant clean: lifetime_paid = 300 = sum of paid payouts (300)
+  -- But B will be wrong: paid commissions (600) ≠ paid payouts (300)
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at, lifetime_paid_thb, lifetime_commission_thb)
+    VALUES (v_partner, v_app_id, 0.3, now(), 300, 600);
+  INSERT INTO public.referral_codes (user_id, code, code_type, is_active, discount_percent)
+    VALUES (v_partner, 'MF-DRIFT-B', 'partner_affiliate', true, 0) RETURNING id INTO v_code_id;
+  INSERT INTO public.referrals (referrer_user_id, referred_user_id, code_id, code_type, attribution_status)
+    VALUES (v_partner, v_referred, v_code_id, 'partner_affiliate', 'confirmed') RETURNING id INTO v_referral_id;
+
+  -- Two paid commission_events totalling 600
+  INSERT INTO public.commission_events (
+    partner_user_id, referred_user_id, referral_id,
+    stripe_invoice_id, gross_amount_thb, net_amount_thb,
+    commission_rate, commission_amount_thb, billing_cycle,
+    cycle_index, status, hold_until, available_at, paid_at
+  )
+  SELECT v_partner, v_referred, v_referral_id,
+         'in_drift_b_' || gs::text, 1000, 1000,
+         0.3, 300, 'month', gs, 'paid',
+         now() - interval '40 days', now() - interval '10 days', now() - interval '1 day'
+  FROM generate_series(1, 2) gs;
+
+  -- One paid payout for 300 (so A passes: 300 = 300; but B fails: 600 != 300)
+  INSERT INTO public.payout_requests (
+    partner_user_id, amount_thb, bank_snapshot, status, commission_ids
+  ) VALUES (v_partner, 300, '{}'::jsonb, 'paid', ARRAY[]::UUID[]);
+
+  PERFORM public.affiliate_reconcile();
+
+  SELECT diff INTO v_drift FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_partner::text
+      AND diff->>'invariant' = 'B_paid_commissions_vs_paid_payouts'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift IS NOT NULL
+     AND (v_drift->>'actual')::numeric = 600
+     AND (v_drift->>'expected')::numeric = 300
+     AND (v_drift->>'delta')::numeric = 300 THEN
+    RAISE NOTICE '✅ TEST 3 PASS: drift B detected with correct payload';
+  ELSE
+    RAISE EXCEPTION 'TEST 3 FAIL: drift row = %', v_drift;
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 4: Drift C — lifetime_commission_thb stored = 1000 but
+--                   active commissions sum to 300
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_referred UUID;
+  v_app_id UUID;
+  v_code_id UUID;
+  v_referral_id UUID;
+  v_drift jsonb;
+BEGIN
+  SELECT user_id INTO v_partner
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  SELECT user_id INTO v_referred FROM public.user_credits
+    WHERE user_id <> v_partner ORDER BY user_id LIMIT 1;
+
+  IF v_partner IS NULL OR v_referred IS NULL THEN
+    RAISE EXCEPTION 'TEST 4 SETUP FAILED';
+  END IF;
+
+  INSERT INTO public.partner_applications (
+    user_id, legal_first_name, legal_last_name, phone_e164,
+    bank_name, bank_account_no, bank_account_name, status
+  ) VALUES (v_partner, 'Drift', 'C', '+66999999999', 'SCB', '0123456789', 'Drift', 'approved')
+  RETURNING id INTO v_app_id;
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at, lifetime_paid_thb, lifetime_commission_thb)
+    VALUES (v_partner, v_app_id, 0.3, now(), 0, 1000);
+  INSERT INTO public.referral_codes (user_id, code, code_type, is_active, discount_percent)
+    VALUES (v_partner, 'MF-DRIFT-C', 'partner_affiliate', true, 0) RETURNING id INTO v_code_id;
+  INSERT INTO public.referrals (referrer_user_id, referred_user_id, code_id, code_type, attribution_status)
+    VALUES (v_partner, v_referred, v_code_id, 'partner_affiliate', 'confirmed') RETURNING id INTO v_referral_id;
+
+  INSERT INTO public.commission_events (
+    partner_user_id, referred_user_id, referral_id,
+    stripe_invoice_id, gross_amount_thb, net_amount_thb,
+    commission_rate, commission_amount_thb, billing_cycle,
+    cycle_index, status, hold_until
+  ) VALUES (
+    v_partner, v_referred, v_referral_id,
+    'in_drift_c', 1000, 1000, 0.3, 300, 'month', 1, 'holding',
+    now() + interval '30 days'
+  );
+
+  PERFORM public.affiliate_reconcile();
+
+  SELECT diff INTO v_drift FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_partner::text
+      AND diff->>'invariant' = 'C_lifetime_commission_vs_active_commissions'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift IS NOT NULL
+     AND (v_drift->>'actual')::numeric = 1000
+     AND (v_drift->>'expected')::numeric = 300
+     AND (v_drift->>'delta')::numeric = 700 THEN
+    RAISE NOTICE '✅ TEST 4 PASS: drift C detected with correct payload';
+  ELSE
+    RAISE EXCEPTION 'TEST 4 FAIL: drift row = %', v_drift;
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 6: Invariant D — per-payout integrity. Two paid payouts with
+--         opposite-direction errors that CANCEL OUT at the partner level
+--         (so invariant B would not fire), but each individual payout
+--         drifts and invariant D catches both.
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_referred UUID;
+  v_app_id UUID;
+  v_code_id UUID;
+  v_referral_id UUID;
+  v_event_ids UUID[];
+  v_payout_1 UUID;
+  v_payout_2 UUID;
+  v_drift_count_b INT;
+  v_drift_count_d INT;
+  v_drift_1 jsonb;
+  v_drift_2 jsonb;
+BEGIN
+  SELECT user_id INTO v_partner
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  SELECT user_id INTO v_referred FROM public.user_credits
+    WHERE user_id <> v_partner ORDER BY user_id LIMIT 1;
+
+  IF v_partner IS NULL OR v_referred IS NULL THEN
+    RAISE EXCEPTION 'TEST 6 SETUP FAILED';
+  END IF;
+
+  INSERT INTO public.partner_applications (
+    user_id, legal_first_name, legal_last_name, phone_e164,
+    bank_name, bank_account_no, bank_account_name, status
+  ) VALUES (v_partner, 'Per', 'Payout', '+66999999999', 'SCB', '0123456789', 'Per', 'approved')
+  RETURNING id INTO v_app_id;
+
+  -- Partner totals contrived so A, B, C all balance:
+  --   lifetime_paid_thb = 800 = sum of both paid payouts (500+300)
+  --   lifetime_commission_thb = 800 = sum of all 4 paid commissions
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at, lifetime_paid_thb, lifetime_commission_thb)
+    VALUES (v_partner, v_app_id, 0.3, now(), 800, 800);
+  INSERT INTO public.referral_codes (user_id, code, code_type, is_active, discount_percent)
+    VALUES (v_partner, 'MF-PER-PAYOUT', 'partner_affiliate', true, 0) RETURNING id INTO v_code_id;
+  INSERT INTO public.referrals (referrer_user_id, referred_user_id, code_id, code_type, attribution_status)
+    VALUES (v_partner, v_referred, v_code_id, 'partner_affiliate', 'confirmed') RETURNING id INTO v_referral_id;
+
+  -- 4 paid commission_events totalling 800 (2 of 200 each, 2 of 200 each)
+  WITH ins AS (
+    INSERT INTO public.commission_events (
+      partner_user_id, referred_user_id, referral_id,
+      stripe_invoice_id, gross_amount_thb, net_amount_thb,
+      commission_rate, commission_amount_thb, billing_cycle,
+      cycle_index, status, hold_until, available_at, paid_at
+    )
+    SELECT v_partner, v_referred, v_referral_id,
+           'in_perpay_' || gs::text, 1000, 1000,
+           0.3, 200, 'month', gs, 'paid',
+           now() - interval '40 days', now() - interval '10 days', now() - interval '1 day'
+    FROM generate_series(1, 4) gs
+    RETURNING id
+  )
+  SELECT array_agg(id) INTO v_event_ids FROM ins;
+
+  -- Payout #1: amount=500 BUT commission_ids=[c1, c2] sums to 400 → over by 100
+  INSERT INTO public.payout_requests (
+    partner_user_id, amount_thb, bank_snapshot, status, commission_ids
+  ) VALUES (v_partner, 500, '{}'::jsonb, 'paid', ARRAY[v_event_ids[1], v_event_ids[2]])
+  RETURNING id INTO v_payout_1;
+
+  -- Payout #2: amount=300 BUT commission_ids=[c3, c4] sums to 400 → under by 100
+  INSERT INTO public.payout_requests (
+    partner_user_id, amount_thb, bank_snapshot, status, commission_ids
+  ) VALUES (v_partner, 300, '{}'::jsonb, 'paid', ARRAY[v_event_ids[3], v_event_ids[4]])
+  RETURNING id INTO v_payout_2;
+
+  PERFORM public.affiliate_reconcile();
+
+  -- Invariant B must NOT fire: sum(paid payouts)=800 == sum(paid commissions)=800
+  SELECT count(*) INTO v_drift_count_b FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_partner::text
+      AND diff->>'invariant' = 'B_paid_commissions_vs_paid_payouts';
+
+  -- Invariant D must fire TWICE — one row per drifting payout
+  SELECT count(*) INTO v_drift_count_d FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND diff->>'invariant' = 'D_per_payout_integrity'
+      AND entity_id IN (v_payout_1::text, v_payout_2::text);
+
+  SELECT diff INTO v_drift_1 FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_payout_1::text
+      AND diff->>'invariant' = 'D_per_payout_integrity'
+    ORDER BY created_at DESC LIMIT 1;
+
+  SELECT diff INTO v_drift_2 FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_payout_2::text
+      AND diff->>'invariant' = 'D_per_payout_integrity'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift_count_b = 0
+     AND v_drift_count_d = 2
+     AND (v_drift_1->>'delta')::numeric = 100
+     AND (v_drift_2->>'delta')::numeric = -100 THEN
+    RAISE NOTICE '✅ TEST 6 PASS: invariant D caught two opposite-direction errors that B alone would have missed';
+  ELSE
+    RAISE EXCEPTION 'TEST 6 FAIL: B_drifts=%, D_drifts=%/2, payout_1_delta=%, payout_2_delta=%',
+      v_drift_count_b, v_drift_count_d, v_drift_1->>'delta', v_drift_2->>'delta';
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 7: Invariant E — attribution mismatch. commission_event has the
+--         wrong partner_user_id relative to its referrals row.
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner_a UUID;
+  v_partner_b UUID;
+  v_referred UUID;
+  v_app_a UUID;
+  v_app_b UUID;
+  v_code_a UUID;
+  v_referral_id UUID;
+  v_event_id UUID;
+  v_drift jsonb;
+BEGIN
+  -- Need TWO partners and a third user as the referred customer
+  SELECT user_id INTO v_partner_a
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  SELECT user_id INTO v_partner_b
+  FROM public.user_credits
+  WHERE user_id <> v_partner_a
+    AND user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  SELECT user_id INTO v_referred FROM public.user_credits
+    WHERE user_id NOT IN (v_partner_a, v_partner_b)
+    ORDER BY user_id LIMIT 1;
+
+  IF v_partner_a IS NULL OR v_partner_b IS NULL OR v_referred IS NULL THEN
+    RAISE EXCEPTION 'TEST 7 SETUP FAILED: need at least 3 distinct user_credits rows';
+  END IF;
+
+  INSERT INTO public.partner_applications (user_id, legal_first_name, legal_last_name, phone_e164, bank_name, bank_account_no, bank_account_name, status)
+    VALUES (v_partner_a, 'Partner', 'A', '+66911111111', 'SCB', '0123456789', 'A', 'approved') RETURNING id INTO v_app_a;
+  INSERT INTO public.partner_applications (user_id, legal_first_name, legal_last_name, phone_e164, bank_name, bank_account_no, bank_account_name, status)
+    VALUES (v_partner_b, 'Partner', 'B', '+66922222222', 'SCB', '0123456789', 'B', 'approved') RETURNING id INTO v_app_b;
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at) VALUES (v_partner_a, v_app_a, 0.3, now());
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at) VALUES (v_partner_b, v_app_b, 0.3, now());
+
+  INSERT INTO public.referral_codes (user_id, code, code_type, is_active, discount_percent)
+    VALUES (v_partner_a, 'MF-ATTR-A', 'partner_affiliate', true, 0) RETURNING id INTO v_code_a;
+
+  -- Referral row says: A referred the customer
+  INSERT INTO public.referrals (referrer_user_id, referred_user_id, code_id, code_type, attribution_status)
+    VALUES (v_partner_a, v_referred, v_code_a, 'partner_affiliate', 'confirmed') RETURNING id INTO v_referral_id;
+
+  -- BUT a commission_event credits partner B (attribution corruption)
+  INSERT INTO public.commission_events (
+    partner_user_id, referred_user_id, referral_id,
+    stripe_invoice_id, gross_amount_thb, net_amount_thb,
+    commission_rate, commission_amount_thb, billing_cycle,
+    cycle_index, status, hold_until
+  ) VALUES (
+    v_partner_b, v_referred, v_referral_id,
+    'in_attr_mismatch', 1000, 1000, 0.3, 300, 'month', 1, 'holding',
+    now() + interval '30 days'
+  ) RETURNING id INTO v_event_id;
+
+  PERFORM public.affiliate_reconcile();
+
+  SELECT diff INTO v_drift FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_event_id::text
+      AND diff->>'invariant' = 'E_attribution_mismatch'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift IS NOT NULL
+     AND (v_drift->>'expected_partner_user_id')::uuid = v_partner_a
+     AND (v_drift->>'actual_partner_user_id')::uuid = v_partner_b THEN
+    RAISE NOTICE '✅ TEST 7 PASS: attribution mismatch detected, drift names both expected and actual partners';
+  ELSE
+    RAISE EXCEPTION 'TEST 7 FAIL: drift = %', v_drift;
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 8: Invariant G — locked-base mismatch. commission_event was
+--         written with a base that diverges from the referral's locked
+--         value (corruption or manual SQL tamper).
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_referred UUID;
+  v_app_id UUID;
+  v_code_id UUID;
+  v_referral_id UUID;
+  v_event_id UUID;
+  v_drift jsonb;
+BEGIN
+  SELECT user_id INTO v_partner
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  SELECT user_id INTO v_referred FROM public.user_credits
+    WHERE user_id <> v_partner ORDER BY user_id LIMIT 1;
+
+  IF v_partner IS NULL OR v_referred IS NULL THEN
+    RAISE EXCEPTION 'TEST 8 SETUP FAILED';
+  END IF;
+
+  INSERT INTO public.partner_applications (user_id, legal_first_name, legal_last_name, phone_e164, bank_name, bank_account_no, bank_account_name, status)
+    VALUES (v_partner, 'Locked', 'Base', '+66999999999', 'SCB', '0123456789', 'Locked', 'approved') RETURNING id INTO v_app_id;
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at) VALUES (v_partner, v_app_id, 0.3, now());
+  INSERT INTO public.referral_codes (user_id, code, code_type, is_active, discount_percent)
+    VALUES (v_partner, 'MF-LOCKED-BASE', 'partner_affiliate', true, 0) RETURNING id INTO v_code_id;
+
+  -- Referral locked at base = 174 (e.g., first-time-discount price)
+  INSERT INTO public.referrals (
+    referrer_user_id, referred_user_id, code_id, code_type,
+    attribution_status, commission_base_amount_thb, commission_rate
+  )
+  VALUES (v_partner, v_referred, v_code_id, 'partner_affiliate', 'confirmed', 174, 0.3)
+  RETURNING id INTO v_referral_id;
+
+  -- Commission_event written with base = 290 (renewal price, NOT the locked value)
+  INSERT INTO public.commission_events (
+    partner_user_id, referred_user_id, referral_id,
+    stripe_invoice_id, gross_amount_thb, net_amount_thb,
+    commission_rate, commission_amount_thb, billing_cycle,
+    cycle_index, status, hold_until, commission_base_amount_thb
+  ) VALUES (
+    v_partner, v_referred, v_referral_id,
+    'in_locked_base', 1000, 1000, 0.3, 87, 'month', 2, 'holding',
+    now() + interval '30 days', 290
+  ) RETURNING id INTO v_event_id;
+
+  PERFORM public.affiliate_reconcile();
+
+  SELECT diff INTO v_drift FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_event_id::text
+      AND diff->>'invariant' = 'G_locked_base_mismatch'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift IS NOT NULL
+     AND (v_drift->>'expected')::numeric = 174
+     AND (v_drift->>'actual')::numeric = 290
+     AND (v_drift->>'delta')::numeric = 116 THEN
+    RAISE NOTICE '✅ TEST 8 PASS: locked-base mismatch detected (expected=174, actual=290, delta=+116)';
+  ELSE
+    RAISE EXCEPTION 'TEST 8 FAIL: drift = %', v_drift;
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 5: Cron is scheduled
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM cron.job
+    WHERE jobname = 'affiliate-reconcile-daily'
+  ) THEN
+    RAISE NOTICE '✅ TEST 5 PASS: affiliate-reconcile-daily cron is scheduled';
+  ELSE
+    RAISE EXCEPTION 'TEST 5 FAIL: affiliate-reconcile-daily cron is missing';
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 9: Dedup — same drift detected twice writes one row only
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_app_id UUID;
+  v_count_after_first INT;
+  v_count_after_second INT;
+BEGIN
+  SELECT user_id INTO v_partner
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  INSERT INTO public.partner_applications (
+    user_id, legal_first_name, legal_last_name, phone_e164,
+    bank_name, bank_account_no, bank_account_name, status
+  ) VALUES (v_partner, 'Dedup', 'Test', '+66999999999', 'SCB', '0123456789', 'Dedup', 'approved')
+  RETURNING id INTO v_app_id;
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at, lifetime_paid_thb)
+    VALUES (v_partner, v_app_id, 0.3, now(), 500);  -- intentional Drift A (no paid payouts)
+
+  PERFORM public.affiliate_reconcile();
+  SELECT count(*) INTO v_count_after_first FROM public.affiliate_audit_log
+    WHERE action='reconciliation_drift' AND entity_id = v_partner::text;
+
+  PERFORM public.affiliate_reconcile();
+  SELECT count(*) INTO v_count_after_second FROM public.affiliate_audit_log
+    WHERE action='reconciliation_drift' AND entity_id = v_partner::text;
+
+  IF v_count_after_first = 1 AND v_count_after_second = 1 THEN
+    RAISE NOTICE '✅ TEST 9 PASS: dedup index makes re-detection a no-op (count stays at 1)';
+  ELSE
+    RAISE EXCEPTION 'TEST 9 FAIL: first=%/1, second=%/1', v_count_after_first, v_count_after_second;
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 10: Invariant H — cash_wallets.balance_thb out of sync with ledger
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_drift jsonb;
+BEGIN
+  SELECT user_id INTO v_partner FROM public.user_credits ORDER BY user_id LIMIT 1;
+
+  INSERT INTO public.cash_wallets (user_id, balance_thb, lifetime_earned)
+    VALUES (v_partner, 700, 700)
+  ON CONFLICT (user_id) DO UPDATE SET balance_thb = 700, lifetime_earned = 700;
+
+  -- Ledger says +300 only — wallet stores 700, so drift = 400
+  INSERT INTO public.cash_wallet_transactions (user_id, amount_thb, tx_type, reference_id, note)
+    VALUES (v_partner, 300, 'commission_released', 'test-ledger-only', 'test');
+
+  PERFORM public.affiliate_reconcile();
+
+  SELECT diff INTO v_drift FROM public.affiliate_audit_log
+    WHERE action='reconciliation_drift'
+      AND entity_id = v_partner::text
+      AND diff->>'invariant' = 'H_wallet_balance_vs_ledger'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift IS NOT NULL
+     AND (v_drift->>'expected')::numeric = 300
+     AND (v_drift->>'actual')::numeric = 700
+     AND (v_drift->>'delta')::numeric = 400 THEN
+    RAISE NOTICE '✅ TEST 10 PASS: invariant H detected wallet drift (expected=300, actual=700, delta=400)';
+  ELSE
+    RAISE EXCEPTION 'TEST 10 FAIL: drift = %', v_drift;
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 11: Invariant I — commission_event with BOTH stripe ids populated
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_referred UUID;
+  v_app_id UUID;
+  v_code_id UUID;
+  v_referral_id UUID;
+  v_event_id UUID;
+  v_drift jsonb;
+BEGIN
+  SELECT user_id INTO v_partner
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+  SELECT user_id INTO v_referred FROM public.user_credits WHERE user_id <> v_partner ORDER BY user_id LIMIT 1;
+
+  INSERT INTO public.partner_applications (user_id, legal_first_name, legal_last_name, phone_e164, bank_name, bank_account_no, bank_account_name, status)
+    VALUES (v_partner, 'Dual', 'IDs', '+66999999999', 'SCB', '0123456789', 'Dual', 'approved') RETURNING id INTO v_app_id;
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at) VALUES (v_partner, v_app_id, 0.3, now());
+  INSERT INTO public.referral_codes (user_id, code, code_type, is_active, discount_percent)
+    VALUES (v_partner, 'MF-DUAL-IDS', 'partner_affiliate', true, 0) RETURNING id INTO v_code_id;
+  INSERT INTO public.referrals (referrer_user_id, referred_user_id, code_id, code_type, attribution_status)
+    VALUES (v_partner, v_referred, v_code_id, 'partner_affiliate', 'confirmed') RETURNING id INTO v_referral_id;
+
+  -- Corruption: both stripe ids populated
+  INSERT INTO public.commission_events (
+    partner_user_id, referred_user_id, referral_id,
+    stripe_invoice_id, stripe_payment_intent_id,
+    gross_amount_thb, net_amount_thb, commission_rate,
+    commission_amount_thb, billing_cycle, cycle_index,
+    status, hold_until
+  ) VALUES (
+    v_partner, v_referred, v_referral_id,
+    'in_dual_ids', 'pi_dual_ids',
+    1000, 1000, 0.3, 300, 'month', 1, 'holding',
+    now() + interval '30 days'
+  ) RETURNING id INTO v_event_id;
+
+  PERFORM public.affiliate_reconcile();
+
+  SELECT diff INTO v_drift FROM public.affiliate_audit_log
+    WHERE action='reconciliation_drift'
+      AND entity_id = v_event_id::text
+      AND diff->>'invariant' = 'I_both_stripe_ids_populated'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift IS NOT NULL
+     AND v_drift->>'stripe_invoice_id' = 'in_dual_ids'
+     AND v_drift->>'stripe_payment_intent_id' = 'pi_dual_ids' THEN
+    RAISE NOTICE '✅ TEST 11 PASS: invariant I detected dual-stripe-id corruption';
+  ELSE
+    RAISE EXCEPTION 'TEST 11 FAIL: drift = %', v_drift;
+  END IF;
+END $$;
+ROLLBACK;
