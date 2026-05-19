@@ -1,5 +1,16 @@
 -- Affiliate end-to-end lifecycle smoke (Phase 4).
 --
+-- ** Merge-order dependency **
+-- This test requires the following migrations to be applied first (they
+-- are introduced in companion PRs and not present on a fresh `main`):
+--   • 20260518162718_partner_applications_rls_tighten.sql        (PR #38)
+--   • 20260519032918_mark_payout_paid_v2_atomic.sql              (PR #40)
+--   • 20260519034841_mark_payout_paid_v2_bump_lifetime.sql       (PR #41 + wallet debit)
+--   • 20260519043838_affiliate_reconciliation_cron.sql           (PR #43)
+--   • 20260519053321_accrue_commission_restore_fraud_flag.sql    (PR #45)
+-- Do not merge this PR until the above land on `main`, or the test will
+-- raise "function does not exist" on phase 7 / column-not-found on phase 6.
+--
 -- Walks one paying customer through every state transition that ships in
 -- this round of work and asserts the runtime safety net (reconciliation)
 -- agrees with the transactional truth at each stage. Every assertion fails
@@ -39,17 +50,31 @@ DECLARE
   v_lifetime NUMERIC;
   v_wallet_balance NUMERIC;
   v_partner_application_id UUID;
+  v_debit_count INT;
+  v_amount_count INT;
 BEGIN
   -- ─── PHASE 1: Setup ────────────────────────────────────────
+  -- Pick a user with NO existing affiliate state anywhere. Crashes between
+  -- BEGIN and ROLLBACK on a flaky local DB could otherwise leave stale rows
+  -- in referrals/commission_events/payout_requests/cash_wallets that the
+  -- partner_applications-only exclusion would miss.
   SELECT user_id INTO v_partner
   FROM public.user_credits
   WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
     AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
     AND user_id NOT IN (SELECT user_id FROM public.partners)
+    AND user_id NOT IN (SELECT referrer_user_id FROM public.referrals)
+    AND user_id NOT IN (SELECT partner_user_id FROM public.commission_events)
+    AND user_id NOT IN (SELECT partner_user_id FROM public.payout_requests)
+    AND user_id NOT IN (SELECT user_id FROM public.cash_wallets)
   ORDER BY user_id LIMIT 1;
 
-  SELECT user_id INTO v_referred FROM public.user_credits
-    WHERE user_id <> v_partner ORDER BY user_id LIMIT 1;
+  SELECT user_id INTO v_referred
+  FROM public.user_credits
+  WHERE user_id <> v_partner
+    AND user_id NOT IN (SELECT referred_user_id FROM public.referrals)
+    AND user_id NOT IN (SELECT referred_user_id FROM public.commission_events)
+  ORDER BY user_id LIMIT 1;
 
   IF v_partner IS NULL OR v_referred IS NULL THEN
     RAISE EXCEPTION 'E2E SETUP FAILED: need 2 distinct user_credits rows';
@@ -94,6 +119,17 @@ BEGIN
         WHERE id IN (v_event_1, v_event_2)
           AND commission_base_amount_thb = 1000) <> 2 THEN
     RAISE EXCEPTION 'PHASE 2 FAIL: events do not carry the locked base';
+  END IF;
+
+  -- Confirm both events have commission_amount_thb = 300 (1000 × 0.3).
+  -- A regression that writes the right BASE but the wrong AMOUNT (e.g.,
+  -- applies 0.5 rate instead of 0.3) would update partners.lifetime_commission
+  -- correctly because both flow from the same calc, but per-event amount
+  -- would diverge. Two independent assertions catch the one-sided write.
+  SELECT count(*) INTO v_amount_count FROM public.commission_events
+    WHERE id IN (v_event_1, v_event_2) AND commission_amount_thb = 300;
+  IF v_amount_count <> 2 THEN
+    RAISE EXCEPTION 'PHASE 2 FAIL: events do not carry per-event commission_amount_thb=300 (got %)', v_amount_count;
   END IF;
 
   -- partner.lifetime_commission_thb should be 600 (2 events x 300)
@@ -170,29 +206,37 @@ BEGIN
   IF v_lifetime <> 600 THEN
     RAISE EXCEPTION 'PHASE 6 FAIL: lifetime_paid_thb=%/600', v_lifetime;
   END IF;
+  -- Wallet debited from 600 → 0 + ledger row
+  SELECT balance_thb INTO v_wallet_balance FROM public.cash_wallets WHERE user_id = v_partner;
+  IF v_wallet_balance <> 0 THEN
+    RAISE EXCEPTION 'PHASE 6 FAIL: wallet not debited (balance=%/0)', v_wallet_balance;
+  END IF;
+  SELECT count(*) INTO v_debit_count FROM public.cash_wallet_transactions
+    WHERE user_id = v_partner AND tx_type = 'payout_debit' AND reference_id = v_payout_id::text;
+  IF v_debit_count <> 1 THEN
+    RAISE EXCEPTION 'PHASE 6 FAIL: payout_debit ledger row count=%/1', v_debit_count;
+  END IF;
 
-  RAISE NOTICE '🔹 PHASE 6 OK: payout paid, commissions paid + backlinked, lifetime_paid=600';
+  RAISE NOTICE '🔹 PHASE 6 OK: payout paid, commissions paid + backlinked, lifetime_paid=600, wallet=0, debit ledger=1';
 
-  -- ─── PHASE 7: Reconcile after happy path — expect 0 drifts ──
+  -- ─── PHASE 7: Reconcile after happy path — expect 0 NEW drifts ──
+  -- NOTE: NOW() inside a transaction returns the txn start time, not the
+  -- statement time. Filtering by created_at >= clock_timestamp() always
+  -- returns 0 rows for inserts inside this same txn. Use a baseline count
+  -- before reconcile and assert no NEW rows were added.
   SELECT count(*) INTO v_drift_count FROM public.affiliate_audit_log
     WHERE action = 'reconciliation_drift'
       AND (entity_id = v_partner::text
            OR entity_id = v_payout_id::text
            OR entity_id IN (v_event_1::text, v_event_2::text));
-  -- Establish baseline (drift rows from prior tests may exist for OTHER ids)
-  v_drift_count := v_drift_count;  -- baseline
 
   PERFORM public.affiliate_reconcile();
 
-  -- After reconcile, NEW drift rows for THIS partner/payout/events should still be 0
-  IF EXISTS (
-    SELECT 1 FROM public.affiliate_audit_log
-    WHERE action = 'reconciliation_drift'
-      AND created_at > now() - interval '5 seconds'
-      AND (entity_id = v_partner::text
-           OR entity_id = v_payout_id::text
-           OR entity_id IN (v_event_1::text, v_event_2::text))
-  ) THEN
+  IF (SELECT count(*) FROM public.affiliate_audit_log
+      WHERE action = 'reconciliation_drift'
+        AND (entity_id = v_partner::text
+             OR entity_id = v_payout_id::text
+             OR entity_id IN (v_event_1::text, v_event_2::text))) <> v_drift_count THEN
     RAISE EXCEPTION 'PHASE 7 FAIL: reconcile flagged a drift on a healthy flow';
   END IF;
 
@@ -232,12 +276,12 @@ BEGIN
 
   PERFORM public.affiliate_reconcile();
 
+  -- Drift B should now exist for v_partner (paid_commissions=300 ≠ paid_payouts=600)
   IF NOT EXISTS (
     SELECT 1 FROM public.affiliate_audit_log
     WHERE action = 'reconciliation_drift'
       AND entity_id = v_partner::text
       AND diff->>'invariant' = 'B_paid_commissions_vs_paid_payouts'
-      AND created_at > now() - interval '5 seconds'
   ) THEN
     RAISE EXCEPTION 'PHASE 9 FAIL: reconcile missed the post-clawback drift';
   END IF;
