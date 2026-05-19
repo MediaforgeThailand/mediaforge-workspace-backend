@@ -90,11 +90,39 @@ BEGIN
      SET lifetime_paid_thb = COALESCE(lifetime_paid_thb, 0) + COALESCE(v_amount_thb, 0)
    WHERE user_id = v_partner_user_id;
 
+  -- Debit the partner's cash wallet by the payout amount. release_commission
+  -- credited the wallet when each commission moved from holding → available;
+  -- reverse_commission debits on clawback. Mark-as-paid was the missing
+  -- counterpart — without this UPDATE the wallet `balance_thb` keeps
+  -- showing money that has already left to the partner's bank, and
+  -- invariant H (added in the reconciliation cron) fires.
+  --
+  -- Use GREATEST(_, 0) defensive floor so we never go negative; a clawback
+  -- post-release on the same partner could otherwise underflow.
+  UPDATE public.cash_wallets
+     SET balance_thb = GREATEST(COALESCE(balance_thb, 0) - COALESCE(v_amount_thb, 0), 0),
+         updated_at = now()
+   WHERE user_id = v_partner_user_id;
+
+  -- Ledger entry so the wallet history shows the debit, not just the new
+  -- balance. tx_type='payout_debit' is already in the CHECK list per
+  -- migration 20260422105243.
+  INSERT INTO public.cash_wallet_transactions (
+    user_id, amount_thb, tx_type, reference_id, note
+  ) VALUES (
+    v_partner_user_id,
+    -COALESCE(v_amount_thb, 0),
+    'payout_debit',
+    p_payout_id::text,
+    'Payout paid out — bank ref ' || COALESCE(p_bank_ref, '(none)')
+  );
+
   RETURN jsonb_build_object(
     'status','paid',
     'payout_id', p_payout_id,
     'commissions_paid', v_flipped,
-    'lifetime_paid_thb_delta', v_amount_thb
+    'lifetime_paid_thb_delta', v_amount_thb,
+    'wallet_debit_thb', v_amount_thb
   );
 END;
 $$;

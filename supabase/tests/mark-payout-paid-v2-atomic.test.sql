@@ -26,6 +26,8 @@ DECLARE
   v_payout_status TEXT;
   v_backlink_count INT;
   v_lifetime NUMERIC;
+  v_wallet_balance NUMERIC;
+  v_debit_count INT;
 BEGIN
   SELECT user_id INTO v_partner
   FROM public.user_credits
@@ -69,6 +71,12 @@ BEGIN
   )
   SELECT array_agg(id) INTO v_event_ids FROM ins;
 
+  -- Pre-seed cash_wallets with the balance release_commission would have
+  -- credited (3 events x 300). The mark_payout_paid_v2 RPC must debit
+  -- this back to 0 + write a payout_debit ledger row.
+  INSERT INTO public.cash_wallets (user_id, balance_thb, lifetime_earned)
+    VALUES (v_partner, 900, 900);
+
   INSERT INTO public.payout_requests (
     partner_user_id, amount_thb, bank_snapshot, status, commission_ids, approved_at
   ) VALUES (
@@ -87,12 +95,16 @@ BEGIN
 
   SELECT status INTO v_payout_status FROM public.payout_requests WHERE id = v_payout_id;
   SELECT lifetime_paid_thb INTO v_lifetime FROM public.partners WHERE user_id = v_partner;
+  SELECT balance_thb INTO v_wallet_balance FROM public.cash_wallets WHERE user_id = v_partner;
+  SELECT count(*) INTO v_debit_count FROM public.cash_wallet_transactions
+    WHERE user_id = v_partner AND tx_type = 'payout_debit' AND reference_id = v_payout_id::text;
 
-  IF v_paid_count = 3 AND v_backlink_count = 3 AND v_payout_status = 'paid' AND v_lifetime = 900 THEN
-    RAISE NOTICE '✅ TEST 1 PASS: 3 commissions paid, all backlinked, payout flipped, lifetime=%', v_lifetime;
+  IF v_paid_count = 3 AND v_backlink_count = 3 AND v_payout_status = 'paid'
+     AND v_lifetime = 900 AND v_wallet_balance = 0 AND v_debit_count = 1 THEN
+    RAISE NOTICE '✅ TEST 1 PASS: 3 commissions paid, backlinked, payout flipped, lifetime=900, wallet=0, debit ledger=1';
   ELSE
-    RAISE EXCEPTION 'TEST 1 FAIL: paid=%/3, backlink=%/3, payout=%, lifetime=%/900',
-      v_paid_count, v_backlink_count, v_payout_status, v_lifetime;
+    RAISE EXCEPTION 'TEST 1 FAIL: paid=%/3 backlink=%/3 payout=% lifetime=%/900 wallet=%/0 debits=%/1',
+      v_paid_count, v_backlink_count, v_payout_status, v_lifetime, v_wallet_balance, v_debit_count;
   END IF;
 END $$;
 ROLLBACK;
