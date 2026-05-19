@@ -25,6 +25,7 @@ DECLARE
   v_paid_count INT;
   v_payout_status TEXT;
   v_backlink_count INT;
+  v_lifetime NUMERIC;
 BEGIN
   SELECT user_id INTO v_partner
   FROM public.user_credits
@@ -85,11 +86,13 @@ BEGIN
   WHERE id = ANY(v_event_ids) AND payout_id = v_payout_id;
 
   SELECT status INTO v_payout_status FROM public.payout_requests WHERE id = v_payout_id;
+  SELECT lifetime_paid_thb INTO v_lifetime FROM public.partners WHERE user_id = v_partner;
 
-  IF v_paid_count = 3 AND v_backlink_count = 3 AND v_payout_status = 'paid' THEN
-    RAISE NOTICE '✅ TEST 1 PASS: 3 commissions paid, all backlinked, payout flipped';
+  IF v_paid_count = 3 AND v_backlink_count = 3 AND v_payout_status = 'paid' AND v_lifetime = 900 THEN
+    RAISE NOTICE '✅ TEST 1 PASS: 3 commissions paid, all backlinked, payout flipped, lifetime=%', v_lifetime;
   ELSE
-    RAISE EXCEPTION 'TEST 1 FAIL: paid=%/3, backlink=%/3, payout=%', v_paid_count, v_backlink_count, v_payout_status;
+    RAISE EXCEPTION 'TEST 1 FAIL: paid=%/3, backlink=%/3, payout=%, lifetime=%/900',
+      v_paid_count, v_backlink_count, v_payout_status, v_lifetime;
   END IF;
 END $$;
 ROLLBACK;

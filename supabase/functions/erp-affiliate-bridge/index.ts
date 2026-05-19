@@ -452,54 +452,50 @@ Deno.serve(async (req) => {
         const { id, processor_id, proof_url } = params;
         if (!id || !processor_id || !proof_url)
           return fail("Missing id, processor_id, or proof_url", 400);
-        const { data: payout, error: pErr } = await db
-          .from("payout_requests")
-          .select("*")
-          .eq("id", id)
-          .maybeSingle();
-        if (pErr) return fail(pErr.message, 500);
-        if (!payout) return fail("Payout not found", 404);
-        if (payout.status === "paid") return fail("Already paid", 409);
 
-        const now = new Date().toISOString();
-
-        // 1. Update payout
-        const { error: e1 } = await db
-          .from("payout_requests")
-          .update({ status: "paid", processed_by: processor_id, processed_at: now, proof_url })
-          .eq("id", id);
-        if (e1) return fail(e1.message, 500);
-
-        // 2. Update commission_events → paid
-        if (Array.isArray(payout.commission_ids) && payout.commission_ids.length > 0) {
-          const { error: e2 } = await db
-            .from("commission_events")
-            .update({ status: "paid", paid_at: now, payout_id: id })
-            .in("id", payout.commission_ids);
-          if (e2) return fail(`Commission update failed: ${e2.message}`, 500);
+        // Atomic financial state change via SECURITY DEFINER RPC:
+        //   - locks the payout row, verifies status='approved'
+        //   - flips commission_events to 'paid' with payout_id backlink
+        //   - flips payout_requests to 'paid' / bank_reference / paid_at
+        //   - bumps partners.lifetime_paid_thb in a single UPDATE
+        // Replaces the previous 4-call JS sequence whose read-modify-write on
+        // lifetime_paid_thb could lose updates under concurrent calls.
+        const { data: rpcResult, error: rpcErr } = await db.rpc("mark_payout_paid_v2", {
+          p_payout_id: id,
+          p_admin_id: null,
+          p_bank_ref: proof_url,
+          p_paid_at: null,
+        });
+        if (rpcErr) {
+          const msg = rpcErr.message ?? String(rpcErr);
+          const status = msg.includes("payout_not_approved") || msg.includes("commission_state_mismatch")
+            ? 409
+            : 500;
+          return fail(msg, status);
         }
 
-        // 3. Update partner lifetime_paid_thb (read-modify-write; no atomic SQL via PostgREST)
-        const { data: partner } = await db
-          .from("partners")
-          .select("lifetime_paid_thb")
-          .eq("user_id", payout.partner_user_id)
-          .maybeSingle();
-        const current = Number(partner?.lifetime_paid_thb ?? 0);
-        const next = current + Number(payout.amount_thb);
+        // ERP metadata that the RPC intentionally does not touch (processor
+        // identity + proof URL live in payout_requests for analytics).
+        // Single statement → no race window.
         await db
-          .from("partners")
-          .update({ lifetime_paid_thb: next })
-          .eq("user_id", payout.partner_user_id);
+          .from("payout_requests")
+          .update({ processed_by: processor_id, processed_at: new Date().toISOString(), proof_url })
+          .eq("id", id);
 
-        // 4. Audit
+        const { data: payout } = await db
+          .from("payout_requests")
+          .select("amount_thb, commission_ids")
+          .eq("id", id)
+          .maybeSingle();
+
         await audit(db, processor_id, "mark_payout_paid", "payout_request", id, {
-          amount_thb: payout.amount_thb,
+          amount_thb: payout?.amount_thb,
           proof_url,
-          commission_ids: payout.commission_ids,
+          commission_ids: payout?.commission_ids,
+          rpc_result: rpcResult,
         });
 
-        return ok({ id, status: "paid", amount_thb: payout.amount_thb });
+        return ok({ id, status: "paid", amount_thb: payout?.amount_thb });
       }
 
       case "mark_payout_failed": {
