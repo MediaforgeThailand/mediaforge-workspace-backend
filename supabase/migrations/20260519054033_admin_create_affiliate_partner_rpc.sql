@@ -87,7 +87,17 @@ BEGIN
     updated_at         = EXCLUDED.updated_at
   RETURNING id INTO v_app_id;
 
-  -- 2. Upsert partners
+  -- 2. Upsert partners. The previous version cleared suspended_at on
+  --    every re-invite — silent ban bypass. Now: if the existing row is
+  --    suspended, raise instead of un-suspending. Admin must explicitly
+  --    reactivate via a separate path (audit trail intact).
+  IF EXISTS (
+    SELECT 1 FROM public.partners
+    WHERE user_id = p_user_id AND suspended_at IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'partner_suspended: cannot re-invite a suspended partner; explicit unsuspend required';
+  END IF;
+
   INSERT INTO public.partners (
     user_id, application_id, commission_rate, tier,
     approved_at, suspended_at, suspended_reason
@@ -99,21 +109,20 @@ BEGIN
     application_id    = EXCLUDED.application_id,
     commission_rate   = EXCLUDED.commission_rate,
     tier              = EXCLUDED.tier,
-    approved_at       = EXCLUDED.approved_at,
-    suspended_at      = NULL,
-    suspended_reason  = NULL
+    approved_at       = EXCLUDED.approved_at
+    -- DO NOT clear suspended_at / suspended_reason here. The IF EXISTS
+    -- check above already short-circuited on suspended rows, and a non-
+    -- suspended row had NULL values anyway — preserve whatever's stored.
   RETURNING * INTO v_partner_row;
 
-  -- 3. Upsert referral_codes. If the code already exists for THIS partner,
-  --    update it; if it exists for someone else, raise (matches the
-  --    upsertCode error). stripe_coupon_id is set later by the TS caller.
-  IF EXISTS (
-    SELECT 1 FROM public.referral_codes
-    WHERE code = p_code AND user_id <> p_user_id
-  ) THEN
-    RAISE EXCEPTION 'affiliate code % is already owned by another partner', p_code;
-  END IF;
-
+  -- 3. Upsert referral_codes. The DO UPDATE branch must NEVER touch a row
+  --    whose user_id doesn't match this invitation — otherwise a race
+  --    between EXISTS and INSERT would let one admin rewrite another
+  --    partner's is_active/campaign_label/discount_percent (the
+  --    user_id stays unchanged but the metadata gets clobbered). We
+  --    add WHERE referral_codes.user_id = p_user_id so a foreign row
+  --    causes the INSERT to refuse-via-no-action; we then detect the
+  --    "0 rows affected" case via FOUND and raise the expected error.
   INSERT INTO public.referral_codes (
     user_id, code, code_type, is_active, campaign_label,
     discount_percent, stripe_coupon_id, discount_duration, updated_at
@@ -126,7 +135,14 @@ BEGIN
     campaign_label   = EXCLUDED.campaign_label,
     discount_percent = EXCLUDED.discount_percent,
     updated_at       = EXCLUDED.updated_at
+    WHERE referral_codes.user_id = p_user_id
   RETURNING * INTO v_code_row;
+
+  IF v_code_row.id IS NULL THEN
+    -- ON CONFLICT matched a row owned by a different partner — the
+    -- WHERE-on-DO-UPDATE filtered it out. Raise the expected message.
+    RAISE EXCEPTION 'affiliate code % is already owned by another partner', p_code;
+  END IF;
 
   -- 4. Audit log
   INSERT INTO public.affiliate_audit_log (actor_id, action, entity_type, entity_id, diff)
