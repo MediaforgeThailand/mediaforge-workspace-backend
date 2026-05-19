@@ -54,11 +54,17 @@ BEGIN
     RAISE EXCEPTION 'paid_at_out_of_range: % is outside [now-30d, now+1m]', v_effective_paid_at;
   END IF;
 
+  -- Accept any non-terminal payable state. The original strict
+  -- `status = 'approved'` check would reject pending/processing payouts —
+  -- but the current ERP workflow goes pending → processing → paid
+  -- without an intermediate 'approved' transition. Cancelled/failed/
+  -- rejected/paid stay rejected (terminal or already-handled states).
   PERFORM 1 FROM public.payout_requests
-    WHERE id = p_payout_id AND status = 'approved'
+    WHERE id = p_payout_id
+      AND status IN ('pending', 'approved', 'processing')
     FOR UPDATE;
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'payout_not_approved';
+    RAISE EXCEPTION 'payout_not_in_payable_state';
   END IF;
 
   SELECT commission_ids INTO v_commission_ids
