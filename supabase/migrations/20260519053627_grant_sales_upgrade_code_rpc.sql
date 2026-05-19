@@ -85,6 +85,12 @@ BEGIN
   -- (e.g., the partner already minted one in a different flow), append a
   -- numeric suffix until we find a free slot. Cap at 10 attempts then fall
   -- back to a random UUID-derived code.
+  --
+  -- The INSERT is INSIDE the loop with EXCEPTION WHEN unique_violation so a
+  -- concurrent tx that wins the race on the same candidate code does not
+  -- propagate the violation out — we just bump v_attempt and try again. The
+  -- pre-INSERT EXISTS check is kept as a cheap fast-path for the common
+  -- non-racing case.
   LOOP
     v_attempt := v_attempt + 1;
     IF v_attempt = 1 THEN
@@ -95,30 +101,38 @@ BEGIN
       v_new_code := 'MF-' || upper(substr(replace(gen_random_uuid()::text, '-', ''), 1, 8)) || '-20';
     END IF;
 
-    -- length cap to fit the existing CHECK on referral_codes.code (3-40)
+    -- 40-char cap matches the normalizeCode regex used by the TS callers.
     IF length(v_new_code) > 40 THEN
       v_new_code := substr(v_new_code, 1, 40);
       v_new_code := regexp_replace(v_new_code, '-$', '', 'g');
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM public.referral_codes WHERE code = v_new_code) THEN
-      EXIT;
-    END IF;
-
     IF v_attempt > 20 THEN
       RAISE EXCEPTION 'grant_sales_upgrade_code: could not mint a unique code after 20 attempts';
     END IF;
-  END LOOP;
 
-  -- All-or-nothing: code + audit row inside one txn
-  INSERT INTO public.referral_codes (
-    user_id, code, code_type, is_active, campaign_label,
-    discount_percent, stripe_coupon_id, discount_duration, updated_at
-  ) VALUES (
-    p_user_id, v_new_code, 'partner_affiliate', true, '100K sales upgrade',
-    p_discount_percent, NULL, 'once', now()
-  )
-  RETURNING id INTO v_inserted_id;
+    -- Fast-path skip when we know the code is already taken (common case
+    -- when partner already minted via the lazy create-checkout path).
+    IF EXISTS (SELECT 1 FROM public.referral_codes WHERE code = v_new_code) THEN
+      CONTINUE;
+    END IF;
+
+    -- Race-safe INSERT: another tx could have inserted v_new_code between
+    -- the EXISTS check and this statement. unique_violation → re-loop.
+    BEGIN
+      INSERT INTO public.referral_codes (
+        user_id, code, code_type, is_active, campaign_label,
+        discount_percent, stripe_coupon_id, discount_duration, updated_at
+      ) VALUES (
+        p_user_id, v_new_code, 'partner_affiliate', true, '100K sales upgrade',
+        p_discount_percent, NULL, 'once', now()
+      )
+      RETURNING id INTO v_inserted_id;
+      EXIT;
+    EXCEPTION WHEN unique_violation THEN
+      CONTINUE;
+    END;
+  END LOOP;
 
   INSERT INTO public.affiliate_audit_log (actor_id, action, entity_type, entity_id, diff)
   VALUES (
