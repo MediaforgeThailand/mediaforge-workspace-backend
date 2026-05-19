@@ -52,12 +52,24 @@ function json(body: unknown, status = 200) {
   });
 }
 
+function timingSafeEqual(a: string, b: string): boolean {
+  // Constant-time string compare. Length is not a secret so fail fast on
+  // mismatch, but never short-circuit per-byte to avoid timing oracles.
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
 function isAuthorized(req: Request): boolean {
   const cronSecret = req.headers.get("x-cron-secret");
-  if (CRON_SECRET && cronSecret === CRON_SECRET) return true;
+  if (CRON_SECRET && cronSecret && timingSafeEqual(cronSecret, CRON_SECRET)) return true;
 
   const auth = req.headers.get("Authorization") ?? "";
-  if (auth.startsWith("Bearer ") && auth.slice(7) === SERVICE_ROLE_KEY) return true;
+  if (auth.startsWith("Bearer ")) {
+    const token = auth.slice(7);
+    if (SERVICE_ROLE_KEY && timingSafeEqual(token, SERVICE_ROLE_KEY)) return true;
+  }
 
   return false;
 }
@@ -85,10 +97,14 @@ function escapeHtml(value: unknown): string {
     .replaceAll('"', "&quot;");
 }
 
-function buildDigestHtml(rows: any[]): string {
+function buildDigestHtml(rows: any[], pendingRemaining: number): string {
   const items = rows.map(renderDrift).join("\n");
+  const backlogBanner = pendingRemaining > 0
+    ? `<div style="background:#fff3cd;border:1px solid #ffe69c;padding:8px 12px;margin:8px 0;border-radius:4px"><b>Backlog:</b> ${pendingRemaining} more drift row${pendingRemaining === 1 ? "" : "s"} queued for the next 15-minute tick. This batch is capped at 100 rows.</div>`
+    : "";
   return `<!DOCTYPE html><html><body style="font-family: -apple-system, sans-serif;">
 <h2>Affiliate reconciliation drift — ${rows.length} new event${rows.length === 1 ? "" : "s"}</h2>
+${backlogBanner}
 <p>These rows in <code>affiliate_audit_log</code> indicate the partner-level counters
 or per-row arithmetic diverged from the underlying transactions. Investigate before
 the next payout run.</p>
@@ -100,14 +116,16 @@ the next payout run.</p>
 async function sendDigest(
   recipients: string[],
   rows: any[],
+  pendingRemaining: number,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!SENDGRID_API_KEY) return { ok: false, error: "missing_sendgrid_api_key" };
 
+  const subjectSuffix = pendingRemaining > 0 ? ` (+${pendingRemaining} queued)` : "";
   const payload = {
     personalizations: recipients.map((to) => ({ to: [{ email: to }] })),
     from: { email: SENDGRID_FROM_EMAIL, name: "MediaForge Alerts" },
-    subject: `[Affiliate drift] ${rows.length} new event${rows.length === 1 ? "" : "s"}`,
-    content: [{ type: "text/html", value: buildDigestHtml(rows) }],
+    subject: `[Affiliate drift] ${rows.length} new event${rows.length === 1 ? "" : "s"}${subjectSuffix}`,
+    content: [{ type: "text/html", value: buildDigestHtml(rows, pendingRemaining) }],
   };
 
   const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
@@ -157,7 +175,25 @@ Deno.serve(async (req) => {
     return json({ ok: true, sent: 0 });
   }
 
-  const send = await sendDigest(recipients, pending);
+  // If we hit the batch limit, peek at the total backlog so the email +
+  // response indicate how many more rows are queued for the next 15-min
+  // tick. Admin can then see "10 sent now, 240 queued" rather than
+  // silently sitting on 240 unseen drifts.
+  let pendingRemaining = 0;
+  if (pending.length >= BATCH_LIMIT) {
+    const { count, error: countErr } = await client
+      .from("affiliate_audit_log")
+      .select("*", { count: "exact", head: true })
+      .eq("action", "reconciliation_drift")
+      .is("notified_at", null);
+    if (countErr) {
+      console.warn("[affiliate-drift-notifier] pending-count peek failed:", countErr);
+    } else {
+      pendingRemaining = Math.max(0, (count ?? 0) - pending.length);
+    }
+  }
+
+  const send = await sendDigest(recipients, pending, pendingRemaining);
   if (!send.ok) {
     console.error("[affiliate-drift-notifier] SendGrid failed:", send.error);
     // Don't mark notified — next run will retry. Return 500 so cron logs the failure.
@@ -175,8 +211,12 @@ Deno.serve(async (req) => {
     // a duplicate. Surface so ops knows to investigate, but the alert itself
     // already went out.
     console.error("[affiliate-drift-notifier] mark-notified DB write failed (email already sent):", updErr);
-    return json({ ok: true, sent: pending.length, mark_warning: updErr.message }, 200);
+    return json({ ok: true, sent: pending.length, mark_warning: updErr.message, pending_remaining: pendingRemaining }, 200);
   }
 
-  return json({ ok: true, sent: pending.length, batched_ids: ids });
+  if (pendingRemaining > 0) {
+    console.warn(`[affiliate-drift-notifier] batched ${pending.length} drift rows; ${pendingRemaining} remaining for next run`);
+  }
+
+  return json({ ok: true, sent: pending.length, batched_ids: ids, pending_remaining: pendingRemaining });
 });
