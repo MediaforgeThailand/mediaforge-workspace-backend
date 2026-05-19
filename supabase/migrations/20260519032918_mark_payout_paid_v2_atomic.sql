@@ -1,4 +1,5 @@
--- Fix two related bugs in mark_payout_paid_v2 surfaced by the round-2 audit.
+-- Fix multiple bugs in mark_payout_paid_v2 surfaced by the round-2 audit
+-- (+ review-round corrections).
 --
 -- 1. ATOMICITY: the previous body flipped payout_requests.status='paid' BEFORE
 --    flipping the linked commission_events. The commission UPDATE used a
@@ -6,18 +7,30 @@
 --    into 'clawback', 'holding', or 'paid' (race with another payout that
 --    already grabbed the same commission, or a refund-during-payout-approval
 --    sequence), payout_requests was marked 'paid' while some commissions
---    silently stayed in their wrong state. The function returned a
---    `commissions_paid` count that callers could ignore.
+--    silently stayed in their wrong state.
 --
--- 2. MISSING payout_id BACKLINK: v1 functions (request_payout / mark_payout_paid)
---    set commission_events.payout_id = p_payout_id when flipping to paid, so
---    you could later trace which payout cleared which commission. The v2
---    function dropped that backlink — every paid commission has payout_id NULL,
---    making refund/clawback reconciliation against a paid payout impossible
---    without joining through payout_requests.commission_ids[] arrays.
+-- 2. MISSING payout_id BACKLINK: v1 functions set commission_events.payout_id
+--    when flipping to paid; v2 dropped that. We restore it.
 --
--- Fix: flip the order, validate the flipped count, and write the backlink.
--- Same signature, same callers — no edge-function changes required.
+-- 3. EMPTY commission_ids ARRAY: array_length([], 1) returns NULL, so
+--    COALESCE → 0, and 0=0 matched, letting an empty-array payout flip to
+--    'paid' with no commissions moved. That's a corruption signal we should
+--    reject loudly.
+--
+-- 4. CONCURRENT REFUND RACE: a parallel reverse_commission only matches
+--    status IN ('holding','available') — if mark_payout_paid_v2 commits
+--    first, the refund silently no-ops (paid commission is unreachable to
+--    clawback). Lock the commission rows FOR UPDATE before flipping so a
+--    concurrent reverse_commission either waits (then sees 'paid' and
+--    misses, which is the original bug we're tracking under the refund-on-
+--    paid follow-up) or wins the lock and clawbacks first (then this
+--    function sees 'clawback' and aborts with the v_flipped check).
+--
+-- 5. BACKDATING: original v2 accepted any p_paid_at, letting a compromised
+--    service-role caller backdate a payout into a prior reporting window.
+--    Bound p_paid_at within [now - 30 days, now + 1 minute].
+--
+-- Same signature, same callers.
 
 CREATE OR REPLACE FUNCTION public.mark_payout_paid_v2(
   p_payout_id uuid,
@@ -33,7 +46,14 @@ DECLARE
   v_commission_ids uuid[];
   v_expected int;
   v_flipped int;
+  v_effective_paid_at timestamptz;
 BEGIN
+  v_effective_paid_at := COALESCE(p_paid_at, now());
+  IF v_effective_paid_at > now() + interval '1 minute'
+     OR v_effective_paid_at < now() - interval '30 days' THEN
+    RAISE EXCEPTION 'paid_at_out_of_range: % is outside [now-30d, now+1m]', v_effective_paid_at;
+  END IF;
+
   PERFORM 1 FROM public.payout_requests
     WHERE id = p_payout_id AND status = 'approved'
     FOR UPDATE;
@@ -47,13 +67,23 @@ BEGIN
 
   v_expected := COALESCE(array_length(v_commission_ids, 1), 0);
 
-  -- Flip commissions FIRST + write the payout_id backlink. Anything not in
-  -- 'available' state (clawback, holding, already-paid via a different
-  -- payout) will not match, v_flipped < v_expected, and we abort.
+  IF v_expected = 0 THEN
+    RAISE EXCEPTION 'payout_has_no_commissions';
+  END IF;
+
+  -- Lock the commission rows first to serialise against a concurrent
+  -- reverse_commission. Anything not in 'available' (clawback, holding,
+  -- already-paid via a different payout) will not match v_expected and we
+  -- abort, leaving the underlying state untouched by way of the txn rollback.
+  PERFORM 1
+  FROM public.commission_events
+  WHERE id = ANY(v_commission_ids)
+  FOR UPDATE;
+
   WITH upd AS (
     UPDATE public.commission_events
        SET status = 'paid',
-           paid_at = now(),
+           paid_at = v_effective_paid_at,
            payout_id = p_payout_id
      WHERE id = ANY(v_commission_ids)
        AND status = 'available'
@@ -65,12 +95,9 @@ BEGIN
     RAISE EXCEPTION 'commission_state_mismatch: % of % commissions were not in available state', v_flipped, v_expected;
   END IF;
 
-  -- Only flip the payout request to 'paid' once every linked commission
-  -- has been confirmed. A failure inside this UPDATE rolls back the
-  -- commission flips above thanks to the implicit transaction.
   UPDATE public.payout_requests SET
     status         = 'paid',
-    paid_at        = COALESCE(p_paid_at, now()),
+    paid_at        = v_effective_paid_at,
     bank_reference = p_bank_ref,
     paid_by        = p_admin_id
   WHERE id = p_payout_id;
