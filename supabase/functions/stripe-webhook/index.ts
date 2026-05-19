@@ -291,6 +291,73 @@ async function handleRefundSucceeded(
   // NOTE: credits claw-back intentionally skipped — may already be consumed.
 }
 
+// charge.dispute.created (and funds_withdrawn) signal a chargeback —
+// the customer's bank has filed a dispute and Stripe has already pulled
+// the disputed amount out of our balance. We must reverse the affiliate
+// commission for the same payment so we don't pay creators on revenue
+// we no longer have. Idempotent: uses dispute.id as the reversal key
+// (reverse_commission dedups by `reversed_by_refund_id`).
+async function handleDisputeCreated(
+  sb: ReturnType<typeof createClient>,
+  dispute: Stripe.Dispute,
+  eventId: string,
+) {
+  const disputeId = dispute.id;
+  const chargeId = typeof dispute.charge === "string" ? dispute.charge : dispute.charge?.id;
+  if (!chargeId) {
+    console.warn("[STRIPE-WEBHOOK] dispute: no charge id on", disputeId);
+    return;
+  }
+
+  // Resolve PI from charge — payment_transactions stores PI not charge id.
+  const { data: tx, error: txErr } = await sb
+    .from("payment_transactions")
+    .select("stripe_payment_intent_id")
+    .eq("stripe_charge_id", chargeId)
+    .maybeSingle();
+
+  if (txErr) {
+    console.error("[STRIPE-WEBHOOK] dispute: payment_transactions lookup error:", txErr);
+    return;
+  }
+  if (!tx?.stripe_payment_intent_id) {
+    console.warn(`[STRIPE-WEBHOOK] dispute: no PI for charge ${chargeId} (dispute=${disputeId})`);
+    return;
+  }
+
+  const { data: reversed, error: rpcErr } = await sb.rpc("reverse_commission", {
+    p_payment_intent_id: tx.stripe_payment_intent_id,
+    p_refund_id: disputeId,
+    p_reason: `stripe_dispute:${dispute.reason ?? "unknown"}`,
+  });
+
+  if (rpcErr) {
+    console.error("[STRIPE-WEBHOOK] dispute reverse_commission failed:", rpcErr);
+    return;
+  }
+
+  console.log("[STRIPE-WEBHOOK] dispute processed:", {
+    disputeId,
+    chargeId,
+    paymentIntentId: tx.stripe_payment_intent_id,
+    reversedCount: Array.isArray(reversed) ? reversed.length : 0,
+  });
+
+  if (Array.isArray(reversed) && reversed.length > 0) {
+    for (const r of reversed as Array<{ commission_event_id: string; partner_user_id: string; reversed_amount_thb: number }>) {
+      await auditLog(sb, "commission_reversed", r.commission_event_id, {
+        event_id: eventId,
+        source: "dispute_webhook",
+        amount_thb: r.reversed_amount_thb,
+        partner_user_id: r.partner_user_id,
+        stripe_dispute_id: disputeId,
+        stripe_charge_id: chargeId,
+        stripe_payment_intent_id: tx.stripe_payment_intent_id,
+      });
+    }
+  }
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -1825,6 +1892,15 @@ serve(async (req) => {
         console.warn(
           `[STRIPE-WEBHOOK] DISPUTE ${event.type} dispute=${dispute.id} charge=${chargeId} reason=${dispute.reason} amount=${dispute.amount}`,
         );
+
+        // Reverse affiliate commission on dispute creation. Stripe has
+        // already pulled the funds; if the dispute is later won we can
+        // restore manually via admin tools. Only fires on .created so a
+        // single dispute reverses at most once (reverse_commission also
+        // dedups by dispute_id).
+        if (event.type === "charge.dispute.created") {
+          await handleDisputeCreated(supabase, dispute, event.id);
+        }
       } catch (e) {
         console.error("[STRIPE-WEBHOOK] dispute exception:", e);
       }

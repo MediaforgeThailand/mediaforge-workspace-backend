@@ -460,6 +460,13 @@ Deno.serve(async (req) => {
         if (pErr) return fail(pErr.message, 500);
         if (!payout) return fail("Payout not found", 404);
         if (payout.status === "paid") return fail("Already paid", 409);
+        // Reject terminal/non-payable states. `cancelled` is set by
+        // reverse_commission when a Stripe refund reverses a commission
+        // in this payout — paying anyway would send creator money for
+        // revenue MediaForge has already returned to the customer.
+        if (["cancelled", "failed", "rejected"].includes(payout.status)) {
+          return fail(`Cannot pay a ${payout.status} payout`, 409);
+        }
 
         const now = new Date().toISOString();
 
@@ -470,13 +477,30 @@ Deno.serve(async (req) => {
           .eq("id", id);
         if (e1) return fail(e1.message, 500);
 
-        // 2. Update commission_events → paid
+        // 2. Update commission_events → paid. Filter by status='available'
+        // so a concurrent reverse_commission cannot have flipped a row to
+        // 'clawback' and have us silently overwrite it. If the rowcount
+        // doesn't match, refuse the payout and roll back the status flip.
         if (Array.isArray(payout.commission_ids) && payout.commission_ids.length > 0) {
-          const { error: e2 } = await db
+          const { data: updatedRows, error: e2 } = await db
             .from("commission_events")
             .update({ status: "paid", paid_at: now, payout_id: id })
-            .in("id", payout.commission_ids);
+            .in("id", payout.commission_ids)
+            .eq("status", "available")
+            .select("id");
           if (e2) return fail(`Commission update failed: ${e2.message}`, 500);
+          if ((updatedRows?.length ?? 0) !== payout.commission_ids.length) {
+            // Roll back the payout status flip so the admin sees the
+            // failure and can investigate which commission was clawbacked.
+            await db
+              .from("payout_requests")
+              .update({ status: payout.status, processed_by: null, processed_at: null, proof_url: null })
+              .eq("id", id);
+            return fail(
+              `Commission state changed during payout — expected ${payout.commission_ids.length} available, found ${updatedRows?.length ?? 0}. Check for concurrent refund.`,
+              409,
+            );
+          }
         }
 
         // 3. Update partner lifetime_paid_thb (read-modify-write; no atomic SQL via PostgREST)
