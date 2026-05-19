@@ -166,6 +166,9 @@ verify_jwt = false
 [functions.admin_workspace_orgs]
 verify_jwt = false
 
+[functions.admin_workspace_affiliates]
+verify_jwt = false
+
 [functions.workspace_org_console]
 verify_jwt = false
 
