@@ -57,7 +57,14 @@ import { appendMentionContext, rewriteMentionsInline, type MentionedAssetSrv } f
 import type { ProviderResult } from "../_shared/providerResult.ts";
 import { executeMergeAudio } from "../_shared/mergeAudio.ts";
 import { executeChatAi } from "../_shared/chatAi.ts";
-import { executeTripo3D } from "../_shared/tripo3d.ts";
+import {
+  executeTripo3D,
+  executeTripoConvert,
+  executeTripoImportModel,
+  executeTripoPreRigCheck,
+  executeTripoRetarget,
+  executeTripoRig,
+} from "../_shared/tripo3d.ts";
 import { executeRemoveBg } from "../_shared/removeBg.ts";
 import {
   executeMagnificUpscale,
@@ -193,6 +200,15 @@ function getProviderForNodeType(
   // Route by model slug so a single node type can serve both providers.
   if (nodeType === "imageTo3dNode") {
     if (m.startsWith("hyper3d")) return "hyper3d";
+    return "tripo3d";
+  }
+  if (
+    nodeType === "tripoImportModelNode" ||
+    nodeType === "tripoPreRigCheckNode" ||
+    nodeType === "tripoRigNode" ||
+    nodeType === "tripoAnimateNode" ||
+    nodeType === "tripoExportNode"
+  ) {
     return "tripo3d";
   }
 
@@ -1171,6 +1187,9 @@ interface WorkspaceRunBody {
   provider_model_id?: string;
   api_key_alias?: string;
   output_type?: string;
+  task_type?: string;
+  source_model_url?: string;
+  original_model_task_id?: string;
   target_lang?: string;
   output_language?: string;
   /** For action="mirror_tripo_url": the Tripo3D CDN URL to mirror
@@ -1847,6 +1866,9 @@ async function pollWorkspaceAsyncResult(args: {
         provider_model_id: String(providerMeta.provider_model_id ?? ""),
         api_key_alias: String(providerMeta.api_key_alias ?? ""),
         output_type: String(providerMeta.output_type ?? ""),
+        task_type: String(providerMeta.task_type ?? ""),
+        source_model_url: String(providerMeta.source_model_url ?? providerMeta.model_url ?? ""),
+        original_model_task_id: String(providerMeta.original_model_task_id ?? providerMeta.tripo_model_task_id ?? ""),
         target_lang: String(providerMeta.target_lang ?? ""),
         output_language: String(providerMeta.output_language ?? ""),
       } as WorkspaceRunBody,
@@ -1857,7 +1879,9 @@ async function pollWorkspaceAsyncResult(args: {
 
     if (successStatuses.has(lastStatus)) {
       const url = String(pollResp.url ?? "");
-      if (!url) {
+      const text = typeof pollResp.text === "string" ? pollResp.text : "";
+      const modelUrl = String(pollResp.model_url ?? "");
+      if (!url && !text && !modelUrl) {
         throw new Error(`${provider} task succeeded but returned no URL`);
       }
       const responseType = String(args.response.type ?? args.response.output_type ?? "");
@@ -1866,7 +1890,9 @@ async function pollWorkspaceAsyncResult(args: {
           ? "output_video"
           : responseType === "audio" || responseType === "audio_url"
             ? "output_audio"
-            : "output_image";
+            : provider === "tripo3d"
+              ? "output_model"
+              : "output_image";
       const currentOutputs =
         args.response.outputs && typeof args.response.outputs === "object"
           ? (args.response.outputs as Record<string, string>)
@@ -1874,7 +1900,7 @@ async function pollWorkspaceAsyncResult(args: {
       const nextOutputs =
         provider === "elevenlabs_dubbing"
           ? { ...currentOutputs, [outputKey]: url, output_media: url }
-          : { ...currentOutputs, [outputKey]: url };
+          : { ...currentOutputs, ...((url || modelUrl) ? { [outputKey]: url || modelUrl } : {}), ...(text ? { text } : {}) };
       const nextProviderMeta = {
         ...providerMeta,
         ...(pollResp.provider_meta && typeof pollResp.provider_meta === "object"
@@ -1885,7 +1911,8 @@ async function pollWorkspaceAsyncResult(args: {
       };
       return {
         ...args.response,
-        url,
+        ...(url ? { url } : {}),
+        ...(text ? { text } : {}),
         outputs: nextOutputs,
         provider_meta: nextProviderMeta,
       };
@@ -1959,6 +1986,9 @@ async function pollWorkspaceAsyncResultOnce(args: {
       provider_model_id: String(providerMeta.provider_model_id ?? ""),
       api_key_alias: String(providerMeta.api_key_alias ?? ""),
       output_type: String(providerMeta.output_type ?? ""),
+      task_type: String(providerMeta.task_type ?? ""),
+      source_model_url: String(providerMeta.source_model_url ?? providerMeta.model_url ?? ""),
+      original_model_task_id: String(providerMeta.original_model_task_id ?? providerMeta.tripo_model_task_id ?? ""),
       target_lang: String(providerMeta.target_lang ?? ""),
       output_language: String(providerMeta.output_language ?? ""),
     } as WorkspaceRunBody,
@@ -1989,7 +2019,9 @@ async function pollWorkspaceAsyncResultOnce(args: {
 
   if (successStatuses.has(status)) {
     const url = String(pollResp.url ?? "");
-    if (!url) {
+    const text = typeof pollResp.text === "string" ? pollResp.text : "";
+    const modelUrl = String(pollResp.model_url ?? "");
+    if (!url && !text && !modelUrl) {
       return { state: "failed", message: `${provider} task succeeded but returned no URL` };
     }
     const nextProviderMeta = {
@@ -2010,16 +2042,19 @@ async function pollWorkspaceAsyncResultOnce(args: {
         ? "output_video"
         : responseType === "audio" || responseType === "audio_url"
           ? "output_audio"
-          : "output_image";
+          : provider === "tripo3d"
+            ? "output_model"
+            : "output_image";
     const nextOutputs =
       provider === "elevenlabs_dubbing"
         ? { ...currentOutputs, [outputKey]: url, output_media: url }
-        : { ...currentOutputs, [outputKey]: url };
+        : { ...currentOutputs, ...((url || modelUrl) ? { [outputKey]: url || modelUrl } : {}), ...(text ? { text } : {}) };
     return {
       state: "succeeded",
       result: {
         ...args.response,
-        url,
+        ...(url ? { url } : {}),
+        ...(text ? { text } : {}),
         outputs: nextOutputs,
         provider_meta: nextProviderMeta,
       },
@@ -4085,6 +4120,8 @@ serve(async (req) => {
             { status: 502, headers: { ...corsHeaders, "Content-Type": "application/json" } },
           );
         }
+        const responseBytes = Number(r.headers.get("content-length") ?? "");
+        const mirroredBytes = Number.isFinite(responseBytes) && responseBytes > 0 ? responseBytes : null;
         // User-scoped path so the asset is owned by THIS user's
         // bucket policy. Uniqueness via timestamp + a hash of the
         // source URL keeps re-mirrors from clobbering each other.
@@ -4115,12 +4152,12 @@ serve(async (req) => {
             { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
           );
         }
-        console.log(`[tripo3d-mirror] ok ${ext} bytes=${buf.byteLength} path=${fileName}`);
+        console.log(`[tripo3d-mirror] ok ${ext} bytes=${mirroredBytes ?? "stream"} path=${fileName}`);
         return new Response(
           JSON.stringify({
             url: signed.signedUrl,
             storage_path: fileName,
-            bytes: buf.byteLength,
+            bytes: mirroredBytes,
             content_type: contentType,
           }),
           { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
@@ -5363,6 +5400,9 @@ serve(async (req) => {
       const status = String(data.status ?? "").toLowerCase();
       const progress = Number(data.progress ?? 0);
       const block = (data.output ?? data.result ?? {}) as Record<string, unknown>;
+      const taskType = String(body.task_type ?? data.type ?? data.task_type ?? "").toLowerCase();
+      const sourceModelUrl = String(body.source_model_url ?? "").trim();
+      const originalModelTaskId = String(body.original_model_task_id ?? "").trim();
 
       // Dump the raw output object so we can see EXACTLY what fields
       // Tripo3D returns. Crucial for debugging when the user reports
@@ -5382,6 +5422,18 @@ serve(async (req) => {
         }
         return "";
       };
+      const collectUrls = (v: unknown, into: string[] = []): string[] => {
+        const u = extractUrl(v);
+        if (u && !into.includes(u)) into.push(u);
+        if (Array.isArray(v)) {
+          for (const item of v) collectUrls(item, into);
+        } else if (v && typeof v === "object") {
+          for (const item of Object.values(v as Record<string, unknown>)) {
+            collectUrls(item, into);
+          }
+        }
+        return into;
+      };
 
       /* Strict GLB filter — Tripo3D's `output` object contains a
        * MIX of asset URLs. Some fields point to GLB / GLTF (3D
@@ -5394,7 +5446,7 @@ serve(async (req) => {
        * whose extension is a known 3D mesh format. Anything else
        * lands in the preview-image fallback path. */
       const isMeshUrl = (u: string): boolean =>
-        /\.(glb|gltf|usdz|obj|fbx)(\?|#|$)/i.test(u);
+        /\.(glb|gltf|usdz|obj|fbx|stl|3mf)(\?|#|$)/i.test(u);
       const isImageUrl = (u: string): boolean =>
         /\.(png|jpe?g|webp|avif)(\?|#|$)/i.test(u);
 
@@ -5404,9 +5456,17 @@ serve(async (req) => {
         "pbr_model",
         "model",
         "base_model",
+        "rigged_model",
+        "animated_model",
+        "converted_model",
+        "output_model",
         "glb",
         "gltf",
         "usdz",
+        "fbx",
+        "obj",
+        "stl",
+        "3mf",
         "rendered_image",
         "preview_image",
         "thumbnail_image",
@@ -5426,6 +5486,7 @@ serve(async (req) => {
         const u = extractUrl(v);
         if (u && !candidates.includes(u)) candidates.push(u);
       }
+      collectUrls(block, candidates);
 
       const tripoModelUrl = candidates.find(isMeshUrl) ?? "";
       const tripoRenderedImage = candidates.find(isImageUrl) ?? "";
@@ -5446,6 +5507,41 @@ serve(async (req) => {
       let modelUrl = tripoModelUrl;
       let renderedImage = tripoRenderedImage;
       const isTerminalSuccess = status === "succeed" || status === "success";
+      if (isTerminalSuccess && taskType === "animate_prerigcheck") {
+        const riggable = block.riggable ?? data.riggable ?? null;
+        const rigType = String(block.rig_type ?? data.rig_type ?? "").trim();
+        const riggableText =
+          riggable === true || riggable === "true"
+            ? "Riggable"
+            : riggable === false || riggable === "false"
+              ? "Not riggable"
+              : "Rig check complete";
+        const text = rigType ? `${riggableText} (${rigType})` : riggableText;
+        return new Response(
+          JSON.stringify({
+            status,
+            progress,
+            task_id: taskId,
+            url: "",
+            model_url: sourceModelUrl,
+            preview_image: "",
+            text,
+            message: payload?.data?.message ?? "",
+            provider_meta: {
+              provider: "tripo3d",
+              task_type: "animate_prerigcheck",
+              provider_task_id: taskId,
+              original_model_task_id: originalModelTaskId,
+              tripo_model_task_id: originalModelTaskId,
+              source_model_url: sourceModelUrl,
+              model_url: sourceModelUrl,
+              riggable,
+              rig_type: rigType,
+            },
+          }),
+          { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
       if (isTerminalSuccess) {
         const mirror = async (
           srcUrl: string,
@@ -5487,11 +5583,13 @@ serve(async (req) => {
         if (tripoModelUrl) {
           // Pick the actual extension from the URL so we keep .glb /
           // .gltf / .usdz semantics intact for model-viewer.
-          const m = tripoModelUrl.match(/\.(glb|gltf|usdz|obj|fbx)(?=\?|#|$)/i);
+          const m = tripoModelUrl.match(/\.(glb|gltf|usdz|obj|fbx|stl|3mf)(?=\?|#|$)/i);
           const ext = (m?.[1] ?? "glb").toLowerCase();
           const contentType = ext === "gltf" ? "model/gltf+json"
             : ext === "usdz" ? "model/vnd.usdz+zip"
-            : "model/gltf-binary"; // .glb default; .obj/.fbx fall through
+            : ext === "obj" ? "model/obj"
+            : ext === "stl" ? "model/stl"
+            : "model/gltf-binary"; // .glb default; .fbx/.3mf fall through
           const mirrored = await mirror(tripoModelUrl, ext, contentType);
           if (mirrored) modelUrl = mirrored;
         }
@@ -5505,6 +5603,9 @@ serve(async (req) => {
             : "image/png";
           const mirrored = await mirror(tripoRenderedImage, ext, contentType);
           if (mirrored) renderedImage = mirrored;
+        }
+        if (taskType === "import_model" && !modelUrl && sourceModelUrl) {
+          modelUrl = sourceModelUrl;
         }
         console.log(
           `[tripo3d] mirror done glb=${modelUrl !== tripoModelUrl ? "ok" : "passthru"} ` +
@@ -5523,10 +5624,21 @@ serve(async (req) => {
           // For UI parity with poll_kling we put the rendered image
           // URL here so the frontend can swap the placeholder for a
           // real preview the moment it lands.
-          url: renderedImage || modelUrl,
+          url: renderedImage,
           model_url: modelUrl,
           preview_image: renderedImage,
           message: payload?.data?.message ?? "",
+          provider_meta: {
+            provider: "tripo3d",
+            task_type: taskType,
+            provider_task_id: taskId,
+            original_model_task_id: taskId,
+            tripo_model_task_id: taskId,
+            ...(originalModelTaskId ? { source_model_task_id: originalModelTaskId } : {}),
+            ...(sourceModelUrl ? { source_model_url: sourceModelUrl } : {}),
+            ...(modelUrl ? { model_url: modelUrl } : {}),
+            ...(renderedImage ? { rendered_image: renderedImage } : {}),
+          },
         }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
@@ -5832,7 +5944,19 @@ serve(async (req) => {
         });
         break;
       case "tripo3d":
-        result = await executeTripo3D(params);
+        if (nodeType === "tripoImportModelNode") {
+          result = await executeTripoImportModel(params);
+        } else if (nodeType === "tripoPreRigCheckNode") {
+          result = await executeTripoPreRigCheck(params);
+        } else if (nodeType === "tripoRigNode") {
+          result = await executeTripoRig(params);
+        } else if (nodeType === "tripoAnimateNode") {
+          result = await executeTripoRetarget(params);
+        } else if (nodeType === "tripoExportNode") {
+          result = await executeTripoConvert(params);
+        } else {
+          result = await executeTripo3D(params);
+        }
         break;
       case "hyper3d":
         result = await executeHyper3D(params);
@@ -5921,10 +6045,11 @@ serve(async (req) => {
     // Surface text outputs at the top level so the frontend's `r.text`
     // path picks them up (used by Chat AI, Video to Prompt, etc.).
     const textOut =
-      result.output_type === "text"
-        ? (result.outputs?.text as string | undefined) ??
-          (result.outputs ? Object.values(result.outputs)[0] : undefined)
-        : undefined;
+      typeof result.outputs?.text === "string"
+        ? result.outputs.text
+        : result.output_type === "text"
+          ? (result.outputs ? Object.values(result.outputs)[0] : undefined)
+          : undefined;
 
     return new Response(
       JSON.stringify({

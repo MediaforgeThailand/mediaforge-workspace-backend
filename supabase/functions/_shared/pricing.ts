@@ -68,6 +68,11 @@ export const NODE_TYPE_REGISTRY: Record<string, ProviderDef> = {
   urlAssetNode:          { provider: "url_asset", feature: "url_to_asset",           output_type: "image_url", is_async: false },
   audioGenNode:          { provider: "google_tts", feature: "text_to_speech",         output_type: "audio_url", is_async: false },
   imageTo3dNode:         { provider: "tripo3d",    feature: "model_3d",               output_type: "model_3d", is_async: true },
+  tripoImportModelNode:  { provider: "tripo3d",    feature: "model_3d",               output_type: "model_3d", is_async: true },
+  tripoPreRigCheckNode:  { provider: "tripo3d",    feature: "model_3d",               output_type: "model_3d", is_async: true },
+  tripoRigNode:          { provider: "tripo3d",    feature: "model_3d",               output_type: "model_3d", is_async: true },
+  tripoAnimateNode:      { provider: "tripo3d",    feature: "model_3d",               output_type: "model_3d", is_async: true },
+  tripoExportNode:       { provider: "tripo3d",    feature: "model_3d",               output_type: "model_3d", is_async: true },
   videoToPromptNode:     { provider: "video_understanding", feature: "video_to_prompt", output_type: "text", is_async: false },
 };
 

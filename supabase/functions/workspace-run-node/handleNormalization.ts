@@ -5,7 +5,7 @@
    Adding a new provider? Just add a new entry here.
    ═══════════════════════════════════════════════════════════ */
 
-export type DataType = "image" | "video" | "audio" | "text";
+export type DataType = "image" | "video" | "audio" | "text" | "model3d";
 
 export interface HandleDef {
   internal_key: string;   // The standardized key the executor reads
@@ -113,6 +113,10 @@ export const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     image:         { internal_key: "image_url",      data_type: "image" },
     image_input:   { internal_key: "image_url",      data_type: "image" },
     ref_image:     { internal_key: "image_url",      data_type: "image" },
+    model3d:       { internal_key: "model3d",        data_type: "model3d" },
+    model_3d:      { internal_key: "model3d",        data_type: "model3d" },
+    output_model:  { internal_key: "model3d",        data_type: "model3d" },
+    ref_model:     { internal_key: "model3d",        data_type: "model3d" },
   },
 };
 
