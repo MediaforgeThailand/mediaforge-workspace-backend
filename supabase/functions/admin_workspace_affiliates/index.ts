@@ -378,65 +378,62 @@ async function manualCreatePartner(client: SupabaseClient, body: Record<string, 
     throw new Error("bank_name and bank_account_no are required — collect bank details before inviting the creator");
   }
 
-  const applicationPayload = {
-    user_id: user.id,
-    legal_first_name: name.first,
-    legal_last_name: name.last,
-    phone_e164: asString(body.phone, "-"),
-    bank_name: bankName,
-    bank_account_no: bankAccountNo,
-    bank_account_name: bankAccountName,
-    social_profile_url: asString(body.social_profile_url),
-    social_platform: asString(body.social_platform),
-    follower_count: Math.max(0, Math.trunc(asNumber(body.follower_count, 0))),
-    status: "approved",
-    reviewed_by: actor.id,
-    reviewed_at: new Date().toISOString(),
-    rejection_reason: null,
-    needs_info_message: null,
-    submitted_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  };
-
-  const { data: app, error: appError } = await client
-    .from("partner_applications")
-    .upsert(applicationPayload, { onConflict: "user_id" })
-    .select("*")
-    .maybeSingle();
-  if (appError) throw new Error(`manual application save failed: ${appError.message}`);
-  if (!app) throw new Error("manual application save returned empty");
-
-  const { data: partner, error: partnerError } = await client
-    .from("partners")
-    .upsert({
-      user_id: user.id,
-      application_id: app.id,
-      commission_rate: commissionRate,
-      tier: discountPercent >= 20 ? "creator_20" : "standard",
-      approved_at: new Date().toISOString(),
-      suspended_at: null,
-      suspended_reason: null,
-    }, { onConflict: "user_id" })
-    .select("*")
-    .maybeSingle();
-  if (partnerError) throw new Error(`manual partner save failed: ${partnerError.message}`);
-
   const defaultCode = normalizeCode(body.code || `MF-${email.split("@")[0]}`);
-  const codeResult = await upsertCode(client, {
-    partner_user_id: user.id,
-    code: defaultCode,
-    discount_percent: discountPercent,
-    campaign_label: asString(body.campaign_label, "Invited creator"),
-    is_active: true,
-  });
 
-  await client.from("affiliate_audit_log").insert({
-    actor_id: actor.id,
-    action: "workspace_affiliate_partner_manual_created",
-    entity_type: "partner",
-    entity_id: user.id,
-    diff: { actor_email: actor.email, email, code: defaultCode, discount_percent: discountPercent },
-  });
+  // Atomic 4-write RPC: application + partner + code + audit in one txn.
+  // Replaces the prior 4-call JS sequence whose partial failures could
+  // leave an approved application without a partners row, or a partner
+  // without a code, etc. Stripe coupon creation stays in TS below — pg_net
+  // is async, so synchronously waiting for a coupon_id from inside plpgsql
+  // isn't worth the complexity, and a Stripe failure no longer leaves the
+  // partner half-created.
+  const { data: rpcResult, error: rpcError } = await client.rpc(
+    "admin_create_affiliate_partner_atomic",
+    {
+      p_user_id: user.id,
+      p_actor_id: actor.id,
+      p_actor_email: actor.email,
+      p_invited_email: email,
+      p_legal_first_name: name.first,
+      p_legal_last_name: name.last,
+      p_phone_e164: asString(body.phone, "-"),
+      p_bank_name: bankName,
+      p_bank_account_no: bankAccountNo,
+      p_bank_account_name: bankAccountName,
+      p_social_profile_url: asString(body.social_profile_url),
+      p_social_platform: asString(body.social_platform),
+      p_follower_count: Math.max(0, Math.trunc(asNumber(body.follower_count, 0))),
+      p_commission_rate: commissionRate,
+      p_code: defaultCode,
+      p_discount_percent: discountPercent,
+      p_campaign_label: asString(body.campaign_label, "Invited creator"),
+    },
+  );
+  if (rpcError) throw new Error(`manual partner create failed: ${rpcError.message}`);
+  if (!rpcResult || !(rpcResult as any).application_id) throw new Error("manual partner create returned empty");
+
+  const app = { id: (rpcResult as any).application_id } as any;
+  const partner = (rpcResult as any).partner;
+  const codeRow = (rpcResult as any).code as { id: string; code: string; stripe_coupon_id: string | null };
+
+  // Stripe coupon creation is best-effort post-RPC. If it fails, the partner
+  // still exists and admin can backfill via the lazy path in create-checkout.
+  if (discountPercent > 0 && !codeRow.stripe_coupon_id) {
+    try {
+      const couponId = await ensureStripeCoupon(client, stripeClient(), codeRow, defaultCode, discountPercent);
+      if (couponId) {
+        await client
+          .from("referral_codes")
+          .update({ stripe_coupon_id: couponId, updated_at: new Date().toISOString() })
+          .eq("id", codeRow.id);
+        codeRow.stripe_coupon_id = couponId;
+      }
+    } catch (e) {
+      console.warn("[admin_workspace_affiliates] Stripe coupon creation deferred after RPC:", e);
+    }
+  }
+
+  const codeResult = { data: { code: codeRow } };
 
   return { data: { application: app, partner, code: codeResult.data.code } };
 }
