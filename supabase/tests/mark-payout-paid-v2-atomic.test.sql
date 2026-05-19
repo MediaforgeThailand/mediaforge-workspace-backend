@@ -231,23 +231,30 @@ BEGIN
   INSERT INTO public.partner_applications (
     user_id, legal_first_name, legal_last_name, phone_e164,
     bank_name, bank_account_no, bank_account_name, status
-  ) VALUES (v_partner, 'Pending', 'Test', '+66999999999', 'SCB', '0123456789', 'Pending', 'approved')
+  ) VALUES (v_partner, 'Cancelled', 'Test', '+66999999999', 'SCB', '0123456789', 'Cancelled', 'approved')
   RETURNING id INTO v_app_id;
   INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at)
     VALUES (v_partner, v_app_id, 0.3, now());
 
+  -- The RPC accepts pending/approved/processing as payable states
+  -- (the current ERP workflow flows pending → processing → paid without
+  -- an intermediate 'approved' transition). Terminal states stay
+  -- rejected. We exercise 'cancelled' here as the canonical terminal —
+  -- the reverse_commission RPC sets payouts to 'cancelled' when a
+  -- refund clawbacks their commissions, and a v2 RPC that ignored that
+  -- guard would silently pay out refunded revenue.
   INSERT INTO public.payout_requests (
     partner_user_id, amount_thb, bank_snapshot, status, commission_ids
   ) VALUES (
-    v_partner, 500, '{}'::jsonb, 'pending', ARRAY[]::UUID[]
+    v_partner, 500, '{}'::jsonb, 'cancelled', ARRAY[]::UUID[]
   ) RETURNING id INTO v_payout_id;
 
   BEGIN
     PERFORM public.mark_payout_paid_v2(v_payout_id, NULL::uuid, 'BANK-REF-003', now());
-    RAISE EXCEPTION 'TEST 3 FAIL: marked a pending payout as paid';
+    RAISE EXCEPTION 'TEST 3 FAIL: marked a cancelled payout as paid';
   EXCEPTION WHEN raise_exception THEN
-    IF SQLERRM = 'payout_not_approved' THEN
-      RAISE NOTICE '✅ TEST 3 PASS: pending payout cannot be marked paid';
+    IF SQLERRM = 'payout_not_in_payable_state' THEN
+      RAISE NOTICE '✅ TEST 3 PASS: cancelled payout cannot be marked paid';
     ELSE
       RAISE EXCEPTION 'TEST 3 FAIL: wrong exception "%"', SQLERRM;
     END IF;
@@ -373,5 +380,73 @@ BEGIN
       RAISE EXCEPTION 'TEST 5 FAIL: wrong exception "%"', SQLERRM;
     END IF;
   END;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 6: 'pending' and 'processing' are accepted as payable states.
+--          The ERP workflow never transitions through 'approved' —
+--          v1 went pending → processing → paid — so the v2 RPC must
+--          accept those states or every payout in the system fails.
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_referred UUID;
+  v_app_id UUID;
+  v_code_id UUID;
+  v_referral_id UUID;
+  v_event_id UUID;
+  v_payout_id UUID;
+  v_final_status TEXT;
+BEGIN
+  SELECT user_id INTO v_partner FROM public.user_credits
+    WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+      AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+      AND user_id NOT IN (SELECT user_id FROM public.partners)
+    ORDER BY user_id LIMIT 1;
+  SELECT user_id INTO v_referred FROM public.user_credits
+    WHERE user_id <> v_partner ORDER BY user_id LIMIT 1;
+  IF v_partner IS NULL OR v_referred IS NULL THEN
+    RAISE NOTICE '⚠️ TEST 6 SKIPPED'; RETURN;
+  END IF;
+
+  INSERT INTO public.partner_applications (
+    user_id, legal_first_name, legal_last_name, phone_e164,
+    bank_name, bank_account_no, bank_account_name, status
+  ) VALUES (v_partner, 'Pending', 'Accepts', '+66999999999', 'SCB', '0123456789', 'Pending', 'approved')
+  RETURNING id INTO v_app_id;
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at)
+    VALUES (v_partner, v_app_id, 0.3, now());
+  INSERT INTO public.referral_codes (user_id, code, code_type, is_active, discount_percent)
+    VALUES (v_partner, 'MF-PENDING-OK', 'partner_affiliate', true, 0)
+    RETURNING id INTO v_code_id;
+  INSERT INTO public.referrals (referrer_user_id, referred_user_id, code_id, code_type, attribution_status)
+    VALUES (v_partner, v_referred, v_code_id, 'partner_affiliate', 'confirmed')
+    RETURNING id INTO v_referral_id;
+  INSERT INTO public.commission_events (
+    partner_user_id, referred_user_id, referral_id,
+    stripe_invoice_id, stripe_payment_intent_id,
+    gross_amount_thb, net_amount_thb, commission_rate,
+    commission_amount_thb, billing_cycle, cycle_index,
+    status, hold_until, available_at
+  ) VALUES (
+    v_partner, v_referred, v_referral_id, NULL, 'pi_pending_test',
+    1000, 1000, 0.3, 300, 'month', 1,
+    'available', now() - interval '1 day', now() - interval '1 hour'
+  ) RETURNING id INTO v_event_id;
+  INSERT INTO public.payout_requests (
+    partner_user_id, amount_thb, bank_snapshot, status, commission_ids
+  ) VALUES (v_partner, 300, '{}'::jsonb, 'pending', ARRAY[v_event_id])
+    RETURNING id INTO v_payout_id;
+
+  PERFORM public.mark_payout_paid_v2(v_payout_id, NULL::uuid, 'BANK-REF-006', now());
+  SELECT status INTO v_final_status FROM public.payout_requests WHERE id = v_payout_id;
+  IF v_final_status <> 'paid' THEN
+    RAISE EXCEPTION 'TEST 6 FAIL: pending payout final status=%, expected paid', v_final_status;
+  END IF;
+
+  RAISE NOTICE '✅ TEST 6 PASS: pending payout marked paid via v2 RPC';
 END $$;
 ROLLBACK;

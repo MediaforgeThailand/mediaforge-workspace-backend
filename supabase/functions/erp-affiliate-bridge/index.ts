@@ -468,7 +468,7 @@ Deno.serve(async (req) => {
         });
         if (rpcErr) {
           const msg = rpcErr.message ?? String(rpcErr);
-          const status = msg.includes("payout_not_approved") || msg.includes("commission_state_mismatch")
+          const status = msg.includes("payout_not_in_payable_state") || msg.includes("commission_state_mismatch")
             ? 409
             : 500;
           return fail(msg, status);
