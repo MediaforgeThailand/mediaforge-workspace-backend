@@ -14,6 +14,7 @@
 // ============================================================================
 
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import Stripe from "https://esm.sh/stripe@18.5.0";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -122,6 +123,133 @@ function genPartnerCode(): string {
   const r = crypto.getRandomValues(new Uint8Array(4));
   const hex = Array.from(r).map((b) => b.toString(16).padStart(2, "0")).join("");
   return "MF-P-" + hex.slice(0, 6).toUpperCase();
+}
+
+// ── Admin/manual partner helpers (mirrors admin_workspace_affiliates) ───────
+function asString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value.trim() : fallback;
+}
+
+function asNumber(value: unknown, fallback = 0): number {
+  const next = Number(value);
+  return Number.isFinite(next) ? next : fallback;
+}
+
+function clampPercent(value: unknown, fallback = 0): number {
+  return Math.max(0, Math.min(100, Number(asNumber(value, fallback).toFixed(2))));
+}
+
+function normalizeCode(raw: unknown): string {
+  const cleaned = asString(raw)
+    .toUpperCase()
+    .replace(/[^A-Z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  if (!/^[A-Z0-9][A-Z0-9-]{2,39}$/.test(cleaned)) {
+    throw new Error("Affiliate code must be 3-40 characters using letters, numbers, or hyphens");
+  }
+  return cleaned;
+}
+
+function splitName(fullName: string, fallbackEmail = "") {
+  const fallback = fallbackEmail.split("@")[0] || "Creator";
+  const parts = (fullName || fallback).trim().split(/\s+/).filter(Boolean);
+  return {
+    first: parts[0] || fallback,
+    last: parts.slice(1).join(" ") || "-",
+  };
+}
+
+async function findUserByEmail(db: SupabaseClient, email: string) {
+  const needle = email.trim().toLowerCase();
+  for (let page = 1; page <= 20; page += 1) {
+    const { data, error } = await db.auth.admin.listUsers({ page, perPage: 1000 });
+    if (error) throw new Error(`auth users lookup failed: ${error.message}`);
+    const user = data.users.find((item: any) => (item.email ?? "").toLowerCase() === needle);
+    if (user) return user;
+    if (data.users.length < 1000) break;
+  }
+  return null;
+}
+
+function stripeClient(): Stripe {
+  const key = Deno.env.get("STRIPE_SECRET_KEY") || "";
+  if (!key) throw new Error("Stripe is not configured");
+  return new Stripe(key, { apiVersion: "2026-02-25.clover" as any });
+}
+
+async function ensureStripeCoupon(
+  db: SupabaseClient,
+  codeRow: any | null,
+  code: string,
+  discountPercent: number,
+): Promise<string | null> {
+  if (discountPercent <= 0) return null;
+  if (codeRow?.stripe_coupon_id && Number(codeRow.discount_percent ?? 0) === discountPercent) {
+    return String(codeRow.stripe_coupon_id);
+  }
+  const coupon = await stripeClient().coupons.create({
+    name: `MediaForge creator ${code} - ${discountPercent}% off`,
+    percent_off: discountPercent,
+    duration: "once",
+    metadata: { source: "workspace_affiliate", affiliate_code: code },
+  });
+  if (codeRow?.id) {
+    await db.from("referral_codes")
+      .update({ stripe_coupon_id: coupon.id, updated_at: new Date().toISOString() })
+      .eq("id", codeRow.id);
+  }
+  return coupon.id;
+}
+
+async function upsertAffiliateCode(
+  db: SupabaseClient,
+  input: {
+    partner_user_id: string;
+    code: string; // pre-normalized
+    discount_percent: number;
+    campaign_label: string;
+    is_active: boolean;
+  },
+) {
+  const { data: partner, error: partnerErr } = await db
+    .from("partners")
+    .select("user_id, suspended_at")
+    .eq("user_id", input.partner_user_id)
+    .maybeSingle();
+  if (partnerErr) throw new Error(`partner read failed: ${partnerErr.message}`);
+  if (!partner || partner.suspended_at) throw new Error("partner is not active");
+
+  const { data: existing, error: existingErr } = await db
+    .from("referral_codes")
+    .select("*")
+    .eq("code", input.code)
+    .maybeSingle();
+  if (existingErr) throw new Error(`code read failed: ${existingErr.message}`);
+  if (existing && existing.user_id !== input.partner_user_id) {
+    throw new Error("affiliate code is already owned by another partner");
+  }
+
+  const couponId = await ensureStripeCoupon(db, existing, input.code, input.discount_percent);
+  const payload = {
+    user_id: input.partner_user_id,
+    code: input.code,
+    code_type: "partner_affiliate",
+    is_active: input.is_active,
+    campaign_label: input.campaign_label,
+    discount_percent: input.discount_percent,
+    stripe_coupon_id: couponId,
+    discount_duration: "once",
+    updated_at: new Date().toISOString(),
+  };
+
+  const query = existing
+    ? db.from("referral_codes").update(payload).eq("id", existing.id)
+    : db.from("referral_codes").insert(payload);
+  const { data, error } = await query.select("*").maybeSingle();
+  if (error) throw new Error(`code save failed: ${error.message}`);
+  if (!data) throw new Error("code save returned empty");
+  return data;
 }
 
 // ── Main handler ────────────────────────────────────────────────────────────
@@ -679,6 +807,125 @@ Deno.serve(async (req) => {
           .eq("code_type", "partner_affiliate");
         await audit(db, admin_id, "unsuspend_partner", "partner", user_id, {});
         return ok({ user_id, suspended: false });
+      }
+
+      case "manual_create_affiliate_partner": {
+        const email = asString(params.email).toLowerCase();
+        if (!email || !email.includes("@")) return fail("valid creator email is required", 400);
+        const bankName = asString(params.bank_name);
+        const bankAccountNo = asString(params.bank_account_no);
+        if (!bankName || !bankAccountNo) {
+          return fail("bank_name and bank_account_no are required — collect bank details before inviting the creator", 400);
+        }
+        const adminId = asString(params.actor_id) || asString(params.admin_id);
+        if (!adminId) return fail("Missing actor_id", 400);
+
+        try {
+          const user = await findUserByEmail(db, email);
+          if (!user) return fail("Creator must create a MediaForge account before admin can invite them", 404);
+
+          const fullName = asString(params.full_name)
+            || asString(user.user_metadata?.display_name)
+            || asString(user.user_metadata?.full_name)
+            || email.split("@")[0];
+          const name = splitName(fullName, email);
+          const commissionRate = Math.max(0, Math.min(1, asNumber(params.commission_rate, 0.3)));
+          const discountPercent = clampPercent(params.discount_percent, 20);
+          const bankAccountName = asString(params.bank_account_name) || fullName;
+          const now = new Date().toISOString();
+
+          const { data: app, error: appErr } = await db
+            .from("partner_applications")
+            .upsert({
+              user_id: user.id,
+              legal_first_name: name.first,
+              legal_last_name: name.last,
+              phone_e164: asString(params.phone, "-"),
+              bank_name: bankName,
+              bank_account_no: bankAccountNo,
+              bank_account_name: bankAccountName,
+              social_profile_url: asString(params.social_profile_url),
+              social_platform: asString(params.social_platform),
+              follower_count: Math.max(0, Math.trunc(asNumber(params.follower_count, 0))),
+              status: "approved",
+              reviewed_by: adminId,
+              reviewed_at: now,
+              rejection_reason: null,
+              needs_info_message: null,
+              submitted_at: now,
+              updated_at: now,
+            }, { onConflict: "user_id" })
+            .select("*")
+            .maybeSingle();
+          if (appErr) return fail(`manual application save failed: ${appErr.message}`, 500);
+          if (!app) return fail("manual application save returned empty", 500);
+
+          const { data: partner, error: partnerErr } = await db
+            .from("partners")
+            .upsert({
+              user_id: user.id,
+              application_id: app.id,
+              commission_rate: commissionRate,
+              tier: discountPercent >= 20 ? "creator_20" : "standard",
+              approved_at: now,
+              suspended_at: null,
+              suspended_reason: null,
+            }, { onConflict: "user_id" })
+            .select("*")
+            .maybeSingle();
+          if (partnerErr) return fail(`manual partner save failed: ${partnerErr.message}`, 500);
+
+          const defaultCode = normalizeCode(params.code || `MF-${email.split("@")[0]}`);
+          const codeRow = await upsertAffiliateCode(db, {
+            partner_user_id: user.id,
+            code: defaultCode,
+            discount_percent: discountPercent,
+            campaign_label: asString(params.campaign_label, "Invited creator"),
+            is_active: true,
+          });
+
+          await audit(db, adminId, "manual_create_affiliate_partner", "partner", user.id, {
+            actor_email: asString(params.actor_email),
+            email,
+            code: defaultCode,
+            discount_percent: discountPercent,
+            commission_rate: commissionRate,
+          });
+
+          return ok({ application: app, partner, code: codeRow });
+        } catch (e: any) {
+          return fail(e?.message ?? "manual create failed", 400);
+        }
+      }
+
+      case "upsert_affiliate_code": {
+        const adminId = asString(params.actor_id) || asString(params.admin_id);
+        if (!adminId) return fail("Missing actor_id", 400);
+        const partnerUserId = asString(params.partner_user_id);
+        if (!partnerUserId) return fail("partner_user_id is required", 400);
+        let code: string;
+        try { code = normalizeCode(params.code); }
+        catch (e: any) { return fail(e?.message ?? "invalid code", 400); }
+        const discountPercent = clampPercent(params.discount_percent, 0);
+        const isActive = params.is_active !== false;
+        try {
+          const codeRow = await upsertAffiliateCode(db, {
+            partner_user_id: partnerUserId,
+            code,
+            discount_percent: discountPercent,
+            campaign_label: asString(params.campaign_label, "Creator affiliate"),
+            is_active: isActive,
+          });
+          await audit(db, adminId, "upsert_affiliate_code", "referral_code", String(codeRow.id), {
+            partner_user_id: partnerUserId,
+            code,
+            discount_percent: discountPercent,
+            is_active: isActive,
+          });
+          return ok({ code: codeRow });
+        } catch (e: any) {
+          return fail(e?.message ?? "code save failed", 400);
+        }
       }
 
       case "adjust_commission_rate": {
