@@ -377,6 +377,166 @@ END $$;
 ROLLBACK;
 
 -- ─────────────────────────────────────────────────────────────
+-- TEST 7: Invariant E — attribution mismatch. commission_event has the
+--         wrong partner_user_id relative to its referrals row.
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner_a UUID;
+  v_partner_b UUID;
+  v_referred UUID;
+  v_app_a UUID;
+  v_app_b UUID;
+  v_code_a UUID;
+  v_referral_id UUID;
+  v_event_id UUID;
+  v_drift jsonb;
+BEGIN
+  -- Need TWO partners and a third user as the referred customer
+  SELECT user_id INTO v_partner_a
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  SELECT user_id INTO v_partner_b
+  FROM public.user_credits
+  WHERE user_id <> v_partner_a
+    AND user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  SELECT user_id INTO v_referred FROM public.user_credits
+    WHERE user_id NOT IN (v_partner_a, v_partner_b)
+    ORDER BY user_id LIMIT 1;
+
+  IF v_partner_a IS NULL OR v_partner_b IS NULL OR v_referred IS NULL THEN
+    RAISE EXCEPTION 'TEST 7 SETUP FAILED: need at least 3 distinct user_credits rows';
+  END IF;
+
+  INSERT INTO public.partner_applications (user_id, legal_first_name, legal_last_name, phone_e164, bank_name, bank_account_no, bank_account_name, status)
+    VALUES (v_partner_a, 'Partner', 'A', '+66911111111', 'SCB', '0123456789', 'A', 'approved') RETURNING id INTO v_app_a;
+  INSERT INTO public.partner_applications (user_id, legal_first_name, legal_last_name, phone_e164, bank_name, bank_account_no, bank_account_name, status)
+    VALUES (v_partner_b, 'Partner', 'B', '+66922222222', 'SCB', '0123456789', 'B', 'approved') RETURNING id INTO v_app_b;
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at) VALUES (v_partner_a, v_app_a, 0.3, now());
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at) VALUES (v_partner_b, v_app_b, 0.3, now());
+
+  INSERT INTO public.referral_codes (user_id, code, code_type, is_active, discount_percent)
+    VALUES (v_partner_a, 'MF-ATTR-A', 'partner_affiliate', true, 0) RETURNING id INTO v_code_a;
+
+  -- Referral row says: A referred the customer
+  INSERT INTO public.referrals (referrer_user_id, referred_user_id, code_id, code_type, attribution_status)
+    VALUES (v_partner_a, v_referred, v_code_a, 'partner_affiliate', 'confirmed') RETURNING id INTO v_referral_id;
+
+  -- BUT a commission_event credits partner B (attribution corruption)
+  INSERT INTO public.commission_events (
+    partner_user_id, referred_user_id, referral_id,
+    stripe_invoice_id, gross_amount_thb, net_amount_thb,
+    commission_rate, commission_amount_thb, billing_cycle,
+    cycle_index, status, hold_until
+  ) VALUES (
+    v_partner_b, v_referred, v_referral_id,
+    'in_attr_mismatch', 1000, 1000, 0.3, 300, 'month', 1, 'holding',
+    now() + interval '30 days'
+  ) RETURNING id INTO v_event_id;
+
+  PERFORM public.affiliate_reconcile();
+
+  SELECT diff INTO v_drift FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_event_id::text
+      AND diff->>'invariant' = 'E_attribution_mismatch'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift IS NOT NULL
+     AND (v_drift->>'expected_partner_user_id')::uuid = v_partner_a
+     AND (v_drift->>'actual_partner_user_id')::uuid = v_partner_b THEN
+    RAISE NOTICE '✅ TEST 7 PASS: attribution mismatch detected, drift names both expected and actual partners';
+  ELSE
+    RAISE EXCEPTION 'TEST 7 FAIL: drift = %', v_drift;
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 8: Invariant G — locked-base mismatch. commission_event was
+--         written with a base that diverges from the referral's locked
+--         value (corruption or manual SQL tamper).
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_referred UUID;
+  v_app_id UUID;
+  v_code_id UUID;
+  v_referral_id UUID;
+  v_event_id UUID;
+  v_drift jsonb;
+BEGIN
+  SELECT user_id INTO v_partner
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  SELECT user_id INTO v_referred FROM public.user_credits
+    WHERE user_id <> v_partner ORDER BY user_id LIMIT 1;
+
+  IF v_partner IS NULL OR v_referred IS NULL THEN
+    RAISE EXCEPTION 'TEST 8 SETUP FAILED';
+  END IF;
+
+  INSERT INTO public.partner_applications (user_id, legal_first_name, legal_last_name, phone_e164, bank_name, bank_account_no, bank_account_name, status)
+    VALUES (v_partner, 'Locked', 'Base', '+66999999999', 'SCB', '0123456789', 'Locked', 'approved') RETURNING id INTO v_app_id;
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at) VALUES (v_partner, v_app_id, 0.3, now());
+  INSERT INTO public.referral_codes (user_id, code, code_type, is_active, discount_percent)
+    VALUES (v_partner, 'MF-LOCKED-BASE', 'partner_affiliate', true, 0) RETURNING id INTO v_code_id;
+
+  -- Referral locked at base = 174 (e.g., first-time-discount price)
+  INSERT INTO public.referrals (
+    referrer_user_id, referred_user_id, code_id, code_type,
+    attribution_status, commission_base_amount_thb, commission_rate
+  )
+  VALUES (v_partner, v_referred, v_code_id, 'partner_affiliate', 'confirmed', 174, 0.3)
+  RETURNING id INTO v_referral_id;
+
+  -- Commission_event written with base = 290 (renewal price, NOT the locked value)
+  INSERT INTO public.commission_events (
+    partner_user_id, referred_user_id, referral_id,
+    stripe_invoice_id, gross_amount_thb, net_amount_thb,
+    commission_rate, commission_amount_thb, billing_cycle,
+    cycle_index, status, hold_until, commission_base_amount_thb
+  ) VALUES (
+    v_partner, v_referred, v_referral_id,
+    'in_locked_base', 1000, 1000, 0.3, 87, 'month', 2, 'holding',
+    now() + interval '30 days', 290
+  ) RETURNING id INTO v_event_id;
+
+  PERFORM public.affiliate_reconcile();
+
+  SELECT diff INTO v_drift FROM public.affiliate_audit_log
+    WHERE action = 'reconciliation_drift'
+      AND entity_id = v_event_id::text
+      AND diff->>'invariant' = 'G_locked_base_mismatch'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift IS NOT NULL
+     AND (v_drift->>'expected')::numeric = 174
+     AND (v_drift->>'actual')::numeric = 290
+     AND (v_drift->>'delta')::numeric = 116 THEN
+    RAISE NOTICE '✅ TEST 8 PASS: locked-base mismatch detected (expected=174, actual=290, delta=+116)';
+  ELSE
+    RAISE EXCEPTION 'TEST 8 FAIL: drift = %', v_drift;
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
 -- TEST 5: Cron is scheduled
 -- ─────────────────────────────────────────────────────────────
 BEGIN;

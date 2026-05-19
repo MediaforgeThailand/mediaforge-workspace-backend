@@ -10,7 +10,7 @@
 --   reconciliation catches it within 24 hours and writes to
 --   affiliate_audit_log so the admin team sees the drift.
 --
--- Four invariants (rounded to 2 decimal THB, drift threshold > 0.01):
+-- Six invariants (rounded to 2 decimal THB, drift threshold > 0.01):
 --   Partner-level (entity_type='partner'):
 --     A. partners.lifetime_paid_thb == SUM(payout_requests.amount_thb
 --        WHERE status='paid' AND partner_user_id = X)
@@ -22,9 +22,19 @@
 --   Payout-level (entity_type='payout'):
 --     D. payout_requests.amount_thb == SUM(commission_events.commission_amount_thb
 --        WHERE id = ANY(commission_ids)) for each paid payout.
---        Invariant B catches mismatches at the aggregate level but two opposite
---        per-payout errors can cancel out across a partner; invariant D pins
---        the error to the specific payout row so admin knows which one to fix.
+--   Commission-level — attribution & locked-base correctness (entity_type='commission_event'):
+--     E. For each commission_event ce: the referrals row pointed to by
+--        ce.referral_id must have (referrer_user_id, referred_user_id) ==
+--        (ce.partner_user_id, ce.referred_user_id). Catches attribution
+--        corruption — commission credited to the wrong partner — which the
+--        A/B/C/D invariants would not detect because per-partner totals
+--        still self-balance even when attribution is wrong.
+--     G. For each commission_event ce where its referrals row has
+--        commission_base_amount_thb IS NOT NULL: ce.commission_base_amount_thb
+--        must equal r.commission_base_amount_thb. Enforces the "lock the
+--        first-paid amount" semantic the affiliate program is built on —
+--        if anyone (a future bug, a manual SQL fix) wrote a per-event base
+--        that diverges from the referral's locked value, this catches it.
 --
 -- A drift writes a row to affiliate_audit_log with action='reconciliation_drift',
 -- the appropriate entity_type/entity_id, and a diff payload that names the
@@ -127,6 +137,67 @@ BEGIN
           'expected', v_sum_active_commissions,
           'actual', v_stored_commission,
           'delta', v_stored_commission - v_sum_active_commissions
+        )
+      );
+      v_drift_count := v_drift_count + 1;
+    END IF;
+  END LOOP;
+
+  -- Invariants E + G: per commission_event attribution and locked-base.
+  -- One pass over commission_events joined to its referrals row.
+  FOR r IN
+    SELECT ce.id AS event_id,
+           ce.partner_user_id     AS ce_partner,
+           ce.referred_user_id    AS ce_referred,
+           ce.referral_id,
+           ce.commission_base_amount_thb AS ce_base,
+           ref.referrer_user_id   AS ref_partner,
+           ref.referred_user_id   AS ref_referred,
+           ref.commission_base_amount_thb AS ref_base
+    FROM public.commission_events ce
+    JOIN public.referrals ref ON ref.id = ce.referral_id
+  LOOP
+    -- Invariant E: attribution match (partner + referred customer)
+    IF r.ce_partner IS DISTINCT FROM r.ref_partner
+       OR r.ce_referred IS DISTINCT FROM r.ref_referred THEN
+      INSERT INTO public.affiliate_audit_log (actor_id, action, entity_type, entity_id, diff)
+      VALUES (
+        NULL,
+        'reconciliation_drift',
+        'commission_event',
+        r.event_id::text,
+        jsonb_build_object(
+          'invariant', 'E_attribution_mismatch',
+          'event_id', r.event_id,
+          'referral_id', r.referral_id,
+          'expected_partner_user_id', r.ref_partner,
+          'actual_partner_user_id', r.ce_partner,
+          'expected_referred_user_id', r.ref_referred,
+          'actual_referred_user_id', r.ce_referred
+        )
+      );
+      v_drift_count := v_drift_count + 1;
+    END IF;
+
+    -- Invariant G: locked-base preserved. Only check when the referral has
+    -- been locked (ref_base IS NOT NULL); skip legacy events from before
+    -- the v2 migration that have ce_base IS NULL.
+    IF r.ref_base IS NOT NULL
+       AND r.ce_base IS NOT NULL
+       AND ABS(ROUND(r.ce_base, 2) - ROUND(r.ref_base, 2)) > 0.01 THEN
+      INSERT INTO public.affiliate_audit_log (actor_id, action, entity_type, entity_id, diff)
+      VALUES (
+        NULL,
+        'reconciliation_drift',
+        'commission_event',
+        r.event_id::text,
+        jsonb_build_object(
+          'invariant', 'G_locked_base_mismatch',
+          'event_id', r.event_id,
+          'referral_id', r.referral_id,
+          'expected', ROUND(r.ref_base, 2),
+          'actual', ROUND(r.ce_base, 2),
+          'delta', ROUND(r.ce_base - r.ref_base, 2)
         )
       );
       v_drift_count := v_drift_count + 1;
