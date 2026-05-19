@@ -552,3 +552,145 @@ BEGIN
   END IF;
 END $$;
 ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 9: Dedup — same drift detected twice writes one row only
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_app_id UUID;
+  v_count_after_first INT;
+  v_count_after_second INT;
+BEGIN
+  SELECT user_id INTO v_partner
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+
+  INSERT INTO public.partner_applications (
+    user_id, legal_first_name, legal_last_name, phone_e164,
+    bank_name, bank_account_no, bank_account_name, status
+  ) VALUES (v_partner, 'Dedup', 'Test', '+66999999999', 'SCB', '0123456789', 'Dedup', 'approved')
+  RETURNING id INTO v_app_id;
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at, lifetime_paid_thb)
+    VALUES (v_partner, v_app_id, 0.3, now(), 500);  -- intentional Drift A (no paid payouts)
+
+  PERFORM public.affiliate_reconcile();
+  SELECT count(*) INTO v_count_after_first FROM public.affiliate_audit_log
+    WHERE action='reconciliation_drift' AND entity_id = v_partner::text;
+
+  PERFORM public.affiliate_reconcile();
+  SELECT count(*) INTO v_count_after_second FROM public.affiliate_audit_log
+    WHERE action='reconciliation_drift' AND entity_id = v_partner::text;
+
+  IF v_count_after_first = 1 AND v_count_after_second = 1 THEN
+    RAISE NOTICE '✅ TEST 9 PASS: dedup index makes re-detection a no-op (count stays at 1)';
+  ELSE
+    RAISE EXCEPTION 'TEST 9 FAIL: first=%/1, second=%/1', v_count_after_first, v_count_after_second;
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 10: Invariant H — cash_wallets.balance_thb out of sync with ledger
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_drift jsonb;
+BEGIN
+  SELECT user_id INTO v_partner FROM public.user_credits ORDER BY user_id LIMIT 1;
+
+  INSERT INTO public.cash_wallets (user_id, balance_thb, lifetime_earned)
+    VALUES (v_partner, 700, 700)
+  ON CONFLICT (user_id) DO UPDATE SET balance_thb = 700, lifetime_earned = 700;
+
+  -- Ledger says +300 only — wallet stores 700, so drift = 400
+  INSERT INTO public.cash_wallet_transactions (user_id, amount_thb, tx_type, reference_id, note)
+    VALUES (v_partner, 300, 'commission_released', 'test-ledger-only', 'test');
+
+  PERFORM public.affiliate_reconcile();
+
+  SELECT diff INTO v_drift FROM public.affiliate_audit_log
+    WHERE action='reconciliation_drift'
+      AND entity_id = v_partner::text
+      AND diff->>'invariant' = 'H_wallet_balance_vs_ledger'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift IS NOT NULL
+     AND (v_drift->>'expected')::numeric = 300
+     AND (v_drift->>'actual')::numeric = 700
+     AND (v_drift->>'delta')::numeric = 400 THEN
+    RAISE NOTICE '✅ TEST 10 PASS: invariant H detected wallet drift (expected=300, actual=700, delta=400)';
+  ELSE
+    RAISE EXCEPTION 'TEST 10 FAIL: drift = %', v_drift;
+  END IF;
+END $$;
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- TEST 11: Invariant I — commission_event with BOTH stripe ids populated
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+DO $$
+DECLARE
+  v_partner UUID;
+  v_referred UUID;
+  v_app_id UUID;
+  v_code_id UUID;
+  v_referral_id UUID;
+  v_event_id UUID;
+  v_drift jsonb;
+BEGIN
+  SELECT user_id INTO v_partner
+  FROM public.user_credits
+  WHERE user_id NOT IN (SELECT user_id FROM public.partner_applications)
+    AND user_id NOT IN (SELECT user_id FROM public.referral_codes)
+    AND user_id NOT IN (SELECT user_id FROM public.partners)
+  ORDER BY user_id LIMIT 1;
+  SELECT user_id INTO v_referred FROM public.user_credits WHERE user_id <> v_partner ORDER BY user_id LIMIT 1;
+
+  INSERT INTO public.partner_applications (user_id, legal_first_name, legal_last_name, phone_e164, bank_name, bank_account_no, bank_account_name, status)
+    VALUES (v_partner, 'Dual', 'IDs', '+66999999999', 'SCB', '0123456789', 'Dual', 'approved') RETURNING id INTO v_app_id;
+  INSERT INTO public.partners (user_id, application_id, commission_rate, approved_at) VALUES (v_partner, v_app_id, 0.3, now());
+  INSERT INTO public.referral_codes (user_id, code, code_type, is_active, discount_percent)
+    VALUES (v_partner, 'MF-DUAL-IDS', 'partner_affiliate', true, 0) RETURNING id INTO v_code_id;
+  INSERT INTO public.referrals (referrer_user_id, referred_user_id, code_id, code_type, attribution_status)
+    VALUES (v_partner, v_referred, v_code_id, 'partner_affiliate', 'confirmed') RETURNING id INTO v_referral_id;
+
+  -- Corruption: both stripe ids populated
+  INSERT INTO public.commission_events (
+    partner_user_id, referred_user_id, referral_id,
+    stripe_invoice_id, stripe_payment_intent_id,
+    gross_amount_thb, net_amount_thb, commission_rate,
+    commission_amount_thb, billing_cycle, cycle_index,
+    status, hold_until
+  ) VALUES (
+    v_partner, v_referred, v_referral_id,
+    'in_dual_ids', 'pi_dual_ids',
+    1000, 1000, 0.3, 300, 'month', 1, 'holding',
+    now() + interval '30 days'
+  ) RETURNING id INTO v_event_id;
+
+  PERFORM public.affiliate_reconcile();
+
+  SELECT diff INTO v_drift FROM public.affiliate_audit_log
+    WHERE action='reconciliation_drift'
+      AND entity_id = v_event_id::text
+      AND diff->>'invariant' = 'I_both_stripe_ids_populated'
+    ORDER BY created_at DESC LIMIT 1;
+
+  IF v_drift IS NOT NULL
+     AND v_drift->>'stripe_invoice_id' = 'in_dual_ids'
+     AND v_drift->>'stripe_payment_intent_id' = 'pi_dual_ids' THEN
+    RAISE NOTICE '✅ TEST 11 PASS: invariant I detected dual-stripe-id corruption';
+  ELSE
+    RAISE EXCEPTION 'TEST 11 FAIL: drift = %', v_drift;
+  END IF;
+END $$;
+ROLLBACK;

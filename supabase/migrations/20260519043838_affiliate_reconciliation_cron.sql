@@ -40,6 +40,17 @@
 -- the appropriate entity_type/entity_id, and a diff payload that names the
 -- invariant, expected, actual, and signed delta. No data is mutated.
 
+-- Dedup index for reconciliation_drift rows. A persistent drift would
+-- otherwise generate a new audit row every cron run + a new email every
+-- 15 minutes. The partial unique index narrows the dedup to the
+-- (entity_id, invariant) shape that uniquely identifies "the same drift".
+-- The INSERTs below use ON CONFLICT DO NOTHING so re-detecting the same
+-- drift on the next cron is a no-op. To force a re-notification, delete
+-- the row (or extend with notified_at-aware dedup once #44 lands).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_affiliate_audit_log_open_drift
+  ON public.affiliate_audit_log (entity_id, (diff->>'invariant'))
+  WHERE action = 'reconciliation_drift';
+
 CREATE OR REPLACE FUNCTION public.affiliate_reconcile()
 RETURNS integer
 LANGUAGE plpgsql
@@ -54,6 +65,7 @@ DECLARE
   v_sum_active_commissions numeric;
   v_stored_paid numeric;
   v_stored_commission numeric;
+  v_inserted_dual_ids integer;
 BEGIN
   FOR r IN
     SELECT user_id, COALESCE(lifetime_paid_thb, 0)::numeric AS stored_paid,
@@ -100,7 +112,8 @@ BEGIN
           'actual', v_stored_paid,
           'delta', v_stored_paid - v_sum_paid_payouts
         )
-      );
+      )
+      ON CONFLICT DO NOTHING;
       v_drift_count := v_drift_count + 1;
     END IF;
 
@@ -119,7 +132,8 @@ BEGIN
           'actual', v_sum_paid_commissions,
           'delta', v_sum_paid_commissions - v_sum_paid_payouts
         )
-      );
+      )
+      ON CONFLICT DO NOTHING;
       v_drift_count := v_drift_count + 1;
     END IF;
 
@@ -138,13 +152,17 @@ BEGIN
           'actual', v_stored_commission,
           'delta', v_stored_commission - v_sum_active_commissions
         )
-      );
+      )
+      ON CONFLICT DO NOTHING;
       v_drift_count := v_drift_count + 1;
     END IF;
   END LOOP;
 
   -- Invariants E + G: per commission_event attribution and locked-base.
-  -- One pass over commission_events joined to its referrals row.
+  -- Filter to "active" statuses — a clawback/void event keeps its
+  -- partner_user_id and base, but if the referrals row drifts later
+  -- (legit edit, future tooling) the reversed event would false-positive.
+  -- Same active set used by invariant C.
   FOR r IN
     SELECT ce.id AS event_id,
            ce.partner_user_id     AS ce_partner,
@@ -156,6 +174,7 @@ BEGIN
            ref.commission_base_amount_thb AS ref_base
     FROM public.commission_events ce
     JOIN public.referrals ref ON ref.id = ce.referral_id
+    WHERE ce.status IN ('holding','available','paid')
   LOOP
     -- Invariant E: attribution match (partner + referred customer)
     IF r.ce_partner IS DISTINCT FROM r.ref_partner
@@ -175,7 +194,8 @@ BEGIN
           'expected_referred_user_id', r.ref_referred,
           'actual_referred_user_id', r.ce_referred
         )
-      );
+      )
+      ON CONFLICT DO NOTHING;
       v_drift_count := v_drift_count + 1;
     END IF;
 
@@ -199,7 +219,8 @@ BEGIN
           'actual', ROUND(r.ce_base, 2),
           'delta', ROUND(r.ce_base - r.ref_base, 2)
         )
-      );
+      )
+      ON CONFLICT DO NOTHING;
       v_drift_count := v_drift_count + 1;
     END IF;
   END LOOP;
@@ -241,10 +262,72 @@ BEGIN
           'actual', ROUND(r.amount_thb, 2),
           'delta', ROUND(r.amount_thb - r.commissions_sum, 2)
         )
-      );
+      )
+      ON CONFLICT DO NOTHING;
       v_drift_count := v_drift_count + 1;
     END IF;
   END LOOP;
+
+  -- Invariant H: cash_wallets.balance_thb consistency with the ledger.
+  -- balance_thb is credited at release (status='available'), debited at
+  -- payout-paid via cash_wallet_transactions.tx_type='payout_debit', and
+  -- debited on clawback via 'commission_clawback'/'commission_refunded'.
+  -- The expected balance is therefore:
+  --   sum of all positive ledger entries for this partner
+  --     - sum of all negative ledger entries.
+  -- Equivalent to `SUM(amount_thb)` because debit entries are stored
+  -- negative. Floor at 0 (reverse_commission uses GREATEST(_, 0) defensively).
+  FOR r IN
+    SELECT cw.user_id,
+           COALESCE(cw.balance_thb, 0)::numeric AS stored_balance,
+           GREATEST(0, COALESCE((SELECT SUM(amount_thb)
+                                  FROM public.cash_wallet_transactions
+                                  WHERE user_id = cw.user_id), 0)::numeric) AS expected_balance
+    FROM public.cash_wallets cw
+  LOOP
+    IF ABS(ROUND(r.stored_balance, 2) - ROUND(r.expected_balance, 2)) > 0.01 THEN
+      INSERT INTO public.affiliate_audit_log (actor_id, action, entity_type, entity_id, diff)
+      VALUES (
+        NULL,
+        'reconciliation_drift',
+        'cash_wallet',
+        r.user_id::text,
+        jsonb_build_object(
+          'invariant', 'H_wallet_balance_vs_ledger',
+          'user_id', r.user_id,
+          'expected', ROUND(r.expected_balance, 2),
+          'actual', ROUND(r.stored_balance, 2),
+          'delta', ROUND(r.stored_balance - r.expected_balance, 2)
+        )
+      )
+      ON CONFLICT DO NOTHING;
+      v_drift_count := v_drift_count + 1;
+    END IF;
+  END LOOP;
+
+  -- Invariant I: commission_events should have EITHER stripe_invoice_id OR
+  -- stripe_payment_intent_id populated, never both. accrue_commission writes
+  -- exactly one based on the `pi_` prefix; both being set is a sign of
+  -- corruption from a future regression or a manual data fix.
+  INSERT INTO public.affiliate_audit_log (actor_id, action, entity_type, entity_id, diff)
+  SELECT
+    NULL,
+    'reconciliation_drift',
+    'commission_event',
+    ce.id::text,
+    jsonb_build_object(
+      'invariant', 'I_both_stripe_ids_populated',
+      'event_id', ce.id,
+      'stripe_invoice_id', ce.stripe_invoice_id,
+      'stripe_payment_intent_id', ce.stripe_payment_intent_id
+    )
+  FROM public.commission_events ce
+  WHERE ce.stripe_invoice_id IS NOT NULL
+    AND ce.stripe_payment_intent_id IS NOT NULL
+  ON CONFLICT DO NOTHING;
+
+  GET DIAGNOSTICS v_inserted_dual_ids = ROW_COUNT;
+  v_drift_count := v_drift_count + v_inserted_dual_ids;
 
   RETURN v_drift_count;
 END;
