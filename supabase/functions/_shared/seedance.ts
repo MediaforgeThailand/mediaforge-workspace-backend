@@ -392,6 +392,11 @@ export async function submitSeedanceTask(
         "Seedance reference video is invalid: reference videos must be 2-15 seconds each, and total reference video duration must not exceed 15 seconds.",
       );
     }
+    if (/video pixel count|less than or equal to 2086876|2086876/i.test(text)) {
+      throw new Error(
+        "Seedance reference video is too large: use a reference video at 1080p or smaller (max 2,086,876 pixels per frame).",
+      );
+    }
     throw new Error(
       `Seedance API error (HTTP ${res.status}): ${errorText}`,
     );
