@@ -201,6 +201,50 @@ async function sendCommissionEmailIfPossible(
   }
 }
 
+// Revert a customer's profile back to the Free plan after refund/dispute.
+// Without this, profiles.current_plan_id stays pointing at the refunded
+// plan — customer can't repurchase or upgrade, and (in the dispute case)
+// keeps service after MediaForge already lost the money. The helper is
+// idempotent: a profile already on Free just gets its timestamps bumped.
+async function revertProfileToFree(
+  sb: ReturnType<typeof createClient>,
+  userId: string | null | undefined,
+  reason: string,
+): Promise<void> {
+  if (!userId) {
+    console.warn(`[STRIPE-WEBHOOK] revertProfileToFree skipped — null userId (${reason})`);
+    return;
+  }
+  const { data: freePlan } = await sb
+    .from("subscription_plans")
+    .select("id")
+    .eq("name", "Free")
+    .eq("price_thb", 0)
+    .eq("is_active", true)
+    .maybeSingle();
+  const freePlanId = (freePlan as any)?.id;
+  if (!freePlanId) {
+    console.error(`[STRIPE-WEBHOOK] revertProfileToFree: Free plan row missing — skipping (${reason})`);
+    return;
+  }
+  const { error } = await sb
+    .from("profiles")
+    .update({
+      current_plan_id: freePlanId,
+      subscription_plan_id: freePlanId,
+      subscription_status: "cancelled",
+      subscription_billing_cycle: null,
+      stripe_subscription_id: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("user_id", userId);
+  if (error) {
+    console.error(`[STRIPE-WEBHOOK] revertProfileToFree(${userId}) failed: ${error.message}`);
+  } else {
+    console.log(`[STRIPE-WEBHOOK] profile reverted to Free for ${userId} (${reason})`);
+  }
+}
+
 async function handleRefundSucceeded(
   sb: ReturnType<typeof createClient>,
   _stripe: Stripe,
@@ -221,7 +265,7 @@ async function handleRefundSucceeded(
 
   const { data: existing, error: existingErr } = await sb
     .from("payment_transactions")
-    .select("id, status, stripe_refund_id")
+    .select("id, user_id, amount_thb, status, stripe_refund_id")
     .eq("stripe_payment_intent_id", paymentIntentId)
     .maybeSingle();
 
@@ -288,6 +332,23 @@ async function handleRefundSucceeded(
     }
   }
 
+  // Revert plan only on FULL refund. Partial refund (e.g., customer
+  // service goodwill credit) keeps the subscription active — only the
+  // payment_transactions row records the partial refund amount.
+  const originalAmount = Number((existing as any).amount_thb ?? 0);
+  const isFullRefund = originalAmount > 0 && refundAmountThb >= originalAmount;
+  if (isFullRefund) {
+    await revertProfileToFree(
+      sb,
+      (existing as any).user_id,
+      `refund ${refundId} (full ${refundAmountThb}/${originalAmount} THB)`,
+    );
+  } else {
+    console.log(
+      `[STRIPE-WEBHOOK] partial refund — profile NOT reverted (refund ${refundAmountThb} < amount ${originalAmount} THB)`,
+    );
+  }
+
   // NOTE: credits claw-back intentionally skipped — may already be consumed.
 }
 
@@ -312,7 +373,7 @@ async function handleDisputeCreated(
   // Resolve PI from charge — payment_transactions stores PI not charge id.
   const { data: tx, error: txErr } = await sb
     .from("payment_transactions")
-    .select("stripe_payment_intent_id")
+    .select("stripe_payment_intent_id, user_id")
     .eq("stripe_charge_id", chargeId)
     .maybeSingle();
 
@@ -356,6 +417,17 @@ async function handleDisputeCreated(
       });
     }
   }
+
+  // Dispute = chargeback. Stripe has already pulled the funds permanently;
+  // unlike a refund there's no "partial" option that keeps the subscription
+  // valid. Always revert the profile so the customer can't continue using
+  // the plan they no longer paid for. If the merchant later wins the
+  // dispute, restoring the plan is a manual admin action (rare path).
+  await revertProfileToFree(
+    sb,
+    (tx as any).user_id,
+    `dispute ${disputeId} (${dispute.reason ?? "unknown"})`,
+  );
 }
 
 serve(async (req) => {
