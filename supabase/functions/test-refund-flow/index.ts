@@ -30,6 +30,13 @@ serve(async (req) => {
       });
     }
 
+    if (Deno.env.get("ENABLE_TEST_REFUND_FLOW") !== "true") {
+      return new Response(JSON.stringify({ error: "not_found" }), {
+        status: 404,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
     const CREDIT_AMOUNT = 10;
     const steps: string[] = [];
 

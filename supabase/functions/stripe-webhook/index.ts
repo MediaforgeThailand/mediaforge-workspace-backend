@@ -18,10 +18,11 @@ const TEAM_PROMO_CREDITS_PER_SEAT_MONTH = 25_000;
 const TEAM_MIN_SEATS = 2;
 const TEAM_MAX_SEATS = 500;
 const TEAM_ANNUAL_DISCOUNT = 0.2;
+type SupabaseServiceClient = any;
 
 // ─── Commission helpers ───
 async function computeCycleIndex(
-  sb: ReturnType<typeof createClient>,
+  sb: SupabaseServiceClient,
   referredUserId: string
 ): Promise<number> {
   const { count } = await sb
@@ -33,7 +34,7 @@ async function computeCycleIndex(
 }
 
 async function auditLog(
-  sb: ReturnType<typeof createClient>,
+  sb: SupabaseServiceClient,
   action: string,
   entityId: string,
   payload: Record<string, unknown>
@@ -55,7 +56,7 @@ async function auditLog(
 // attribution confirmation. No-op for partner_affiliate and for
 // already-granted referrals. Safe to call on every successful payment.
 async function ensureAffiliateReferralFromMetadata(
-  sb: ReturnType<typeof createClient>,
+  sb: SupabaseServiceClient,
   referredUserId: string,
   metadata: Record<string, string | undefined> | null | undefined,
   sourceTag: string,
@@ -105,7 +106,7 @@ function paidThbFromStripeAmount(
 }
 
 async function awardUserReferralBonusIfEligible(
-  sb: ReturnType<typeof createClient>,
+  sb: SupabaseServiceClient,
   referredUserId: string,
   sourceTag: string,
 ): Promise<void> {
@@ -127,7 +128,7 @@ async function awardUserReferralBonusIfEligible(
 
 // ─── Email helpers ───
 async function getUserEmailAndName(
-  sb: ReturnType<typeof createClient>,
+  sb: SupabaseServiceClient,
   userId: string,
 ): Promise<{ email: string | null; first_name: string }> {
   try {
@@ -178,7 +179,7 @@ function receiptFieldsFromIntent(intent: Stripe.PaymentIntent): Record<string, u
 }
 
 async function sendCommissionEmailIfPossible(
-  sb: ReturnType<typeof createClient>,
+  sb: SupabaseServiceClient,
   partnerUserId: string,
   referredUserId: string,
   commissionAmount: number,
@@ -209,7 +210,7 @@ async function sendCommissionEmailIfPossible(
 // keeps service after MediaForge already lost the money. The helper is
 // idempotent: a profile already on Free just gets its timestamps bumped.
 async function revertProfileToFree(
-  sb: ReturnType<typeof createClient>,
+  sb: SupabaseServiceClient,
   userId: string | null | undefined,
   reason: string,
 ): Promise<void> {
@@ -217,19 +218,24 @@ async function revertProfileToFree(
     console.warn(`[STRIPE-WEBHOOK] revertProfileToFree skipped — null userId (${reason})`);
     return;
   }
-  const { data: freePlan } = await sb
+  const { data: freePlan, error: freePlanError } = await sb
     .from("subscription_plans")
     .select("id")
     .eq("name", "Free")
     .eq("price_thb", 0)
     .eq("is_active", true)
     .maybeSingle();
+  if (freePlanError) {
+    console.error(`[STRIPE-WEBHOOK] revertProfileToFree: Free plan lookup failed (${reason}):`, freePlanError);
+    throw freePlanError;
+  }
   const freePlanId = (freePlan as any)?.id;
   if (!freePlanId) {
-    console.error(`[STRIPE-WEBHOOK] revertProfileToFree: Free plan row missing — skipping (${reason})`);
-    return;
+    const error = new Error(`Free plan row missing while reverting ${userId} (${reason})`);
+    console.error(`[STRIPE-WEBHOOK] revertProfileToFree: ${error.message}`);
+    throw error;
   }
-  const { error } = await sb
+  const { data: updatedProfile, error } = await sb
     .from("profiles")
     .update({
       current_plan_id: freePlanId,
@@ -239,21 +245,33 @@ async function revertProfileToFree(
       stripe_subscription_id: null,
       updated_at: new Date().toISOString(),
     })
-    .eq("user_id", userId);
+    .eq("user_id", userId)
+    .select("user_id")
+    .maybeSingle();
   if (error) {
     console.error(`[STRIPE-WEBHOOK] revertProfileToFree(${userId}) failed: ${error.message}`);
+    throw error;
+  } else if (!updatedProfile) {
+    const missingProfileError = new Error(`profile row missing while reverting ${userId} (${reason})`);
+    console.error(`[STRIPE-WEBHOOK] revertProfileToFree: ${missingProfileError.message}`);
+    throw missingProfileError;
   } else {
     console.log(`[STRIPE-WEBHOOK] profile reverted to Free for ${userId} (${reason})`);
   }
 }
 
 async function handleRefundSucceeded(
-  sb: ReturnType<typeof createClient>,
+  sb: SupabaseServiceClient,
   _stripe: Stripe,
   refund: Stripe.Refund,
   eventId: string
 ) {
   const refundId = refund.id;
+  if (refund.metadata?.purpose === "autorefill_verification_refund") {
+    console.log(`[STRIPE-WEBHOOK] ignoring auto-refill verification refund ${refundId}`);
+    return;
+  }
+
   const paymentIntentId = typeof refund.payment_intent === "string"
     ? refund.payment_intent
     : refund.payment_intent?.id;
@@ -273,36 +291,19 @@ async function handleRefundSucceeded(
 
   if (existingErr) {
     console.error("[STRIPE-WEBHOOK] refund: payment_transactions lookup error:", existingErr);
-    return;
+    throw existingErr;
   }
   if (!existing) {
     console.warn(`[STRIPE-WEBHOOK] refund: no payment_transactions for PI ${paymentIntentId}`);
     return;
   }
 
-  if (existing.stripe_refund_id === refundId) {
-    console.log(`[STRIPE-WEBHOOK] refund already processed: ${refundId}`);
-    return;
+  const alreadyMarkedRefunded = existing.stripe_refund_id === refundId;
+  if (alreadyMarkedRefunded) {
+    console.log(`[STRIPE-WEBHOOK] refund transaction already marked: ${refundId}; rechecking side effects`);
   }
 
-  // 1. Mark payment as refunded
-  const { error: updErr } = await sb
-    .from("payment_transactions")
-    .update({
-      status: "refunded",
-      refunded_at: new Date().toISOString(),
-      refund_amount_thb: refundAmountThb,
-      refund_reason: refund.reason ?? "customer_request",
-      stripe_refund_id: refundId,
-    })
-    .eq("id", existing.id);
-
-  if (updErr) {
-    console.error("[STRIPE-WEBHOOK] refund: payment_transactions update failed:", updErr);
-    throw updErr;
-  }
-
-  // 2. Reverse commission via RPC (idempotent by refund_id)
+  // 1. Reverse commission via RPC (idempotent by refund_id)
   const { data: reversed, error: rpcErr } = await sb.rpc("reverse_commission", {
     p_payment_intent_id: paymentIntentId,
     p_refund_id: refundId,
@@ -334,7 +335,7 @@ async function handleRefundSucceeded(
     }
   }
 
-  // Revert plan only on FULL refund. Partial refund (e.g., customer
+  // 2. Revert plan only on FULL refund. Partial refund (e.g., customer
   // service goodwill credit) keeps the subscription active — only the
   // payment_transactions row records the partial refund amount.
   const originalAmountRaw = (existing as any).amount_thb;
@@ -357,6 +358,27 @@ async function handleRefundSucceeded(
     );
   }
 
+  // 3. Mark payment as refunded only after the commission/profile side
+  // effects succeed. This keeps Stripe retries useful if a downstream
+  // write fails mid-handler.
+  if (!alreadyMarkedRefunded) {
+    const { error: updErr } = await sb
+      .from("payment_transactions")
+      .update({
+        status: "refunded",
+        refunded_at: new Date().toISOString(),
+        refund_amount_thb: refundAmountThb,
+        refund_reason: refund.reason ?? "customer_request",
+        stripe_refund_id: refundId,
+      })
+      .eq("id", existing.id);
+
+    if (updErr) {
+      console.error("[STRIPE-WEBHOOK] refund: payment_transactions update failed:", updErr);
+      throw updErr;
+    }
+  }
+
   // NOTE: credits claw-back intentionally skipped — may already be consumed.
 }
 
@@ -367,7 +389,7 @@ async function handleRefundSucceeded(
 // we no longer have. Idempotent: uses dispute.id as the reversal key
 // (reverse_commission dedups by `reversed_by_refund_id`).
 async function handleDisputeCreated(
-  sb: ReturnType<typeof createClient>,
+  sb: SupabaseServiceClient,
   dispute: Stripe.Dispute,
   eventId: string,
 ) {
@@ -387,7 +409,7 @@ async function handleDisputeCreated(
 
   if (txErr) {
     console.error("[STRIPE-WEBHOOK] dispute: payment_transactions lookup error:", txErr);
-    return;
+    throw txErr;
   }
   if (!tx?.stripe_payment_intent_id) {
     console.warn(`[STRIPE-WEBHOOK] dispute: no PI for charge ${chargeId} (dispute=${disputeId})`);
@@ -400,42 +422,49 @@ async function handleDisputeCreated(
     p_reason: `stripe_dispute:${dispute.reason ?? "unknown"}`,
   });
 
+  let reverseError: unknown = null;
   if (rpcErr) {
     console.error("[STRIPE-WEBHOOK] dispute reverse_commission failed:", rpcErr);
-    return;
-  }
+    reverseError = rpcErr;
+  } else {
+    console.log("[STRIPE-WEBHOOK] dispute processed:", {
+      disputeId,
+      chargeId,
+      paymentIntentId: tx.stripe_payment_intent_id,
+      reversedCount: Array.isArray(reversed) ? reversed.length : 0,
+    });
 
-  console.log("[STRIPE-WEBHOOK] dispute processed:", {
-    disputeId,
-    chargeId,
-    paymentIntentId: tx.stripe_payment_intent_id,
-    reversedCount: Array.isArray(reversed) ? reversed.length : 0,
-  });
-
-  if (Array.isArray(reversed) && reversed.length > 0) {
-    for (const r of reversed as Array<{ commission_event_id: string; partner_user_id: string; reversed_amount_thb: number }>) {
-      await auditLog(sb, "commission_reversed", r.commission_event_id, {
-        event_id: eventId,
-        source: "dispute_webhook",
-        amount_thb: r.reversed_amount_thb,
-        partner_user_id: r.partner_user_id,
-        stripe_dispute_id: disputeId,
-        stripe_charge_id: chargeId,
-        stripe_payment_intent_id: tx.stripe_payment_intent_id,
-      });
+    if (Array.isArray(reversed) && reversed.length > 0) {
+      for (const r of reversed as Array<{ commission_event_id: string; partner_user_id: string; reversed_amount_thb: number }>) {
+        await auditLog(sb, "commission_reversed", r.commission_event_id, {
+          event_id: eventId,
+          source: "dispute_webhook",
+          amount_thb: r.reversed_amount_thb,
+          partner_user_id: r.partner_user_id,
+          stripe_dispute_id: disputeId,
+          stripe_charge_id: chargeId,
+          stripe_payment_intent_id: tx.stripe_payment_intent_id,
+        });
+      }
     }
   }
 
-  // Dispute = chargeback. Stripe has already pulled the funds permanently;
-  // unlike a refund there's no "partial" option that keeps the subscription
-  // valid. Always revert the profile so the customer can't continue using
-  // the plan they no longer paid for. If the merchant later wins the
-  // dispute, restoring the plan is a manual admin action (rare path).
-  await revertProfileToFree(
-    sb,
-    (tx as any).user_id,
-    `dispute ${disputeId} (${dispute.reason ?? "unknown"})`,
-  );
+  try {
+    // Dispute = chargeback. Stripe has already pulled the funds permanently;
+    // unlike a refund there's no "partial" option that keeps the subscription
+    // valid. Always revert the profile so the customer can't continue using
+    // the plan they no longer paid for. If the merchant later wins the
+    // dispute, restoring the plan is a manual admin action (rare path).
+    await revertProfileToFree(
+      sb,
+      (tx as any).user_id,
+      `dispute ${disputeId} (${dispute.reason ?? "unknown"})`,
+    );
+  } finally {
+    if (reverseError) {
+      throw reverseError;
+    }
+  }
 }
 
 serve(async (req) => {
@@ -1858,6 +1887,7 @@ serve(async (req) => {
         }
       } catch (e) {
         console.error("[STRIPE-WEBHOOK] refund.* exception:", e);
+        throw e;
       }
     }
 
@@ -1881,6 +1911,7 @@ serve(async (req) => {
         }
       } catch (e) {
         console.error("[STRIPE-WEBHOOK] charge.refunded exception:", e);
+        throw e;
       }
     }
 
@@ -1957,11 +1988,10 @@ serve(async (req) => {
      * Pre-fix: no handler. A user disputes a charge → our system
      * never knows, the user keeps using the credits they bought.
      *
-     * Post-fix: log the dispute against the user's profile via a
-     * service-side audit table (`payment_disputes`) so ops can
-     * see it on the dashboard, and pause the subscription if the
-     * dispute looks fraud-flavoured. We don't auto-revoke credits
-     * because Stripe gives 7+ days to respond — admin can choose. */
+     * Post-fix: log the dispute in `payment_disputes`, reverse any
+     * affiliate commission, and revert the subscription profile to Free.
+     * Credits are not clawed back automatically because they may have
+     * already been consumed; ops can handle that separately. */
     if (
       event.type === "charge.dispute.created" ||
       event.type === "charge.dispute.updated" ||
@@ -2011,6 +2041,7 @@ serve(async (req) => {
         }
       } catch (e) {
         console.error("[STRIPE-WEBHOOK] dispute exception:", e);
+        throw e;
       }
     }
 
