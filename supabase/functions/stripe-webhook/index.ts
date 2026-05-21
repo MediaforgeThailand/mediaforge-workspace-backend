@@ -84,9 +84,11 @@ async function ensureAffiliateReferralFromMetadata(
       );
     } else if (error) {
       console.error(`[STRIPE-WEBHOOK] affiliate referral insert (${sourceTag}) error:`, error);
+      throw new Error(`affiliate referral insert failed: ${error.message}`);
     }
   } catch (e) {
     console.error(`[STRIPE-WEBHOOK] affiliate referral insert (${sourceTag}) exception:`, e);
+    throw e;
   }
 }
 
@@ -201,6 +203,50 @@ async function sendCommissionEmailIfPossible(
   }
 }
 
+// Revert a customer's profile back to the Free plan after refund/dispute.
+// Without this, profiles.current_plan_id stays pointing at the refunded
+// plan — customer can't repurchase or upgrade, and (in the dispute case)
+// keeps service after MediaForge already lost the money. The helper is
+// idempotent: a profile already on Free just gets its timestamps bumped.
+async function revertProfileToFree(
+  sb: ReturnType<typeof createClient>,
+  userId: string | null | undefined,
+  reason: string,
+): Promise<void> {
+  if (!userId) {
+    console.warn(`[STRIPE-WEBHOOK] revertProfileToFree skipped — null userId (${reason})`);
+    return;
+  }
+  const { data: freePlan } = await sb
+    .from("subscription_plans")
+    .select("id")
+    .eq("name", "Free")
+    .eq("price_thb", 0)
+    .eq("is_active", true)
+    .maybeSingle();
+  const freePlanId = (freePlan as any)?.id;
+  if (!freePlanId) {
+    console.error(`[STRIPE-WEBHOOK] revertProfileToFree: Free plan row missing — skipping (${reason})`);
+    return;
+  }
+  const { error } = await sb
+    .from("profiles")
+    .update({
+      current_plan_id: freePlanId,
+      subscription_plan_id: freePlanId,
+      subscription_status: "free",
+      subscription_billing_cycle: null,
+      stripe_subscription_id: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("user_id", userId);
+  if (error) {
+    console.error(`[STRIPE-WEBHOOK] revertProfileToFree(${userId}) failed: ${error.message}`);
+  } else {
+    console.log(`[STRIPE-WEBHOOK] profile reverted to Free for ${userId} (${reason})`);
+  }
+}
+
 async function handleRefundSucceeded(
   sb: ReturnType<typeof createClient>,
   _stripe: Stripe,
@@ -221,7 +267,7 @@ async function handleRefundSucceeded(
 
   const { data: existing, error: existingErr } = await sb
     .from("payment_transactions")
-    .select("id, status, stripe_refund_id")
+    .select("id, user_id, amount_thb, status, stripe_refund_id")
     .eq("stripe_payment_intent_id", paymentIntentId)
     .maybeSingle();
 
@@ -288,6 +334,29 @@ async function handleRefundSucceeded(
     }
   }
 
+  // Revert plan only on FULL refund. Partial refund (e.g., customer
+  // service goodwill credit) keeps the subscription active — only the
+  // payment_transactions row records the partial refund amount.
+  const originalAmountRaw = (existing as any).amount_thb;
+  const originalAmount = Number(originalAmountRaw ?? 0);
+  const isFullRefund = originalAmount > 0 && refundAmountThb >= originalAmount;
+  console.log(
+    `[STRIPE-WEBHOOK] refund-revert-check: existing.user_id=${(existing as any).user_id}, ` +
+    `amount_thb_raw=${JSON.stringify(originalAmountRaw)}, originalAmount=${originalAmount}, ` +
+    `refundAmountThb=${refundAmountThb}, isFullRefund=${isFullRefund}`,
+  );
+  if (isFullRefund) {
+    await revertProfileToFree(
+      sb,
+      (existing as any).user_id,
+      `refund ${refundId} (full ${refundAmountThb}/${originalAmount} THB)`,
+    );
+  } else {
+    console.log(
+      `[STRIPE-WEBHOOK] partial refund — profile NOT reverted (refund ${refundAmountThb} < amount ${originalAmount} THB)`,
+    );
+  }
+
   // NOTE: credits claw-back intentionally skipped — may already be consumed.
 }
 
@@ -312,7 +381,7 @@ async function handleDisputeCreated(
   // Resolve PI from charge — payment_transactions stores PI not charge id.
   const { data: tx, error: txErr } = await sb
     .from("payment_transactions")
-    .select("stripe_payment_intent_id")
+    .select("stripe_payment_intent_id, user_id")
     .eq("stripe_charge_id", chargeId)
     .maybeSingle();
 
@@ -356,6 +425,17 @@ async function handleDisputeCreated(
       });
     }
   }
+
+  // Dispute = chargeback. Stripe has already pulled the funds permanently;
+  // unlike a refund there's no "partial" option that keeps the subscription
+  // valid. Always revert the profile so the customer can't continue using
+  // the plan they no longer paid for. If the merchant later wins the
+  // dispute, restoring the plan is a manual admin action (rare path).
+  await revertProfileToFree(
+    sb,
+    (tx as any).user_id,
+    `dispute ${disputeId} (${dispute.reason ?? "unknown"})`,
+  );
 }
 
 serve(async (req) => {
@@ -659,78 +739,71 @@ serve(async (req) => {
 
         console.log(`[STRIPE-WEBHOOK] Subscription: ${planName} (${planTarget}/${billingCycle}), +${creditsToAdd} credits for user ${userId}`);
 
-        // Grant credits if this plan includes upfront credits
+        const { data: existingCheckoutTx, error: existingCheckoutTxErr } = await supabase
+          .from("payment_transactions")
+          .select("id")
+          .eq("stripe_session_id", session.id)
+          .eq("status", "completed")
+          .maybeSingle();
+        if (existingCheckoutTxErr) {
+          console.error("[STRIPE-WEBHOOK] subscription existing payment lookup failed:", existingCheckoutTxErr);
+          throw new Error(`Existing payment lookup failed: ${existingCheckoutTxErr.message}`);
+        }
+        const checkoutPaymentAlreadyRecorded = Boolean(existingCheckoutTx);
+
+        // Grant credits atomically so duplicate webhook delivery cannot
+        // double-credit the same paid checkout.
         if (creditsToAdd > 0) {
-          const { data: existing } = await supabase
-            .from("user_credits")
-            .select("balance, total_purchased")
-            .eq("user_id", userId)
-            .single();
-
-          const newBalance = (existing?.balance || 0) + creditsToAdd;
-
-          if (existing) {
-            await supabase.from("user_credits").update({
-              balance: newBalance,
-              total_purchased: (existing.total_purchased || 0) + creditsToAdd,
-            }).eq("user_id", userId);
-          } else {
-            await supabase.from("user_credits").insert({
-              user_id: userId,
-              balance: newBalance,
-              total_purchased: creditsToAdd,
-            });
-          }
-
-          // Credit batch: monthly = 1 month expiry, annual = 12 months
-          const subExpiresAt = new Date();
-          if (billingCycle === "annual") {
-            subExpiresAt.setFullYear(subExpiresAt.getFullYear() + 1);
-          } else {
-            subExpiresAt.setMonth(subExpiresAt.getMonth() + 1);
-          }
-
-          await supabase.from("credit_batches").insert({
-            user_id: userId,
-            source_type: "subscription",
-            amount: creditsToAdd,
-            remaining: creditsToAdd,
-            expires_at: subExpiresAt.toISOString(),
-            reference_id: session.id,
+          const { data: creditsGranted, error: grantError } = await supabase.rpc("grant_purchased_credits_once", {
+            p_user_id: userId,
+            p_amount: creditsToAdd,
+            p_source_type: "subscription",
+            p_expiry_days: billingCycle === "annual" ? 365 : 30,
+            p_description: `${planName} subscription: +${creditsToAdd} credits (${billingCycle})`,
+            p_reference_id: session.id,
           });
-
-          const { error: subTxError } = await supabase.from("credit_transactions").insert({
-            user_id: userId,
-            amount: creditsToAdd,
-            type: "subscription_grant",
-            description: `${planName} subscription: +${creditsToAdd} credits (${billingCycle})`,
-            reference_id: session.id,
-            balance_after: newBalance,
-          });
-          if (subTxError) console.error("[STRIPE-WEBHOOK] subscription credit_transactions error:", subTxError);
-
-          console.log(`[STRIPE-WEBHOOK] Credits granted: +${creditsToAdd}. New balance: ${newBalance}`);
+          if (grantError) {
+            console.error("[STRIPE-WEBHOOK] subscription grant_purchased_credits_once error:", grantError);
+            throw new Error(`Credit grant failed: ${grantError.message}`);
+          }
+          console.log(
+            creditsGranted
+              ? `[STRIPE-WEBHOOK] Credits granted: +${creditsToAdd} for ${session.id}`
+              : `[STRIPE-WEBHOOK] Credits already granted for ${session.id} - skipping`,
+          );
         }
 
         // Log payment
-        const { data: paymentRow } = await supabase.from("payment_transactions").insert({
-          user_id: userId,
-          package_id: null,
-          stripe_session_id: session.id,
-          stripe_payment_intent_id: (session.payment_intent as string) || null,
-          stripe_subscription_id: subscriptionId || null,
-          amount_thb: amountThb,
-          currency: session.metadata?.currency ?? session.currency ?? "thb",
-          amount_original: Number(session.metadata?.amount_original ?? amountThb),
-          exchange_rate_thb: Number(session.metadata?.thb_per_currency_unit ?? 1),
-          price_buffer_percent: Number(session.metadata?.price_buffer_percent ?? 0),
-          checkout_metadata: session.metadata ?? {},
-          credits_added: creditsToAdd,
-          status: "completed",
-          payment_method: session.payment_method_types?.[0] || "card",
-        }).select("*").maybeSingle();
-        if (paymentRow) {
-          await syncBillingDocumentsForPayment(supabase, stripe, paymentRow, { sendEmail: false });
+        if (!checkoutPaymentAlreadyRecorded) {
+          const { data: insertedPaymentRow, error: paymentInsertError } = await supabase.from("payment_transactions").insert({
+            user_id: userId,
+            package_id: null,
+            stripe_session_id: session.id,
+            stripe_payment_intent_id: (session.payment_intent as string) || null,
+            stripe_subscription_id: subscriptionId || null,
+            amount_thb: amountThb,
+            currency: session.metadata?.currency ?? session.currency ?? "thb",
+            amount_original: Number(session.metadata?.amount_original ?? amountThb),
+            exchange_rate_thb: Number(session.metadata?.thb_per_currency_unit ?? 1),
+            price_buffer_percent: Number(session.metadata?.price_buffer_percent ?? 0),
+            checkout_metadata: session.metadata ?? {},
+            credits_added: creditsToAdd,
+            status: "completed",
+            payment_method: session.payment_method_types?.[0] || "card",
+          }).select("*").maybeSingle();
+          if (paymentInsertError) {
+            if (paymentInsertError.code === "23505") {
+              console.log(`[STRIPE-WEBHOOK] subscription payment already recorded concurrently for ${session.id}`);
+            } else {
+              console.error("[STRIPE-WEBHOOK] subscription payment_transactions insert failed:", paymentInsertError);
+              throw new Error(`Payment transaction insert failed: ${paymentInsertError.message}`);
+            }
+          }
+          if (insertedPaymentRow) {
+            await syncBillingDocumentsForPayment(supabase, stripe, insertedPaymentRow, { sendEmail: false });
+          }
+        } else {
+          console.log(`[STRIPE-WEBHOOK] subscription checkout payment already recorded for ${session.id} - skipping payment insert`);
         }
 
         // Get subscription period end
@@ -750,8 +823,9 @@ serve(async (req) => {
           newStatus = "agency";
         }
 
-        // Update profile with subscription info
-        await supabase.from("profiles").update({
+        // Update profile with subscription info. This is the entitlement
+        // write; throw so Stripe retries if a paid customer was not upgraded.
+        const { error: profileUpdateError } = await supabase.from("profiles").update({
           subscription_status: newStatus,
           stripe_subscription_id: subscriptionId || null,
           stripe_customer_id: customerId || null,
@@ -762,6 +836,10 @@ serve(async (req) => {
           current_plan_id: planId || null,
           subscription_plan_id: planId || null,
         }).eq("user_id", userId);
+        if (profileUpdateError) {
+          console.error("[STRIPE-WEBHOOK] subscription profile UPDATE failed:", profileUpdateError);
+          throw new Error(`Profile update failed: ${profileUpdateError.message}`);
+        }
 
         console.log(`[STRIPE-WEBHOOK] Profile updated: status=${newStatus}, plan=${planName}, planId=${planId}`);
 
@@ -1408,7 +1486,7 @@ serve(async (req) => {
 
         console.log(`[STRIPE-WEBHOOK] subscription_oneoff: granting ${finalCredits} credits to ${userId} (${finalPlanName}/${finalBillingCycle})`);
 
-        const { error: grantError } = await supabase.rpc("grant_credits", {
+        const { data: creditsGranted, error: grantError } = await supabase.rpc("grant_purchased_credits_once", {
           p_user_id: userId,
           p_amount: finalCredits,
           p_source_type: "subscription",
@@ -1418,8 +1496,14 @@ serve(async (req) => {
         });
 
         if (grantError) {
-          console.error("[STRIPE-WEBHOOK] subscription_oneoff grant_credits error:", grantError);
+          console.error("[STRIPE-WEBHOOK] subscription_oneoff grant_purchased_credits_once error:", grantError);
           throw new Error(`Credit grant failed: ${grantError.message}`);
+        }
+
+        if (creditsGranted) {
+          console.log(`[STRIPE-WEBHOOK] subscription_oneoff: credits granted for ${intent.id}`);
+        } else {
+          console.log(`[STRIPE-WEBHOOK] subscription_oneoff: credits already granted for ${intent.id} — skipping`);
         }
 
         // Update profile (one-off: set period end manually, no recurring sub)
@@ -1430,7 +1514,7 @@ serve(async (req) => {
         let newStatus: "free" | "professional" | "agency" = "professional";
         if (finalPlanName === "Enterprise" || finalPlanName === "Studio") newStatus = "agency";
 
-        await supabase.from("profiles").update({
+        const { error: profileUpdateError } = await supabase.from("profiles").update({
           subscription_status: newStatus,
           billing_interval: finalBillingCycle,
           subscription_billing_cycle: finalBillingCycle,
@@ -1439,8 +1523,78 @@ serve(async (req) => {
           current_plan_id: planId,
           subscription_plan_id: planId,
         }).eq("user_id", userId);
+        if (profileUpdateError) {
+          // Throw before INSERT-marker → Stripe retries until profile lands.
+          // Without this, a failed UPDATE leaves credits granted + plan not set,
+          // and the marker row blocks all future retries (permanent skew).
+          console.error("[STRIPE-WEBHOOK] subscription_oneoff profile UPDATE failed:", profileUpdateError);
+          throw new Error(`Profile update failed: ${profileUpdateError.message}`);
+        }
 
-        const { data: paymentRow } = await supabase.from("payment_transactions").insert({
+        // Accrue commission before writing the completed payment marker. If
+        // this fails, Stripe retries the webhook and the idempotent credit/profile
+        // writes above are safe to replay. Writing the marker first would make
+        // a commission failure permanent because the early idempotency check
+        // returns before commission work on subsequent retries.
+        if (amountThb > 0) {
+          await ensureAffiliateReferralFromMetadata(supabase, userId, intent.metadata, "payment_intent.succeeded");
+          const cycleIndex = await computeCycleIndex(supabase, userId);
+          const { data: commissionId, error: accrueError } = await supabase.rpc("accrue_commission", {
+            p_referred_user_id: userId,
+            p_stripe_invoice_id: intent.id,
+            p_gross_amount_thb: amountThb,
+            p_net_amount_thb: amountThb,
+            p_billing_cycle: finalBillingCycle,
+            p_cycle_index: cycleIndex,
+          });
+
+          await awardUserReferralBonusIfEligible(supabase, userId, "oneoff");
+
+          if (accrueError) {
+            console.error("[STRIPE-WEBHOOK] accrue_commission (oneoff pre-marker) error:", accrueError);
+            await auditLog(supabase, "commission_accrual_failed", intent.id, {
+              event_id: event.id,
+              source: "payment_intent.succeeded:subscription_oneoff",
+              payment_intent: intent.id,
+              amount_thb: amountThb,
+              cycle_index: cycleIndex,
+              error: accrueError.message,
+            });
+            throw new Error(`Commission accrual failed: ${accrueError.message}`);
+          }
+
+          if (commissionId) {
+            console.log(`[STRIPE-WEBHOOK] Commission accrued before payment marker (oneoff cycle ${cycleIndex}): ${commissionId}`);
+            await auditLog(supabase, "commission_accrued", commissionId as string, {
+              event_id: event.id,
+              source: "payment_intent.succeeded:subscription_oneoff",
+              amount_thb: amountThb,
+              cycle_index: cycleIndex,
+              payment_intent: intent.id,
+            });
+            try {
+              const { data: ce } = await supabase
+                .from("commission_events")
+                .select("partner_user_id, commission_amount_thb, commission_rate")
+                .eq("id", commissionId as string)
+                .maybeSingle();
+              if (ce?.partner_user_id) {
+                await sendCommissionEmailIfPossible(
+                  supabase,
+                  ce.partner_user_id as string,
+                  userId,
+                  Number(ce.commission_amount_thb ?? 0),
+                  finalPlanName,
+                  Number(ce.commission_rate ?? 0) * 100,
+                );
+              }
+            } catch (e) {
+              console.warn("[STRIPE-WEBHOOK] pre-marker commission email lookup failed:", e);
+            }
+          }
+        }
+
+        const { data: insertedPaymentRow, error: paymentInsertError } = await supabase.from("payment_transactions").insert({
           user_id: userId,
           package_id: null,
           stripe_session_id: null,
@@ -1456,62 +1610,16 @@ serve(async (req) => {
           status: "completed",
           payment_method: intent.payment_method_types?.[0] || "card",
         }).select("*").maybeSingle();
-        if (paymentRow) {
-          await syncBillingDocumentsForPayment(supabase, stripe, paymentRow, { sendEmail: false });
-        }
-
-        // Commission accrual
-        try {
-          await ensureAffiliateReferralFromMetadata(supabase, userId, intent.metadata, "payment_intent.succeeded");
-          const cycleIndex = await computeCycleIndex(supabase, userId);
-          if (amountThb > 0) {
-            const { data: commissionId, error: accrueError } = await supabase.rpc("accrue_commission", {
-              p_referred_user_id: userId,
-              p_stripe_invoice_id: intent.id, // PI id used as idempotency key for one-off
-              p_gross_amount_thb: amountThb,
-              p_net_amount_thb: amountThb,
-              p_billing_cycle: finalBillingCycle,
-              p_cycle_index: cycleIndex,
-            });
-
-            // Track A: 100 THB user_referral bonus (idempotent)
-            await awardUserReferralBonusIfEligible(supabase, userId, "oneoff");
-
-            if (accrueError) {
-              console.error("[STRIPE-WEBHOOK] accrue_commission (oneoff) error:", accrueError);
-            } else if (commissionId) {
-              console.log(`[STRIPE-WEBHOOK] Commission accrued (oneoff cycle ${cycleIndex}): ${commissionId}`);
-              await auditLog(supabase, "commission_accrued", commissionId as string, {
-                event_id: event.id,
-                source: "payment_intent.succeeded:subscription_oneoff",
-                amount_thb: amountThb,
-                cycle_index: cycleIndex,
-                payment_intent: intent.id,
-              });
-              // Email partner about commission
-              try {
-                const { data: ce } = await supabase
-                  .from("commission_events")
-                  .select("partner_user_id, commission_amount_thb, commission_rate")
-                  .eq("id", commissionId as string)
-                  .maybeSingle();
-                if (ce?.partner_user_id) {
-                  await sendCommissionEmailIfPossible(
-                    supabase,
-                    ce.partner_user_id as string,
-                    userId,
-                    Number(ce.commission_amount_thb ?? 0),
-                    finalPlanName,
-                    Number(ce.commission_rate ?? 0) * 100,
-                  );
-                }
-              } catch (e) {
-                console.warn("[STRIPE-WEBHOOK] commission email lookup failed:", e);
-              }
-            }
+        if (paymentInsertError) {
+          if (paymentInsertError.code === "23505") {
+            console.log(`[STRIPE-WEBHOOK] subscription_oneoff payment already recorded concurrently for ${intent.id}`);
+          } else {
+            console.error("[STRIPE-WEBHOOK] subscription_oneoff payment_transactions insert failed:", paymentInsertError);
+            throw new Error(`Payment transaction insert failed: ${paymentInsertError.message}`);
           }
-        } catch (e) {
-          console.error("[STRIPE-WEBHOOK] subscription_oneoff commission exception:", e);
+        }
+        if (insertedPaymentRow) {
+          await syncBillingDocumentsForPayment(supabase, stripe, insertedPaymentRow, { sendEmail: false });
         }
 
         // Email payment receipt
@@ -1765,7 +1873,7 @@ serve(async (req) => {
             refundList = refunds.data;
           } catch (_) {}
         }
-        const succeeded = refundList.find((r) => r.status === "succeeded");
+        const succeeded = refundList.find((r: Stripe.Refund) => r.status === "succeeded");
         if (!succeeded) {
           console.log(`[STRIPE-WEBHOOK] charge.refunded: no succeeded refund yet on ${charge.id}`);
         } else {
