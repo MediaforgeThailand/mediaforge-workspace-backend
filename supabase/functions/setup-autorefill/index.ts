@@ -31,6 +31,7 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const STRIPE_SECRET_KEY = Deno.env.get("STRIPE_SECRET_KEY")!;
+type SupabaseServiceClient = any;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -61,7 +62,7 @@ async function getCallerUser(req: Request) {
 /** Find or create the Stripe customer for this user. */
 async function ensureStripeCustomer(
   stripe: Stripe,
-  admin: ReturnType<typeof createClient>,
+  admin: SupabaseServiceClient,
   user: { id: string; email?: string },
 ): Promise<string> {
   const { data: profile } = await admin
@@ -87,6 +88,9 @@ async function ensureStripeCustomer(
       metadata: { supabase_user_id: user.id },
     });
     customerId = created.id;
+  }
+  if (!customerId) {
+    throw new Error("stripe_customer_create_failed");
   }
   await admin
     .from("profiles")
@@ -179,6 +183,54 @@ Deno.serve(async (req) => {
           ? setupIntent.customer
           : setupIntent.customer?.id;
 
+      // Sanitize threshold + amount inputs before any early return so
+      // retries can still update settings without re-verifying the card.
+      const threshold = Math.max(
+        50,
+        Math.min(10000, Number(body.threshold ?? 100)),
+      );
+      const amountThb = Math.max(
+        100,
+        Math.min(10000, Number(body.amount_thb ?? 500)),
+      );
+
+      const { data: existingProfile, error: existingProfileErr } = await admin
+        .from("profiles")
+        .select("auto_refill_payment_method_id, subscription_auto_refill")
+        .eq("user_id", user.id)
+        .maybeSingle();
+      if (existingProfileErr) {
+        return json({ error: "profile_lookup_failed", details: existingProfileErr.message }, 500);
+      }
+
+      if (
+        existingProfile?.subscription_auto_refill === true &&
+        existingProfile?.auto_refill_payment_method_id === pmId
+      ) {
+        const { error: updErr } = await admin
+          .from("profiles")
+          .update({
+            auto_refill_threshold: threshold,
+            auto_refill_amount_thb: amountThb,
+            auto_refill_failure_count: 0,
+            subscription_auto_refill: true,
+          })
+          .eq("user_id", user.id);
+        if (updErr) {
+          return json({ error: "save_failed", details: updErr.message }, 500);
+        }
+
+        return json({
+          success: true,
+          payment_method_id: pmId,
+          verify_charge_id: null,
+          verify_refund_id: null,
+          threshold,
+          amount_thb: amountThb,
+          already_verified: true,
+        });
+      }
+
       // Optional verification charge: ฿20 (Stripe Thailand min) +
       // immediate refund. Confirms the card actually charges off-session
       // (per user request "ตัดผ่านแล้ว"). On 3DS-required cards this
@@ -188,31 +240,39 @@ Deno.serve(async (req) => {
       let verifyChargeId: string | null = null;
       let verifyRefundId: string | null = null;
       try {
-        const verifyIntent = await stripe.paymentIntents.create({
-          amount: 2000, // 20.00 THB in satang
-          currency: "thb",
-          customer: customerId,
-          payment_method: pmId,
-          off_session: true,
-          confirm: true,
-          metadata: {
-            supabase_user_id: user.id,
-            purpose: "autorefill_card_verification",
+        const verifyIntent = await stripe.paymentIntents.create(
+          {
+            amount: 2000, // 20.00 THB in satang
+            currency: "thb",
+            customer: customerId,
+            payment_method: pmId,
+            off_session: true,
+            confirm: true,
+            metadata: {
+              supabase_user_id: user.id,
+              setup_intent_id: setupIntentId,
+              purpose: "autorefill_card_verification",
+            },
+            description: "Auto-refill card verification (refunded immediately)",
           },
-          description: "Auto-refill card verification (refunded immediately)",
-        });
+          { idempotencyKey: `autorefill-verify:${setupIntentId}` },
+        );
         if (verifyIntent.status === "succeeded") {
           verifyChargeId = String(verifyIntent.latest_charge ?? "");
           // Immediately refund the verification charge.
           if (verifyChargeId) {
-            const refund = await stripe.refunds.create({
-              charge: verifyChargeId,
-              reason: "requested_by_customer",
-              metadata: {
-                supabase_user_id: user.id,
-                purpose: "autorefill_verification_refund",
+            const refund = await stripe.refunds.create(
+              {
+                charge: verifyChargeId,
+                reason: "requested_by_customer",
+                metadata: {
+                  supabase_user_id: user.id,
+                  setup_intent_id: setupIntentId,
+                  purpose: "autorefill_verification_refund",
+                },
               },
-            });
+              { idempotencyKey: `autorefill-verify-refund:${setupIntentId}` },
+            );
             verifyRefundId = refund.id;
           }
         } else {
@@ -238,16 +298,6 @@ Deno.serve(async (req) => {
           400,
         );
       }
-
-      // Sanitize threshold + amount inputs.
-      const threshold = Math.max(
-        50,
-        Math.min(10000, Number(body.threshold ?? 100)),
-      );
-      const amountThb = Math.max(
-        100,
-        Math.min(10000, Number(body.amount_thb ?? 500)),
-      );
 
       // Persist + flip the toggle on. The cron watches this column
       // set and `subscription_auto_refill = true` to trigger refills.
