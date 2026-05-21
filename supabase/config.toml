@@ -112,6 +112,9 @@ verify_jwt = false
 [functions.customer-portal]
 verify_jwt = false
 
+[functions.setup-autorefill]
+verify_jwt = false
+
 [functions.freepik-stock]
 verify_jwt = false
 
