@@ -752,7 +752,7 @@ serve(async (req) => {
 
       // PaymentIntent doesn't natively support coupons — discount the amount inline.
       const amountSatang = effectiveDiscountPct > 0
-        ? Math.round(baseAmountSatang * (1 - effectiveDiscountPct / 100))
+        ? Math.max(100, Math.round(baseAmountSatang * (1 - effectiveDiscountPct / 100)))
         : baseAmountSatang;
 
       const piMetadata = {

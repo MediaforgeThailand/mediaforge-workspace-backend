@@ -18,6 +18,44 @@ const CORS_HEADERS = {
 const UPGRADE_SALES_THRESHOLD_THB = 100_000;
 const UPGRADE_DISCOUNT_PERCENT = 20;
 
+const SOCIAL_PLATFORM_VALUES = new Set([
+  "YouTube",
+  "TikTok",
+  "Instagram",
+  "Facebook",
+  "X / Twitter",
+  "Threads",
+  "Twitch",
+  "Website / Blog",
+  "Podcast",
+  "Other",
+]);
+
+const THAI_BANK_VALUES = new Set([
+  "Bangkok Bank (BBL)",
+  "Kasikornbank (KBank)",
+  "Krungthai Bank (KTB)",
+  "Siam Commercial Bank (SCB)",
+  "Bank of Ayudhya / Krungsri (BAY)",
+  "TMBThanachart Bank (ttb)",
+  "Government Savings Bank (GSB)",
+  "BAAC",
+  "Government Housing Bank (GHB)",
+  "Kiatnakin Phatra Bank (KKP)",
+  "CIMB Thai Bank",
+  "TISCO Bank",
+  "United Overseas Bank (Thai) / UOB",
+  "LH Bank",
+  "Thai Credit Bank",
+  "Islamic Bank of Thailand",
+  "Standard Chartered Bank (Thai)",
+  "ICBC (Thai)",
+  "Bank of China (Thai)",
+  "SME D Bank",
+  "EXIM Bank Thailand",
+  "Other Thai bank",
+]);
+
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -40,6 +78,36 @@ function splitName(fullName: string) {
     first: parts[0] || "Creator",
     last: parts.slice(1).join(" ") || "-",
   };
+}
+
+function normalizePhone(raw: string): string {
+  const trimmed = raw.replace(/[\s-]/g, "");
+  if (/^0\d{8,9}$/.test(trimmed)) return `+66${trimmed.slice(1)}`;
+  if (/^\+[1-9]\d{7,14}$/.test(trimmed)) return trimmed;
+  throw new Error("phone must be Thai local format or E.164");
+}
+
+function normalizeBankAccountNo(raw: string): string {
+  const digits = raw.replace(/[^\d]/g, "");
+  if (!/^\d{6,15}$/.test(digits)) {
+    throw new Error("bank account number must be 6-15 digits");
+  }
+  return digits;
+}
+
+function normalizeSocialProfileUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  try {
+    const url = new URL(withScheme);
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      throw new Error("unsupported protocol");
+    }
+    return url.toString();
+  } catch {
+    throw new Error("social profile URL must be a valid http(s) URL");
+  }
 }
 
 function normalizeCode(raw: unknown): string {
@@ -68,12 +136,6 @@ async function getAuthedUser(req: Request) {
 
 function adminClient() {
   return createClient(SUPABASE_URL, SERVICE_ROLE_KEY, { auth: { persistSession: false } });
-}
-
-function activeSalesTotal(rows: any[]): number {
-  return rows
-    .filter((row) => !["void", "clawback"].includes(String(row.status ?? "")))
-    .reduce((sum, row) => sum + Number(row.net_amount_thb ?? row.gross_amount_thb ?? row.commission_base_amount_thb ?? 0), 0);
 }
 
 async function maybeGrantSalesUpgradeCode(
@@ -120,36 +182,36 @@ async function maybeGrantSalesUpgradeCode(
 async function getStatus(user: any) {
   const userId = user.id;
   const client = adminClient();
-  const [application, partner, codes, commissions] = await Promise.all([
+  const [application, partner, codes, commissions, ledgerTotals] = await Promise.all([
     client.from("partner_applications").select("*").eq("user_id", userId).maybeSingle(),
     client.from("partners").select("*").eq("user_id", userId).maybeSingle(),
     client.from("referral_codes").select("*").eq("user_id", userId).eq("code_type", "partner_affiliate").order("created_at"),
-    client.from("commission_events").select("*").eq("partner_user_id", userId).order("created_at", { ascending: false }).limit(1000),
+    client.from("commission_events").select("*").eq("partner_user_id", userId).order("created_at", { ascending: false }).limit(50),
+    client.rpc("affiliate_partner_status_totals", { p_partner_user_id: userId }).maybeSingle(),
   ]);
   if (application.error) throw new Error(`application read failed: ${application.error.message}`);
   if (partner.error) throw new Error(`partner read failed: ${partner.error.message}`);
   if (codes.error) throw new Error(`codes read failed: ${codes.error.message}`);
   if (commissions.error) throw new Error(`commissions read failed: ${commissions.error.message}`);
+  if (ledgerTotals.error) throw new Error(`commission totals read failed: ${ledgerTotals.error.message}`);
 
   const commissionRows = commissions.data ?? [];
-  const salesTotalThb = activeSalesTotal(commissionRows);
+  const totalsRow = ledgerTotals.data ?? {};
+  const totals = {
+    total: Number(totalsRow.total ?? 0),
+    holding: Number(totalsRow.holding ?? 0),
+    available: Number(totalsRow.available ?? 0),
+    paid: Number(totalsRow.paid ?? 0),
+  };
+  const salesTotalThb = Number(totalsRow.sales_total_thb ?? 0);
   const resolvedCodes = await maybeGrantSalesUpgradeCode(client, user, partner.data ?? null, codes.data ?? [], salesTotalThb);
-
-  const totals = commissionRows.reduce((acc: any, row: any) => {
-    const amount = Number(row.commission_amount_thb ?? 0);
-    acc.total += amount;
-    if (row.status === "holding") acc.holding += amount;
-    if (row.status === "available") acc.available += amount;
-    if (row.status === "paid") acc.paid += amount;
-    return acc;
-  }, { total: 0, holding: 0, available: 0, paid: 0 });
 
   return {
     data: {
       application: application.data ?? null,
       partner: partner.data ?? null,
       codes: resolvedCodes,
-      commissions: commissionRows.slice(0, 50),
+      commissions: commissionRows,
       totals,
       sales_total_thb: salesTotalThb,
       upgrade: {
@@ -167,15 +229,19 @@ async function getStatus(user: any) {
 async function submitApplication(user: any, body: Record<string, unknown>) {
   const fullName = asString(body.full_name) || asString(user.user_metadata?.full_name) || asString(user.email).split("@")[0];
   const name = splitName(fullName);
-  const phone = asString(body.phone);
-  const socialUrl = asString(body.social_profile_url);
+  const rawPhone = asString(body.phone);
+  if (!rawPhone) throw new Error("phone is required");
+  const phone = normalizePhone(rawPhone);
+  const socialUrl = normalizeSocialProfileUrl(asString(body.social_profile_url));
+  const socialPlatform = asString(body.social_platform);
   const bankName = asString(body.bank_name);
-  const bankAccountNo = asString(body.bank_account_no);
+  const bankAccountNo = normalizeBankAccountNo(asString(body.bank_account_no));
   const bankAccountName = asString(body.bank_account_name) || fullName;
 
-  if (!phone) throw new Error("phone is required");
   if (!socialUrl) throw new Error("social profile URL is required");
   if (!bankName || !bankAccountNo || !bankAccountName) throw new Error("bank details are required");
+  if (socialPlatform && !SOCIAL_PLATFORM_VALUES.has(socialPlatform)) throw new Error("invalid social platform");
+  if (!THAI_BANK_VALUES.has(bankName)) throw new Error("invalid Thai bank name");
 
   const client = adminClient();
   const { data: existing, error: existingError } = await client
@@ -208,7 +274,7 @@ async function submitApplication(user: any, body: Record<string, unknown>) {
     bank_account_no: bankAccountNo,
     bank_account_name: bankAccountName,
     social_profile_url: socialUrl,
-    social_platform: asString(body.social_platform),
+    social_platform: socialPlatform,
     follower_count: Math.max(0, Math.trunc(asNumber(body.follower_count, 0))),
     status: existing?.status === "approved" ? "approved" : "submitted",
     submitted_at: new Date().toISOString(),

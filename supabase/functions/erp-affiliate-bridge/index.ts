@@ -15,10 +15,12 @@
 
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Stripe from "https://esm.sh/stripe@18.5.0";
+import { verifyAdminJwt } from "../_shared/adminAuth.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-bridge-token",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, x-bridge-token, x-admin-auth-key, x-admin-email, x-admin-internal-key",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 const jsonHeaders = { ...corsHeaders, "Content-Type": "application/json" };
@@ -27,6 +29,25 @@ const ok = (data: unknown, status = 200) =>
   new Response(JSON.stringify({ ok: true, data }), { status, headers: jsonHeaders });
 const fail = (error: string, status = 400) =>
   new Response(JSON.stringify({ ok: false, error }), { status, headers: jsonHeaders });
+
+const ADMIN_BRIDGE_ROLES = new Set(["admin", "super_admin", "service_role", "internal_automation"]);
+
+// Sales operators can inspect aggregate finance screens, but cannot reveal PII,
+// mutate partners, or record payouts. Creator admins do not get affiliate bridge
+// access; they use the separate creator-system routes.
+const SALES_READ_ONLY_ACTIONS = new Set([
+  "get_affiliate_analytics",
+  "list_partners",
+  "get_partner_detail",
+  "list_commission_events",
+]);
+
+function canRunAction(action: string, actorRole: string | null, hasBridgeSecret: boolean): boolean {
+  if (hasBridgeSecret) return true;
+  if (actorRole && ADMIN_BRIDGE_ROLES.has(actorRole)) return true;
+  if (actorRole === "sales" && SALES_READ_ONLY_ACTIONS.has(action)) return true;
+  return false;
+}
 
 // ── Rate limit (per-instance, per-token) ────────────────────────────────────
 const RATE_LIMIT = 100;
@@ -128,6 +149,87 @@ function genPartnerCode(): string {
 // ── Admin/manual partner helpers (mirrors admin_workspace_affiliates) ───────
 function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value.trim() : fallback;
+}
+
+type TransferProof = {
+  proof_type: "url" | "bank_reference" | "note" | "mixed" | "legacy";
+  proof_url: string | null;
+  bank_reference: string | null;
+  proof_note: string | null;
+  legacy_proof: string;
+};
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function normalizeTransferProof(params: Record<string, any>): TransferProof {
+  const rawProofUrl = asString(params.proof_url || params.slip_url);
+  const rawBankReference = asString(params.bank_reference || params.transfer_reference);
+  const rawProofNote = asString(params.proof_note || params.note);
+  const rawTransferProof = asString(params.transfer_proof || params.proof);
+  const rawType = asString(params.proof_type).toLowerCase();
+
+  let proofUrl = rawProofUrl && isHttpUrl(rawProofUrl) ? rawProofUrl : "";
+  let bankReference = rawBankReference;
+  let proofNote = rawProofNote;
+
+  if (!proofUrl && rawTransferProof && isHttpUrl(rawTransferProof)) proofUrl = rawTransferProof;
+  if (!bankReference && rawTransferProof && !isHttpUrl(rawTransferProof)) bankReference = rawTransferProof;
+  if (!bankReference && rawProofUrl && !isHttpUrl(rawProofUrl)) bankReference = rawProofUrl;
+
+  let proofType = rawType as TransferProof["proof_type"] | "";
+  if (!proofType) {
+    const filled = [proofUrl, bankReference, proofNote].filter(Boolean).length;
+    if (filled > 1) proofType = "mixed";
+    else if (proofUrl) proofType = "url";
+    else if (bankReference) proofType = "bank_reference";
+    else if (proofNote) proofType = "note";
+  }
+
+  if (!["url", "bank_reference", "note", "mixed", "legacy"].includes(proofType)) {
+    throw new Error("invalid_proof_type");
+  }
+
+  if (proofType === "url" && !proofUrl) {
+    throw new Error("invalid_proof_url");
+  }
+  if (proofType === "bank_reference" && !bankReference && rawProofUrl) {
+    bankReference = rawProofUrl;
+  }
+  if (proofType === "note" && !proofNote && rawProofUrl) {
+    proofNote = rawProofUrl;
+  }
+
+  const legacyProof = proofUrl || bankReference || proofNote || rawProofUrl || rawTransferProof;
+  if (!legacyProof || legacyProof.length < 3) {
+    throw new Error("missing_transfer_proof");
+  }
+
+  return {
+    proof_type: proofType || "legacy",
+    proof_url: proofUrl || null,
+    bank_reference: bankReference || null,
+    proof_note: proofNote || null,
+    legacy_proof: legacyProof,
+  };
+}
+
+function csvEscape(value: unknown): string {
+  const text = value == null ? "" : String(value);
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function shouldRetryLegacyPayoutRpc(error: any): boolean {
+  const text = `${error?.code ?? ""} ${error?.message ?? ""} ${error?.details ?? ""}`;
+  return text.includes("PGRST202")
+    || text.includes("Could not find the function")
+    || text.includes("schema cache");
 }
 
 function asNumber(value: unknown, fallback = 0): number {
@@ -264,36 +366,49 @@ Deno.serve(async (req) => {
     let actorId: string | null = null;
     let actorEmail: string | null = null;
     let actorRole: string | null = null;
+    let hasBridgeSecret = false;
 
     if (bridgeToken && expected && bridgeToken === expected) {
       // Service-to-service auth via shared secret — actor info comes from body
+      hasBridgeSecret = true;
     } else {
-      // Direct frontend call — verify Supabase session + admin/sales/creator role
+      // Direct frontend call from admin-hub. In workspace deployments the
+      // bearer token is issued by the admin/auth project, not by this target
+      // workspace project, so try the shared admin verifier first.
       const authHeader = req.headers.get("Authorization");
       if (!authHeader?.startsWith("Bearer ")) return fail("Unauthorized", 401);
 
-      const anonClient = createClient(
-        Deno.env.get("SUPABASE_URL")!,
-        Deno.env.get("SUPABASE_ANON_KEY")!,
-        { global: { headers: { Authorization: authHeader } } },
-      );
-      const { data: { user }, error: authErr } = await anonClient.auth.getUser();
-      if (authErr || !user) return fail("Unauthorized", 401);
+      const admin = await verifyAdminJwt(req);
+      if (admin) {
+        actorId = admin.sub;
+        actorEmail = admin.email ?? null;
+        actorRole = admin.role ?? "admin";
+      } else {
+        // Backward-compatible path for branches where admin users live in the
+        // same project as the affiliate data.
+        const anonClient = createClient(
+          Deno.env.get("SUPABASE_URL")!,
+          Deno.env.get("SUPABASE_ANON_KEY")!,
+          { global: { headers: { Authorization: authHeader } } },
+        );
+        const { data: { user }, error: authErr } = await anonClient.auth.getUser();
+        if (authErr || !user) return fail("Unauthorized", 401);
 
-      const svc = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
-      const { data: roleRow } = await svc
-        .from("user_roles")
-        .select("role")
-        .eq("user_id", user.id)
-        .maybeSingle();
+        const svc = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+        const { data: roleRow } = await svc
+          .from("user_roles")
+          .select("role")
+          .eq("user_id", user.id)
+          .maybeSingle();
 
-      if (!roleRow || !["admin", "sales", "creator"].includes(roleRow.role)) {
-        return fail("Insufficient permissions", 403);
+        if (!roleRow || !["admin", "sales"].includes(roleRow.role)) {
+          return fail("Insufficient permissions", 403);
+        }
+
+        actorId = user.id;
+        actorEmail = user.email ?? null;
+        actorRole = roleRow.role;
       }
-
-      actorId = user.id;
-      actorEmail = user.email ?? null;
-      actorRole = roleRow.role;
     }
 
     // 2. Rate limit
@@ -311,6 +426,7 @@ Deno.serve(async (req) => {
     }
     const { action } = body ?? {};
     if (!action) return fail("Missing action", 400);
+    if (typeof action !== "string") return fail("Invalid action", 400);
     const params: Record<string, any> = {
       ...(body ?? {}),
       ...(body?.payload ?? {}),
@@ -319,6 +435,10 @@ Deno.serve(async (req) => {
     delete params.action;
     delete params.payload;
     delete params.params;
+
+    if (!canRunAction(action, actorRole, hasBridgeSecret)) {
+      return fail("Insufficient permissions for action", 403);
+    }
 
     // Inject actor info from Supabase auth (frontend calls don't have these in body)
     if (actorId) {
@@ -577,81 +697,95 @@ Deno.serve(async (req) => {
       }
 
       case "mark_payout_paid": {
-        const { id, processor_id, proof_url } = params;
-        if (!id || !processor_id || !proof_url)
-          return fail("Missing id, processor_id, or proof_url", 400);
-        const { data: payout, error: pErr } = await db
-          .from("payout_requests")
-          .select("*")
-          .eq("id", id)
-          .maybeSingle();
-        if (pErr) return fail(pErr.message, 500);
-        if (!payout) return fail("Payout not found", 404);
-        if (payout.status === "paid") return fail("Already paid", 409);
-        // Reject terminal/non-payable states. `cancelled` is set by
-        // reverse_commission when a Stripe refund reverses a commission
-        // in this payout — paying anyway would send creator money for
-        // revenue MediaForge has already returned to the customer.
-        if (["cancelled", "failed", "rejected"].includes(payout.status)) {
-          return fail(`Cannot pay a ${payout.status} payout`, 409);
+        const { id, processor_id } = params;
+        if (!id || !processor_id)
+          return fail("Missing id or processor_id", 400);
+        let proof: TransferProof;
+        try {
+          proof = normalizeTransferProof(params);
+        } catch (e: any) {
+          return fail(e?.message ?? "invalid_transfer_proof", 400);
         }
 
-        const now = new Date().toISOString();
-
-        // 1. Update payout
-        const { error: e1 } = await db
-          .from("payout_requests")
-          .update({ status: "paid", processed_by: processor_id, processed_at: now, proof_url })
-          .eq("id", id);
-        if (e1) return fail(e1.message, 500);
-
-        // 2. Update commission_events → paid. Filter by status='available'
-        // so a concurrent reverse_commission cannot have flipped a row to
-        // 'clawback' and have us silently overwrite it. If the rowcount
-        // doesn't match, refuse the payout and roll back the status flip.
-        if (Array.isArray(payout.commission_ids) && payout.commission_ids.length > 0) {
-          const { data: updatedRows, error: e2 } = await db
-            .from("commission_events")
-            .update({ status: "paid", paid_at: now, payout_id: id })
-            .in("id", payout.commission_ids)
-            .eq("status", "available")
-            .select("id");
-          if (e2) return fail(`Commission update failed: ${e2.message}`, 500);
-          if ((updatedRows?.length ?? 0) !== payout.commission_ids.length) {
-            // Roll back the payout status flip so the admin sees the
-            // failure and can investigate which commission was clawbacked.
-            await db
-              .from("payout_requests")
-              .update({ status: payout.status, processed_by: null, processed_at: null, proof_url: null })
-              .eq("id", id);
-            return fail(
-              `Commission state changed during payout — expected ${payout.commission_ids.length} available, found ${updatedRows?.length ?? 0}. Check for concurrent refund.`,
-              409,
-            );
-          }
-        }
-
-        // 3. Update partner lifetime_paid_thb (read-modify-write; no atomic SQL via PostgREST)
-        const { data: partner } = await db
-          .from("partners")
-          .select("lifetime_paid_thb")
-          .eq("user_id", payout.partner_user_id)
-          .maybeSingle();
-        const current = Number(partner?.lifetime_paid_thb ?? 0);
-        const next = current + Number(payout.amount_thb);
-        await db
-          .from("partners")
-          .update({ lifetime_paid_thb: next })
-          .eq("user_id", payout.partner_user_id);
-
-        // 4. Audit
-        await audit(db, processor_id, "mark_payout_paid", "payout_request", id, {
-          amount_thb: payout.amount_thb,
-          proof_url,
-          commission_ids: payout.commission_ids,
+        // Atomic via process_payout_paid RPC:
+        //   - payout flip + commission flip + lifetime_paid_thb increment
+        //     + audit log all in one transaction with FOR UPDATE on payout.
+        //   - Prevents concurrent admins from lost-update on lifetime_paid_thb.
+        //   - Prevents partial state if the bridge crashes mid-flow.
+        //   - Concurrent reverse_commission detected via rowcount check
+        //     inside the RPC (raises commission_state_changed, rolls back).
+        const { data, error } = await db.rpc("process_payout_paid", {
+          p_payout_id: id,
+          p_processor_id: processor_id,
+          p_proof_url: proof.legacy_proof,
         });
+        if (error) {
+          const msg = error.message || "unknown";
+          if (msg.includes("payout_not_found")) return fail("Payout not found", 404);
+          if (msg.includes("already_paid")) return fail("Already paid", 409);
+          if (msg.includes("cannot_pay_terminal")) return fail(msg, 409);
+          if (msg.includes("commission_state_changed")) return fail(msg, 409);
+          return fail(msg, 500);
+        }
+        return ok(data);
+      }
 
-        return ok({ id, status: "paid", amount_thb: payout.amount_thb });
+      // One-click manual settle — admin transfers via bank, then clicks
+      // "Paid" on the partner row. Creates payout_request + flips commissions
+      // + increments lifetime_paid_thb + audit log, all atomically inside
+      // admin_settle_partner RPC. partner_user_id, processor_id, and one
+      // transfer proof field are required; expected_amount_thb is the race
+      // guard.
+      case "admin_settle_partner": {
+        const { partner_user_id, processor_id, expected_amount_thb } = params;
+        if (!partner_user_id || !processor_id)
+          return fail("Missing partner_user_id or processor_id", 400);
+        let proof: TransferProof;
+        try {
+          proof = normalizeTransferProof(params);
+        } catch (e: any) {
+          return fail(e?.message ?? "invalid_transfer_proof", 400);
+        }
+        let { data, error } = await db.rpc("admin_settle_partner", {
+          p_partner_user_id: partner_user_id,
+          p_processor_id: processor_id,
+          p_proof_url: proof.legacy_proof,
+          p_expected_amount_thb: expected_amount_thb ?? null,
+          p_proof_type: proof.proof_type,
+          p_bank_reference: proof.bank_reference,
+          p_proof_note: proof.proof_note,
+        });
+        if (error && shouldRetryLegacyPayoutRpc(error)) {
+          ({ data, error } = await db.rpc("admin_settle_partner", {
+            p_partner_user_id: partner_user_id,
+            p_processor_id: processor_id,
+            p_proof_url: proof.legacy_proof,
+            p_expected_amount_thb: expected_amount_thb ?? null,
+          }));
+        }
+        if (error) {
+          const msg = error.message || "unknown";
+          if (msg.includes("partner_not_found")) return fail("Partner not found", 404);
+          if (msg.includes("partner_suspended")) return fail("Partner is suspended", 409);
+          if (msg.includes("bank_details_incomplete")) return fail("Partner bank details incomplete", 409);
+          if (msg.includes("nothing_to_settle")) return fail("Nothing to settle — no available commissions", 409);
+          if (msg.includes("amount_changed")) return fail(msg, 409);
+          if (msg.includes("invalid_proof_url")) return fail("Invalid proof URL", 400);
+          if (msg.includes("missing_transfer_proof")) return fail("Missing transfer proof", 400);
+          return fail(msg, 500);
+        }
+        return ok(data);
+      }
+
+      // Per-partner unpaid balance for the admin "pay-out dashboard".
+      // Sums status='available' commissions not yet in a non-terminal payout,
+      // joins partners metadata (tier, suspended_at) + first/last bank info.
+      // The admin clicks "Paid" → admin_settle_partner consumes the exact set
+      // returned here (optional expected_amount_thb = balance_thb for race guard).
+      case "list_partner_settlement_balances": {
+        const { data, error } = await db.rpc("affiliate_settlement_balances");
+        if (error) return fail(error.message, 500);
+        return ok(data ?? []);
       }
 
       case "mark_payout_failed": {
@@ -1299,20 +1433,197 @@ Deno.serve(async (req) => {
 
       // ── Aliases for admin-hub frontend ──────────────────────────────
       case "list_partners": {
-        const { data, error } = await db.from("partners").select("*").order("created_at", { ascending: false });
+        const limit = Math.max(1, Math.min(Number(params?.limit ?? params?.page_size ?? 50), 200));
+        const offset = Math.max(0, Number(params?.offset ?? 0));
+        let query = db
+          .from("partners")
+          .select("*", { count: "exact" })
+          .order("created_at", { ascending: false })
+          .range(offset, offset + limit - 1);
+        if (params?.status === "active") query = query.is("suspended_at", null);
+        if (params?.status === "suspended") query = query.not("suspended_at", "is", null);
+        const { data, error, count } = await query;
         if (error) return fail(error.message);
-        return ok(data);
+        return ok({
+          items: (data ?? []).map((row: any) => ({
+            ...row,
+            display_name: row.display_name ?? null,
+            avatar_url: row.avatar_url ?? null,
+            email: row.email ?? null,
+            referrals_total: row.referrals_total ?? 0,
+            referrals_paying: row.referrals_paying ?? 0,
+          })),
+          total: count ?? 0,
+          limit,
+          offset,
+        });
       }
       case "list_payouts": {
-        // Alias → list_payout_requests
-        const { data, error } = await db.from("payout_requests").select("*").order("requested_at", { ascending: false }).limit(params?.limit ?? 50);
+        const limit = Math.max(1, Math.min(Number(params?.limit ?? params?.page_size ?? 50), 200));
+        const offset = Math.max(0, Number(params?.offset ?? 0));
+        let query = db
+          .from("payout_requests")
+          .select("*", { count: "exact" })
+          .order("requested_at", { ascending: false })
+          .range(offset, offset + limit - 1);
+        if (params?.status && params.status !== "all") query = query.eq("status", params.status);
+        const { data, error, count } = await query;
         if (error) return fail(error.message);
-        return ok(data);
+        return ok({
+          items: (data ?? []).map((row: any) => {
+            const snap = (row.bank_snapshot ?? {}) as Record<string, unknown>;
+            return {
+              ...row,
+              partner_display_name: row.partner_display_name ?? null,
+              partner_email: row.partner_email ?? null,
+              bank_name: row.bank_name ?? snap.bank_name ?? null,
+              account_last4: row.account_last4
+                ?? (typeof snap.bank_account_no === "string" ? snap.bank_account_no.slice(-4) : null),
+            };
+          }),
+          total: count ?? 0,
+          limit,
+          offset,
+        });
+      }
+      case "get_payout_detail": {
+        const id = asString(params?.id);
+        if (!id) return fail("Missing payout id", 400);
+        const { data: payout, error: payoutError } = await db
+          .from("payout_requests")
+          .select("*")
+          .eq("id", id)
+          .maybeSingle();
+        if (payoutError) return fail(payoutError.message, 500);
+        if (!payout) return fail("Payout not found", 404);
+
+        const commissionIds = Array.isArray((payout as any).commission_ids)
+          ? (payout as any).commission_ids
+          : [];
+        const { data: commissionEvents, error: commissionError } = commissionIds.length
+          ? await db
+            .from("commission_events")
+            .select("*")
+            .in("id", commissionIds)
+            .order("created_at", { ascending: true })
+          : { data: [], error: null };
+        if (commissionError) return fail(commissionError.message, 500);
+
+        const total = (commissionEvents ?? []).reduce(
+          (sum: number, row: any) => sum + Number(row.commission_amount_thb ?? 0),
+          0,
+        );
+
+        return ok({
+          payout: {
+            ...(payout as any),
+            partner_display_name: (payout as any).partner_display_name ?? null,
+            partner_email: (payout as any).partner_email ?? null,
+          },
+          commission_events: (commissionEvents ?? []).map((row: any) => ({
+            ...row,
+            referred_display_name: row.referred_display_name ?? null,
+            referred_email: row.referred_email ?? null,
+          })),
+          commission_events_total: total,
+        });
+      }
+      case "export_approved_payouts": {
+        const { data, error } = await db
+          .from("payout_requests")
+          .select("*")
+          .eq("status", "approved")
+          .order("requested_at", { ascending: true })
+          .limit(500);
+        if (error) return fail(error.message, 500);
+
+        const headers = [
+          "payout_id",
+          "partner_user_id",
+          "amount_thb",
+          "bank_name",
+          "bank_account_no",
+          "bank_account_name",
+          "requested_at",
+        ];
+        const csvRows = [headers.join(",")];
+        const skipped: { id: string; reason: string; bank_name: string | null }[] = [];
+        let rowCount = 0;
+
+        for (const row of data ?? []) {
+          const snap = ((row as any).bank_snapshot ?? {}) as Record<string, unknown>;
+          const bankName = asString((row as any).bank_name) || asString(snap.bank_name);
+          const accountNo = asString((row as any).bank_account_no) || asString(snap.bank_account_no);
+          const accountName = asString((row as any).bank_account_name) || asString(snap.bank_account_name);
+
+          if (!bankName || !accountNo || !accountName) {
+            skipped.push({
+              id: String((row as any).id),
+              reason: "bank_details_missing",
+              bank_name: bankName || null,
+            });
+            continue;
+          }
+
+          csvRows.push([
+            (row as any).id,
+            (row as any).partner_user_id,
+            (row as any).amount_thb,
+            bankName,
+            accountNo,
+            accountName,
+            (row as any).requested_at,
+          ].map(csvEscape).join(","));
+          rowCount += 1;
+        }
+
+        return ok({
+          csv: csvRows.join("\n"),
+          row_count: rowCount,
+          skipped_count: skipped.length,
+          skipped,
+          generated_at: new Date().toISOString(),
+        });
       }
       case "list_commission_events": {
-        const { data, error } = await db.from("commission_events").select("*").order("created_at", { ascending: false }).limit(params?.limit ?? 50);
+        const limit = Math.max(1, Math.min(Number(params?.limit ?? params?.page_size ?? 50), 200));
+        const offset = Math.max(0, Number(params?.offset ?? 0));
+        let query = db
+          .from("commission_events")
+          .select("*", { count: "exact" })
+          .order("created_at", { ascending: false })
+          .range(offset, offset + limit - 1);
+        if (params?.status && params.status !== "all") query = query.eq("status", params.status);
+        if (params?.partner_user_id) query = query.eq("partner_user_id", params.partner_user_id);
+        if (params?.since) query = query.gte("created_at", params.since);
+        if (params?.until) query = query.lte("created_at", params.until);
+        const { data, error, count } = await query;
         if (error) return fail(error.message);
-        return ok(data);
+        let totalsQuery = db.from("commission_events").select("status,commission_amount_thb");
+        if (params?.partner_user_id) totalsQuery = totalsQuery.eq("partner_user_id", params.partner_user_id);
+        if (params?.since) totalsQuery = totalsQuery.gte("created_at", params.since);
+        if (params?.until) totalsQuery = totalsQuery.lte("created_at", params.until);
+        const { data: totalRows } = await totalsQuery;
+        const totals = (totalRows ?? []).reduce<Record<string, { count: number; amount_thb: number }>>((acc, row: any) => {
+          const key = row.status ?? "unknown";
+          if (!acc[key]) acc[key] = { count: 0, amount_thb: 0 };
+          acc[key].count += 1;
+          acc[key].amount_thb += Number(row.commission_amount_thb ?? 0);
+          return acc;
+        }, {});
+        return ok({
+          items: (data ?? []).map((row: any) => ({
+            ...row,
+            partner_display_name: row.partner_display_name ?? null,
+            partner_email: row.partner_email ?? null,
+            referred_display_name: row.referred_display_name ?? null,
+            referred_email: row.referred_email ?? null,
+          })),
+          total: count ?? 0,
+          limit,
+          offset,
+          totals,
+        });
       }
       case "list_fraud_flags": {
         const limit = params?.limit ?? 50;
