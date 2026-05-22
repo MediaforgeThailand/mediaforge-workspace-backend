@@ -91,7 +91,10 @@ import {
   REPLICATE_SEEDANCE_MODEL_SLUG,
   REPLICATE_VEO_MODEL_SLUG,
 } from "../_shared/replicate.ts";
-import { parseSupabaseStorageUrl } from "../_shared/storageUrl.ts";
+import {
+  parseSupabaseStorageUrl,
+  publicizeSupabaseStorageUrl,
+} from "../_shared/storageUrl.ts";
 import { executeBanana } from "../_shared/banana.ts";
 import { executeOpenAIImage2 } from "../_shared/openAIImage.ts";
 import {
@@ -3324,6 +3327,7 @@ async function validateVeoFrameInputs(
   supabaseClient: ReturnType<typeof createClient>,
   inputs: unknown,
   supabaseUrl: string,
+  publicSupabaseUrl?: string | null,
 ): Promise<string | null> {
   if (!inputs || typeof inputs !== "object" || Array.isArray(inputs)) return null;
   const frameInputs = inputs as Record<string, unknown>;
@@ -3332,7 +3336,7 @@ async function validateVeoFrameInputs(
     const values = Array.isArray(raw) ? raw : [raw];
     for (const value of values) {
       if (typeof value !== "string" || value.startsWith("data:")) continue;
-      const parsed = parseSupabaseStorageUrl(value, supabaseUrl);
+      const parsed = parseWorkspaceStorageUrl(value, supabaseUrl, publicSupabaseUrl);
       if (!parsed) continue;
       const { data, error } = await supabaseClient.storage
         .from(parsed.bucket)
@@ -3368,12 +3372,65 @@ function addStoragePointer(
   pointers.set(`${b}:${p}`, `${b}\n${p}`);
 }
 
+function publicSupabaseUrlForRequest(req: Request): string | null {
+  const envUrl =
+    Deno.env.get("PUBLIC_SUPABASE_URL") ??
+    Deno.env.get("SUPABASE_PUBLIC_URL") ??
+    Deno.env.get("VITE_SUPABASE_URL");
+  if (envUrl?.trim()) return envUrl.trim();
+  try {
+    return new URL(req.url).origin;
+  } catch {
+    return null;
+  }
+}
+
+function parseWorkspaceStorageUrl(
+  rawUrl: string,
+  internalSupabaseUrl: string,
+  publicSupabaseUrl?: string | null,
+): { bucket: string; path: string } | null {
+  return (
+    parseSupabaseStorageUrl(rawUrl, internalSupabaseUrl) ??
+    (publicSupabaseUrl
+      ? parseSupabaseStorageUrl(rawUrl, publicSupabaseUrl)
+      : null)
+  );
+}
+
+function publicizeStorageValue(
+  value: unknown,
+  internalSupabaseUrl: string,
+  publicSupabaseUrl: string | null,
+): unknown {
+  if (typeof value === "string") {
+    return publicizeSupabaseStorageUrl(value, {
+      internalSupabaseUrl,
+      publicSupabaseUrl,
+    });
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) =>
+      publicizeStorageValue(item, internalSupabaseUrl, publicSupabaseUrl)
+    );
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = publicizeStorageValue(nested, internalSupabaseUrl, publicSupabaseUrl);
+    }
+    return out;
+  }
+  return value;
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
   const startTime = Date.now();
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
   const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  const PUBLIC_SUPABASE_URL = publicSupabaseUrlForRequest(req);
   let activeCreditCharge: WorkspaceCreditCharge | null = null;
   let activeUserId: string | null = null;
   let activeBody: WorkspaceRunBody | null = null;
@@ -3458,7 +3515,9 @@ serve(async (req) => {
         .replace(/^user-asset-/, "");
       const storagePointers = new Map<string, string>();
       addStoragePointer(storagePointers, body.storage_bucket, body.storage_path, user.id);
-      const parsedBodyUrl = body.url ? parseSupabaseStorageUrl(String(body.url), SUPABASE_URL) : null;
+      const parsedBodyUrl = body.url
+        ? parseWorkspaceStorageUrl(String(body.url), SUPABASE_URL, PUBLIC_SUPABASE_URL)
+        : null;
       if (parsedBodyUrl) addStoragePointer(storagePointers, parsedBodyUrl.bucket, parsedBodyUrl.path, user.id);
 
       let deletedRows = 0;
@@ -3488,7 +3547,7 @@ serve(async (req) => {
           );
         }
         for (const rawUrl of collectUrlStrings((job as { result?: unknown }).result)) {
-          const parsed = parseSupabaseStorageUrl(rawUrl, SUPABASE_URL);
+          const parsed = parseWorkspaceStorageUrl(rawUrl, SUPABASE_URL, PUBLIC_SUPABASE_URL);
           if (parsed) addStoragePointer(storagePointers, parsed.bucket, parsed.path, user.id);
         }
         const { data: deleted, error: deleteError } = await supabase
@@ -3530,7 +3589,7 @@ serve(async (req) => {
           );
         }
         for (const rawUrl of collectUrlStrings(row)) {
-          const parsed = parseSupabaseStorageUrl(rawUrl, SUPABASE_URL);
+          const parsed = parseWorkspaceStorageUrl(rawUrl, SUPABASE_URL, PUBLIC_SUPABASE_URL);
           if (parsed) addStoragePointer(storagePointers, parsed.bucket, parsed.path, user.id);
         }
         const { data: deleted, error: deleteError } = await supabase
@@ -3568,7 +3627,7 @@ serve(async (req) => {
 
     if (body.action === "refresh_storage_url") {
       const srcUrl = String(body.url ?? "").trim();
-      const parsed = parseSupabaseStorageUrl(srcUrl, SUPABASE_URL);
+      const parsed = parseWorkspaceStorageUrl(srcUrl, SUPABASE_URL, PUBLIC_SUPABASE_URL);
       if (!parsed) {
         return new Response(
           JSON.stringify({ error: "A valid Supabase storage URL is required." }),
@@ -3602,10 +3661,14 @@ serve(async (req) => {
         );
       }
 
+      const clientSignedUrl = publicizeSupabaseStorageUrl(signed.signedUrl, {
+        internalSupabaseUrl: SUPABASE_URL,
+        publicSupabaseUrl: PUBLIC_SUPABASE_URL,
+      });
       return new Response(
         JSON.stringify({
-          url: signed.signedUrl,
-          signed_url: signed.signedUrl,
+          url: clientSignedUrl,
+          signed_url: clientSignedUrl,
           bucket: parsed.bucket,
           storage_path: parsed.path,
         }),
@@ -3640,7 +3703,9 @@ serve(async (req) => {
         );
       }
       return new Response(
-        JSON.stringify({ job }),
+        JSON.stringify({
+          job: publicizeStorageValue(job, SUPABASE_URL, PUBLIC_SUPABASE_URL),
+        }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
     }
@@ -3704,7 +3769,9 @@ serve(async (req) => {
 
       if (["completed", "failed", "permanent_failed"].includes(job.status)) {
         return new Response(
-          JSON.stringify({ job }),
+          JSON.stringify({
+            job: publicizeStorageValue(job, SUPABASE_URL, PUBLIC_SUPABASE_URL),
+          }),
           { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       }
@@ -3715,7 +3782,9 @@ serve(async (req) => {
           : null;
       if (!currentResult?.task_id) {
         return new Response(
-          JSON.stringify({ job }),
+          JSON.stringify({
+            job: publicizeStorageValue(job, SUPABASE_URL, PUBLIC_SUPABASE_URL),
+          }),
           { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       }
@@ -3796,7 +3865,9 @@ serve(async (req) => {
 
         job = await loadJob();
         return new Response(
-          JSON.stringify({ job }),
+          JSON.stringify({
+            job: publicizeStorageValue(job, SUPABASE_URL, PUBLIC_SUPABASE_URL),
+          }),
           { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       } catch (err) {
@@ -3810,7 +3881,10 @@ serve(async (req) => {
           .eq("id", job.id);
         job = await loadJob();
         return new Response(
-          JSON.stringify({ job, warning: msg.substring(0, 300) }),
+          JSON.stringify({
+            job: publicizeStorageValue(job, SUPABASE_URL, PUBLIC_SUPABASE_URL),
+            warning: msg.substring(0, 300),
+          }),
           { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       }
@@ -3877,6 +3951,7 @@ serve(async (req) => {
           supabase,
           runRequest.inputs,
           SUPABASE_URL,
+          PUBLIC_SUPABASE_URL,
         );
         if (frameInputError) {
           return new Response(
@@ -4153,9 +4228,13 @@ serve(async (req) => {
           );
         }
         console.log(`[tripo3d-mirror] ok ${ext} bytes=${mirroredBytes ?? "stream"} path=${fileName}`);
+        const clientSignedUrl = publicizeSupabaseStorageUrl(signed.signedUrl, {
+          internalSupabaseUrl: SUPABASE_URL,
+          publicSupabaseUrl: PUBLIC_SUPABASE_URL,
+        });
         return new Response(
           JSON.stringify({
-            url: signed.signedUrl,
+            url: clientSignedUrl,
             storage_path: fileName,
             bytes: mirroredBytes,
             content_type: contentType,
@@ -6050,17 +6129,34 @@ serve(async (req) => {
         : result.output_type === "text"
           ? (result.outputs ? Object.values(result.outputs)[0] : undefined)
           : undefined;
+    const clientResultUrl =
+      typeof result.result_url === "string"
+        ? publicizeSupabaseStorageUrl(result.result_url, {
+            internalSupabaseUrl: SUPABASE_URL,
+            publicSupabaseUrl: PUBLIC_SUPABASE_URL,
+          })
+        : result.result_url;
+    const clientOutputs = publicizeStorageValue(
+      result.outputs,
+      SUPABASE_URL,
+      PUBLIC_SUPABASE_URL,
+    );
+    const clientProviderMeta = publicizeStorageValue(
+      result.provider_meta,
+      SUPABASE_URL,
+      PUBLIC_SUPABASE_URL,
+    );
 
     return new Response(
       JSON.stringify({
         type: responseType,
-        url: result.result_url,
+        url: clientResultUrl,
         text: textOut,
-        outputs: result.outputs,
+        outputs: clientOutputs,
         task_id: result.task_id,
         prompt_used: promptUsed,
         prompt_source: promptSource,
-        provider_meta: result.provider_meta,
+        provider_meta: clientProviderMeta,
         node_type: nodeType,
         credits_spent: creditsSpent,
       }),
