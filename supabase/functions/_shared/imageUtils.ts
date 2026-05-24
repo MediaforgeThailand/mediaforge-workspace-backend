@@ -90,6 +90,27 @@ export function coerceOpenAIEditSize(requested: string): OpenAIEditSize {
   return w > h ? "1536x1024" : "1024x1536";
 }
 
+export function isValidGptImage2FlexibleSize(requested: string): boolean {
+  const m = requested.match(/^(\d+)x(\d+)$/);
+  if (!m) return false;
+  const w = Number(m[1]);
+  const h = Number(m[2]);
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
+    return false;
+  }
+  if (w % 16 !== 0 || h % 16 !== 0) return false;
+  if (Math.max(w, h) > 3840) return false;
+  const ratio = Math.max(w, h) / Math.min(w, h);
+  if (ratio > 3) return false;
+  const pixels = w * h;
+  return pixels >= 655_360 && pixels <= 8_294_400;
+}
+
+export function normalizeOpenAIImageGenerationSize(requested: string): string {
+  if (isValidGptImage2FlexibleSize(requested)) return requested;
+  return coerceOpenAIEditSize(requested);
+}
+
 // Supabase Storage /storage/v1/object/{sign,public,authenticated}/...
 // URLs can be rewritten to /storage/v1/render/image/{...} to route
 // through imgproxy, which bakes EXIF orientation into pixels and

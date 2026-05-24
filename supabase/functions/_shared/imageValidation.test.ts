@@ -2,7 +2,13 @@
 
 import { assertEquals, assertExists } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import { parseJpegInfo, prepareReferenceImage } from "./imageValidation.ts";
-import { coerceOpenAIEditSize, detectOpenAIImageFile, toSupabaseRenderUrlForOpenAI } from "./imageUtils.ts";
+import {
+  coerceOpenAIEditSize,
+  detectOpenAIImageFile,
+  isValidGptImage2FlexibleSize,
+  normalizeOpenAIImageGenerationSize,
+  toSupabaseRenderUrlForOpenAI,
+} from "./imageUtils.ts";
 
 // Minimal valid baseline JPEG with no EXIF, 1x1 pixel, used as a
 // fast-path control. Bytes generated via jpeg-js from a single black
@@ -58,6 +64,24 @@ Deno.test("coerceOpenAIEditSize: garbage → 1024x1024 fallback", () => {
   assertEquals(coerceOpenAIEditSize(""), "1024x1024");
   assertEquals(coerceOpenAIEditSize("garbage"), "1024x1024");
   assertEquals(coerceOpenAIEditSize("0x0"), "1024x1024");
+});
+
+Deno.test("normalizeOpenAIImageGenerationSize: preserves valid gpt-image-2 flexible sizes", () => {
+  assertEquals(isValidGptImage2FlexibleSize("1280x720"), true);
+  assertEquals(isValidGptImage2FlexibleSize("2048x1152"), true);
+  assertEquals(isValidGptImage2FlexibleSize("3840x2160"), true);
+  assertEquals(normalizeOpenAIImageGenerationSize("1280x720"), "1280x720");
+  assertEquals(normalizeOpenAIImageGenerationSize("2048x1152"), "2048x1152");
+  assertEquals(normalizeOpenAIImageGenerationSize("3840x2160"), "3840x2160");
+});
+
+Deno.test("normalizeOpenAIImageGenerationSize: invalid custom sizes fall back to legacy presets", () => {
+  assertEquals(isValidGptImage2FlexibleSize("1537x864"), false);
+  assertEquals(isValidGptImage2FlexibleSize("4096x2304"), false);
+  assertEquals(isValidGptImage2FlexibleSize("4000x1000"), false);
+  assertEquals(normalizeOpenAIImageGenerationSize("1537x864"), "1536x1024");
+  assertEquals(normalizeOpenAIImageGenerationSize("4096x2304"), "1536x1024");
+  assertEquals(normalizeOpenAIImageGenerationSize("4000x1000"), "1536x1024");
 });
 
 Deno.test("toSupabaseRenderUrlForOpenAI: Supabase JPEG sign URL is rewritten", () => {

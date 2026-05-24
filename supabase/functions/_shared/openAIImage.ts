@@ -2,9 +2,9 @@
 /// <reference lib="dom" />
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
-  coerceOpenAIEditSize,
   detectOpenAIImageFile,
   fetchImageBuffer,
+  normalizeOpenAIImageGenerationSize,
   openAIReferenceImageError,
   OPENAI_IMAGE_MAX_BYTES,
   toSupabaseRenderUrlForOpenAI,
@@ -53,11 +53,8 @@ export async function executeOpenAIImage2(
     requestedQuality === "low" || requestedQuality === "medium" || requestedQuality === "high"
       ? requestedQuality
       : "medium";
-  // Coerce to one of OpenAI's four supported sizes. Frontends
-  // sometimes pass arbitrary aspect ratios (1024x1280 etc.) which
-  // gpt-image-1 rejects with `Invalid size '...'` — surfaced to the
-  // user as a generic provider error.
-  const size = coerceOpenAIEditSize(String(params.size ?? "1024x1024"));
+  const requestedSize = String(params.size ?? "1024x1024");
+  const size = normalizeOpenAIImageGenerationSize(requestedSize);
   const outputFormat = String(params.output_format ?? "png");
   const rawOutputCompression = Number(params.output_compression ?? 100);
   const outputCompression = Number.isFinite(rawOutputCompression)
