@@ -5,6 +5,10 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import type { ProviderResult } from "./providerResult.ts";
 import { extractProviderMediaUrl } from "./imageUtils.ts";
 import { MAGNIFIC_BASE, loadMagnificApiKey } from "./magnific.ts";
+import {
+  WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
+  workspaceAiMediaPipelinePath,
+} from "./storageUrl.ts";
 
 /**
  * executeRemoveBg — calls Freepik's Remove Background endpoint (Magnific API).
@@ -26,6 +30,7 @@ export async function executeRemoveBg(
   params: Record<string, unknown>,
   supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "",
   serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+  userId?: string | null,
 ): Promise<ProviderResult> {
   const imageUrl = String(params.image_url ?? "");
   if (!imageUrl) {
@@ -91,6 +96,7 @@ export async function executeRemoveBg(
   );
 
   let publicUrl = directUrl;
+  let storagePath: string | null = null;
 
   // If we got base64, upload it to ai-media and return a signed URL.
   if (!publicUrl && candidateB64) {
@@ -101,14 +107,18 @@ export async function executeRemoveBg(
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
 
       const supabase = createClient(supabaseUrl, serviceRoleKey);
-      const fileName = `pipeline/mediaforge_nobg_${Date.now()}.png`;
+      const fileName = workspaceAiMediaPipelinePath(
+        userId,
+        `mediaforge_nobg_${Date.now()}.png`,
+      );
       const { error: uploadError } = await supabase.storage
         .from("ai-media")
         .upload(fileName, bytes, { contentType: "image/png", upsert: true });
       if (!uploadError) {
+        storagePath = fileName;
         const { data: urlData, error: signError } = await supabase.storage
           .from("ai-media")
-          .createSignedUrl(fileName, 60 * 60 * 24 * 7);
+          .createSignedUrl(fileName, WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS);
         if (!signError && urlData?.signedUrl) {
           publicUrl = urlData.signedUrl;
         } else {
@@ -135,6 +145,17 @@ export async function executeRemoveBg(
     result_url: publicUrl,
     outputs: { output_image: publicUrl },
     output_type: "image_url" as const,
-    provider_meta: { provider: "freepik", model: "freepik-remove-bg", endpoint },
+    provider_meta: {
+      provider: "freepik",
+      model: "freepik-remove-bg",
+      endpoint,
+      ...(storagePath
+        ? {
+            storage_bucket: "ai-media",
+            storage_path: storagePath,
+            signed_url_ttl_seconds: WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
+          }
+        : {}),
+    },
   };
 }

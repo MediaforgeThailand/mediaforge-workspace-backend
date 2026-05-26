@@ -5,6 +5,10 @@ import { bytesToBase64, fetchImageBuffer } from "./imageUtils.ts";
 import { isProviderBillingLike, summarizeProviderErrorBody } from "./providerErrors.ts";
 import { shouldFastFallbackProviderError } from "./providerRetry.ts";
 import type { ProviderResult } from "./providerResult.ts";
+import {
+  WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
+  workspaceAiMediaPipelinePath,
+} from "./storageUrl.ts";
 
 const BANANA_MODEL_MAP: Record<string, string> = {
   "nano-banana-pro": "nano-banana-pro",
@@ -44,6 +48,7 @@ function hasGeminiImageFallbackKey(): boolean {
 export async function executeBanana(
   params: Record<string, unknown>,
   supabase: ReturnType<typeof createClient>,
+  userId?: string | null,
 ): Promise<ProviderResult> {
   // Banana must stay on the primary Gemini image key. Do not silently route
   // to secondary keys or wrapper providers; this keeps failures attributable
@@ -329,7 +334,10 @@ export async function executeBanana(
 
   // Upload to storage
   const ext = imageMime.split("/")[1] || "png";
-  const fileName = `pipeline/mediaforge_${Date.now()}.${ext}`;
+  const fileName = workspaceAiMediaPipelinePath(
+    userId,
+    `mediaforge_${Date.now()}.${ext}`,
+  );
   const binaryData = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
 
   let publicUrl = `data:${imageMime};base64,${imageBase64}`;
@@ -343,7 +351,7 @@ export async function executeBanana(
   } else {
     const { data: urlData, error: signError } = await supabase.storage
       .from("ai-media")
-      .createSignedUrl(fileName, 60 * 60 * 24 * 7);
+      .createSignedUrl(fileName, WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS);
     if (!signError && urlData?.signedUrl) {
       publicUrl = urlData.signedUrl;
     } else {
@@ -364,6 +372,9 @@ export async function executeBanana(
       reference_image_count: resolvedReferenceCount,
       reference_image_requested_count: imageUrls.length,
       reference_image_failed_count: failedReferenceCount,
+      storage_bucket: "ai-media",
+      storage_path: fileName,
+      signed_url_ttl_seconds: WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
     },
   };
 }
