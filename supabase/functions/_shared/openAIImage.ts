@@ -16,6 +16,10 @@ import {
   summarizeProviderErrorText,
 } from "./providerErrors.ts";
 import type { ProviderResult } from "./providerResult.ts";
+import {
+  WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
+  workspaceAiMediaPipelinePath,
+} from "./storageUrl.ts";
 
 /**
  * OpenAI gpt-image-2 executor.
@@ -36,6 +40,7 @@ const GPT_IMAGE_2_ENHANCE_PROMPT =
 export async function executeOpenAIImage2(
   params: Record<string, unknown>,
   supabase: ReturnType<typeof createClient>,
+  userId?: string | null,
 ): Promise<ProviderResult> {
   const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
   if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not configured");
@@ -208,7 +213,10 @@ export async function executeOpenAIImage2(
 
   const ext = outputFormat === "jpeg" ? "jpg" : outputFormat;
   const mime = `image/${outputFormat === "jpg" ? "jpeg" : outputFormat}`;
-  const fileName = `pipeline/mediaforge_${Date.now()}.${ext}`;
+  const fileName = workspaceAiMediaPipelinePath(
+    userId,
+    `mediaforge_${Date.now()}.${ext}`,
+  );
   const binaryData = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 
   let publicUrl = `data:${mime};base64,${b64}`;
@@ -222,7 +230,7 @@ export async function executeOpenAIImage2(
   } else {
     const { data: urlData, error: signError } = await supabase.storage
       .from("ai-media")
-      .createSignedUrl(fileName, 60 * 60 * 24 * 7);
+      .createSignedUrl(fileName, WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS);
     if (!signError && urlData?.signedUrl) {
       publicUrl = urlData.signedUrl;
     } else {
@@ -239,6 +247,9 @@ export async function executeOpenAIImage2(
       model,
       requested_model: requestedModel,
       mode: isEnhanceMode ? "enhance" : (useEdits ? "edit" : "generate"),
+      storage_bucket: "ai-media",
+      storage_path: fileName,
+      signed_url_ttl_seconds: WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
     },
   };
 }

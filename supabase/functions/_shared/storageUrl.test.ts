@@ -2,8 +2,10 @@
 
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import {
+  WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
   parseSupabaseStorageUrl,
   publicizeSupabaseStorageUrl,
+  workspaceAiMediaPipelinePath,
 } from "./storageUrl.ts";
 
 Deno.test("parseSupabaseStorageUrl parses signed storage object URLs", () => {
@@ -16,6 +18,30 @@ Deno.test("parseSupabaseStorageUrl parses signed storage object URLs", () => {
     bucket: "ai-media",
     path: "user-id/file.png",
   });
+});
+
+Deno.test("parseSupabaseStorageUrl parses rendered signed image URLs", () => {
+  const parsed = parseSupabaseStorageUrl(
+    "https://example.supabase.co/storage/v1/render/image/sign/ai-media/user-id/file.png?width=768&token=abc",
+    "https://example.supabase.co",
+  );
+
+  assertEquals(parsed, {
+    bucket: "ai-media",
+    path: "user-id/file.png",
+  });
+});
+
+Deno.test("workspaceAiMediaPipelinePath scopes new pipeline assets to user id", () => {
+  assertEquals(
+    workspaceAiMediaPipelinePath("user-id", "mediaforge_123.png"),
+    "user-id/pipeline/mediaforge_123.png",
+  );
+  assertEquals(
+    workspaceAiMediaPipelinePath(null, "mediaforge_123.png"),
+    "pipeline/mediaforge_123.png",
+  );
+  assertEquals(WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS, 31_536_000);
 });
 
 Deno.test("publicizeSupabaseStorageUrl rewrites local Kong storage URLs", () => {

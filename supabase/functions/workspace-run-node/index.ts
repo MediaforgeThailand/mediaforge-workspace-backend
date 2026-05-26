@@ -92,8 +92,10 @@ import {
   REPLICATE_VEO_MODEL_SLUG,
 } from "../_shared/replicate.ts";
 import {
+  WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
   parseSupabaseStorageUrl,
   publicizeSupabaseStorageUrl,
+  workspaceAiMediaPipelinePath,
 } from "../_shared/storageUrl.ts";
 import { executeBanana } from "../_shared/banana.ts";
 import { executeOpenAIImage2 } from "../_shared/openAIImage.ts";
@@ -3305,19 +3307,24 @@ async function processWorkspaceGenerationJob(args: {
   console.warn(`[workspace-job] failed job=${job.id} attempts=${attempt}: ${lastError}`);
 }
 
-function collectUrlStrings(value: unknown, output = new Set<string>(), depth = 0): Set<string> {
-  if (depth > 4 || value == null) return output;
+function collectUrlStrings(
+  value: unknown,
+  output = new Set<string>(),
+  depth = 0,
+  maxDepth = 8,
+): Set<string> {
+  if (depth > maxDepth || value == null) return output;
   if (typeof value === "string") {
     if (/^https?:\/\//i.test(value) || /^data:/i.test(value)) output.add(value);
     return output;
   }
   if (Array.isArray(value)) {
-    for (const item of value) collectUrlStrings(item, output, depth + 1);
+    for (const item of value) collectUrlStrings(item, output, depth + 1, maxDepth);
     return output;
   }
   if (typeof value === "object") {
     for (const item of Object.values(value as Record<string, unknown>)) {
-      collectUrlStrings(item, output, depth + 1);
+      collectUrlStrings(item, output, depth + 1, maxDepth);
     }
   }
   return output;
@@ -3358,6 +3365,83 @@ function isOwnWorkspaceStoragePath(bucket: string, path: string, userId: string)
     return path.startsWith(`${userId}/`) || path.startsWith(`tripo3d-mirror/${userId}/`);
   }
   return false;
+}
+
+function isLegacyWorkspacePipelinePath(bucket: string, path: string): boolean {
+  return (
+    bucket === "ai-media" &&
+    path.startsWith("pipeline/") &&
+    path.split("/").every((part) => part.length > 0 && part !== "..")
+  );
+}
+
+function valueReferencesStoragePath(
+  value: unknown,
+  bucket: string,
+  path: string,
+  supabaseUrl: string,
+  publicSupabaseUrl?: string | null,
+): boolean {
+  for (const rawUrl of collectUrlStrings(value)) {
+    const parsed = parseWorkspaceStorageUrl(rawUrl, supabaseUrl, publicSupabaseUrl);
+    if (parsed?.bucket === bucket && parsed.path === path) return true;
+  }
+  return false;
+}
+
+async function isLegacyWorkspaceStorageReferencedByUser(args: {
+  supabase: ReturnType<typeof createClient>;
+  userId: string;
+  jobId?: string | null;
+  bucket: string;
+  path: string;
+  supabaseUrl: string;
+  publicSupabaseUrl?: string | null;
+}): Promise<boolean> {
+  if (!isLegacyWorkspacePipelinePath(args.bucket, args.path)) return false;
+  const requestedJobId = String(args.jobId ?? "").trim();
+  if (requestedJobId) {
+    const { data: job, error: jobError } = await args.supabase
+      .from("workspace_generation_jobs")
+      .select("id,result")
+      .eq("id", requestedJobId)
+      .eq("user_id", args.userId)
+      .maybeSingle();
+    if (jobError) {
+      console.warn("[refresh_storage_url] legacy job lookup failed:", jobError.message);
+    } else if (
+      job &&
+      valueReferencesStoragePath(
+        (job as { result?: unknown }).result,
+        args.bucket,
+        args.path,
+        args.supabaseUrl,
+        args.publicSupabaseUrl,
+      )
+    ) {
+      return true;
+    }
+  }
+  const { data, error } = await args.supabase
+    .from("workspace_generation_jobs")
+    .select("id,result")
+    .eq("user_id", args.userId)
+    .not("result", "is", null)
+    .order("created_at", { ascending: false })
+    .limit(5000);
+  if (error) {
+    console.warn("[refresh_storage_url] legacy ownership lookup failed:", error.message);
+    return false;
+  }
+  return (data ?? []).some((job) =>
+    valueReferencesStoragePath(
+      (job as { result?: unknown }).result,
+      args.bucket,
+      args.path,
+      args.supabaseUrl,
+      args.publicSupabaseUrl,
+    )
+  );
 }
 
 function addStoragePointer(
@@ -3635,16 +3719,20 @@ serve(async (req) => {
         );
       }
 
-      const ownUserAsset =
-        parsed.bucket === "user_assets" &&
-        (parsed.path.startsWith(`${user.id}/`) ||
-          parsed.path.startsWith(`tts/${user.id}/`));
-      const ownAiMedia =
-        parsed.bucket === "ai-media" &&
-        (parsed.path.startsWith(`${user.id}/`) ||
-          parsed.path.startsWith(`tripo3d-mirror/${user.id}/`));
+      const ownsPath = isOwnWorkspaceStoragePath(parsed.bucket, parsed.path, user.id);
+      const ownsLegacyPipelinePath = ownsPath
+        ? false
+        : await isLegacyWorkspaceStorageReferencedByUser({
+            supabase,
+            userId: user.id,
+            jobId: body.job_id ?? null,
+            bucket: parsed.bucket,
+            path: parsed.path,
+            supabaseUrl: SUPABASE_URL,
+            publicSupabaseUrl: PUBLIC_SUPABASE_URL,
+          });
 
-      if (!ownUserAsset && !ownAiMedia) {
+      if (!ownsPath && !ownsLegacyPipelinePath) {
         return new Response(
           JSON.stringify({ error: "Storage URL does not belong to this account." }),
           { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } },
@@ -3653,7 +3741,7 @@ serve(async (req) => {
 
       const { data: signed, error: signError } = await supabase.storage
         .from(parsed.bucket)
-        .createSignedUrl(parsed.path, 60 * 60 * 24 * 365);
+        .createSignedUrl(parsed.path, WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS);
       if (signError || !signed?.signedUrl) {
         return new Response(
           JSON.stringify({ error: signError?.message ?? "Could not refresh signed URL." }),
@@ -3671,6 +3759,8 @@ serve(async (req) => {
           signed_url: clientSignedUrl,
           bucket: parsed.bucket,
           storage_path: parsed.path,
+          legacy_pipeline_path: ownsLegacyPipelinePath,
+          signed_url_ttl_seconds: WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
         }),
         { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
@@ -4220,7 +4310,7 @@ serve(async (req) => {
         }
         const { data: signed, error: signErr } = await supabase.storage
           .from("ai-media")
-          .createSignedUrl(fileName, 60 * 60 * 24 * 365);
+          .createSignedUrl(fileName, WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS);
         if (signErr || !signed?.signedUrl) {
           return new Response(
             JSON.stringify({ error: `Sign URL failed: ${signErr?.message ?? "unknown"}` }),
@@ -4951,14 +5041,17 @@ serve(async (req) => {
             contentType.includes("png") ? "png" :
             "png";
           const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
-          const path = `pipeline/magnific_banana_${safeTaskId}.${ext}`;
+          const path = workspaceAiMediaPipelinePath(
+            user.id,
+            `magnific_banana_${safeTaskId}.${ext}`,
+          );
           const upload = await supabase.storage
             .from("ai-media")
             .upload(path, imageRes.body, { contentType, upsert: true });
           if (upload.error) throw upload.error;
           const signed = await supabase.storage
             .from("ai-media")
-            .createSignedUrl(path, 60 * 60 * 24 * 7);
+            .createSignedUrl(path, WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS);
           if (signed.error || !signed.data?.signedUrl) {
             throw signed.error ?? new Error("no signed URL");
           }
@@ -5105,16 +5198,21 @@ serve(async (req) => {
             : "processing";
 
       let publicUrl = "";
+      let storagePath: string | null = null;
       if (normalised === "succeed" && providerMediaUrl) {
         try {
           const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
+          storagePath = workspaceAiMediaPipelinePath(
+            user.id,
+            `magnific_upscale_${safeTaskId}.${isVideoUpscale ? "mp4" : "png"}`,
+          );
           const mirrored = await mirrorRemoteMedia({
             supabase,
             sourceUrl: providerMediaUrl,
             bucket: "ai-media",
-            path: `pipeline/magnific_upscale_${safeTaskId}.${isVideoUpscale ? "mp4" : "png"}`,
+            path: storagePath,
             fallbackContentType: isVideoUpscale ? "video/mp4" : "image/png",
-            signedUrlTtlSeconds: 60 * 60 * 24 * 365,
+            signedUrlTtlSeconds: WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
             maxBufferBytes: isVideoUpscale ? WORKSPACE_VIDEO_MIRROR_MAX_BYTES : WORKSPACE_IMAGE_MIRROR_MAX_BYTES,
             allowRawUrlFallback: isVideoUpscale,
             label: "poll_magnific_upscale",
@@ -5144,6 +5242,13 @@ serve(async (req) => {
           provider_meta: {
             candidate_count: providerCandidates.length,
             selected_candidate_index: selectedCandidate?.index ?? null,
+            ...(storagePath
+              ? {
+                  storage_bucket: "ai-media",
+                  storage_path: storagePath,
+                  signed_url_ttl_seconds: WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
+                }
+              : {}),
             ...(selectedCandidate?.width && selectedCandidate?.height
               ? {
                   selected_width: selectedCandidate.width,
@@ -5222,14 +5327,14 @@ serve(async (req) => {
           }
           if (!videoRes.body) throw new Error("download response missing body");
           const opId = taskId.replace(/^operations\//, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-          const path = `veo-renders/mediaforge_${opId}.mp4`;
+          const path = `${user.id}/veo-renders/mediaforge_${opId}.mp4`;
           const upload = await supabase.storage
             .from("user_assets")
             .upload(path, videoRes.body, { contentType: "video/mp4", upsert: true });
           if (upload.error) throw upload.error;
           const signed = await supabase.storage
             .from("user_assets")
-            .createSignedUrl(path, 60 * 60 * 24 * 365);
+            .createSignedUrl(path, WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS);
           if (signed.error || !signed.data?.signedUrl) {
             throw signed.error ?? new Error("no signed URL");
           }
@@ -5354,7 +5459,8 @@ serve(async (req) => {
               console.warn(`[hyper3d] mirror ${ext} missing response body`);
               return null;
             }
-            const fileName = `hyper3d/${taskId}/mediaforge_${Date.now()}.${ext}`;
+            const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
+            const fileName = `${user.id}/hyper3d/${safeTaskId}/mediaforge_${Date.now()}.${ext}`;
             const { error: upErr } = await supabase.storage
               .from("ai-media")
               .upload(fileName, r.body, { contentType, upsert: true });
@@ -5364,7 +5470,7 @@ serve(async (req) => {
             }
             const { data: signed, error: signErr } = await supabase.storage
               .from("ai-media")
-              .createSignedUrl(fileName, 60 * 60 * 24 * 365);
+              .createSignedUrl(fileName, WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS);
             if (signErr || !signed?.signedUrl) {
               console.warn(`[hyper3d] mirror ${ext} sign err: ${signErr?.message}`);
               return null;
@@ -5637,7 +5743,8 @@ serve(async (req) => {
               console.warn(`[tripo3d] mirror ${ext} missing response body`);
               return null;
             }
-            const fileName = `tripo3d/${taskId}/mediaforge_${Date.now()}.${ext}`;
+            const safeTaskId = taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
+            const fileName = `${user.id}/tripo3d/${safeTaskId}/mediaforge_${Date.now()}.${ext}`;
             const { error: upErr } = await supabase.storage
               .from("ai-media")
               .upload(fileName, r.body, { contentType, upsert: true });
@@ -5647,7 +5754,7 @@ serve(async (req) => {
             }
             const { data: signed, error: signErr } = await supabase.storage
               .from("ai-media")
-              .createSignedUrl(fileName, 60 * 60 * 24 * 365); // 1 year
+              .createSignedUrl(fileName, WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS);
             if (signErr || !signed?.signedUrl) {
               console.warn(`[tripo3d] mirror ${ext} sign err: ${signErr?.message}`);
               return null;
@@ -5986,7 +6093,7 @@ serve(async (req) => {
     let result: ProviderResult;
     switch (provider) {
       case "banana":
-        result = await executeBanana(params, supabase);
+        result = await executeBanana(params, supabase, user.id);
         break;
       case "kling":
         result = await executeKling(params, supabase, mentioned);
@@ -5995,7 +6102,7 @@ serve(async (req) => {
         result = await executeChatAi(params);
         break;
       case "remove_bg":
-        result = await executeRemoveBg(params, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+        result = await executeRemoveBg(params, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, user.id);
         break;
       case "upscale_image":
         result = await executeMagnificUpscale(params);
@@ -6007,7 +6114,7 @@ serve(async (req) => {
         result = await executeElevenLabsDubbing(params);
         break;
       case "openai":
-        result = await executeOpenAIImage2(params, supabase);
+        result = await executeOpenAIImage2(params, supabase, user.id);
         break;
       case "replicate_image":
         result = await executeReplicateImage(params);
@@ -6072,7 +6179,7 @@ serve(async (req) => {
         result = await executeVeo(params, supabase);
         break;
       case "seedream":
-        result = await executeSeedream(params, supabase);
+        result = await executeSeedream(params, supabase, user.id);
         break;
       default:
         throw new Error(`No executor for provider "${provider}"`);

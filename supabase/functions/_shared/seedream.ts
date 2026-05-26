@@ -30,6 +30,10 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { loadSeedanceCredentials } from "./seedance.ts";
 import type { ProviderResult } from "./providerResult.ts";
+import {
+  WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
+  workspaceAiMediaPipelinePath,
+} from "./storageUrl.ts";
 
 /** BytePlus ModelArk base URL (international). Same gateway as Seedance. */
 export const SEEDREAM_BASE = "https://ark.ap-southeast.bytepluses.com";
@@ -190,6 +194,7 @@ export async function generateSeedreamSingleUrl(
 export async function executeSeedream(
   params: Record<string, unknown>,
   supabase: ReturnType<typeof createClient>,
+  userId?: string | null,
 ): Promise<ProviderResult> {
   const { apiKey } = loadSeedanceCredentials();
 
@@ -367,6 +372,7 @@ export async function executeSeedream(
   // node body to a thin line because neither the image branch nor the
   // empty placeholder matched.
   let publicUrl = url;
+  let storagePath: string | null = null;
   try {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`download HTTP ${res.status}`);
@@ -378,14 +384,18 @@ export async function executeSeedream(
       contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" :
       contentType.includes("gif") ? "gif" :
       "png";
-    const fileName = `pipeline/seedream_${Date.now()}.${ext}`;
+    const fileName = workspaceAiMediaPipelinePath(
+      userId,
+      `seedream_${Date.now()}.${ext}`,
+    );
     const { error: uploadError } = await supabase.storage
       .from("ai-media")
       .upload(fileName, res.body, { contentType, upsert: true });
     if (uploadError) throw uploadError;
+    storagePath = fileName;
     const { data: urlData, error: signError } = await supabase.storage
       .from("ai-media")
-      .createSignedUrl(fileName, 60 * 60 * 24 * 7);
+      .createSignedUrl(fileName, WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS);
     if (!signError && urlData?.signedUrl) {
       publicUrl = urlData.signedUrl;
     } else {
@@ -417,6 +427,13 @@ export async function executeSeedream(
       size,
       revised_prompt: items[0]?.revised_prompt,
       reference_image_count: refUrls.length,
+      ...(storagePath
+        ? {
+            storage_bucket: "ai-media",
+            storage_path: storagePath,
+            signed_url_ttl_seconds: WORKSPACE_STORAGE_SIGNED_URL_TTL_SECONDS,
+          }
+        : {}),
     },
   };
 }
