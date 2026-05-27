@@ -47,6 +47,7 @@ serve(async (request) => {
   const company = clean(body.company, 180);
   const project = clean(body.project, 180);
   const budget = clean(body.budget, 180);
+  const phone = clean(body.phone, 80);
   const message = clean(body.message, 2400);
 
   if (!name || !email || !message || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -74,6 +75,7 @@ serve(async (request) => {
       <p><strong>Company:</strong> ${company || "-"}</p>
       <p><strong>Project Type:</strong> ${project || "-"}</p>
       <p><strong>Budget / Timeline:</strong> ${budget || "-"}</p>
+      <p><strong>Phone:</strong> ${phone || "-"}</p>
       <p><strong>Submitted:</strong> ${submittedAt} Bangkok time</p>
       <hr style="border:0;border-top:1px solid #ddd;margin:20px 0" />
       <p style="white-space:pre-line">${message}</p>
@@ -86,6 +88,7 @@ serve(async (request) => {
     `Company: ${company || "-"}`,
     `Project Type: ${project || "-"}`,
     `Budget / Timeline: ${budget || "-"}`,
+    `Phone: ${phone || "-"}`,
     `Submitted: ${submittedAt} Bangkok time`,
     "",
     message,
