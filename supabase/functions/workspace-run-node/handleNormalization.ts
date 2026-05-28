@@ -55,6 +55,13 @@ export const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     image_input:   { internal_key: "image_url",      data_type: "image" },
     image:         { internal_key: "image_url",      data_type: "image" },
   },
+  runpod_qwen: {
+    ref_image:     { internal_key: "image_url",      data_type: "image" },
+    image_input:   { internal_key: "image_url",      data_type: "image" },
+    image:         { internal_key: "image_url",      data_type: "image" },
+    mask_image:    { internal_key: "mask_image_url", data_type: "image" },
+    mask:          { internal_key: "mask_image_url", data_type: "image" },
+  },
   seedream: {
     ref_image:     { internal_key: "image_url",      data_type: "image" },
     image_input:   { internal_key: "image_url",      data_type: "image" },

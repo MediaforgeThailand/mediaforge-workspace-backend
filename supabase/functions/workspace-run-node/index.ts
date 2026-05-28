@@ -32,6 +32,10 @@ import {
 } from "../_shared/seedance.ts";
 import { executeSeedream } from "../_shared/seedream.ts";
 import {
+  executeRunpodQwen,
+  pollRunpodQwenOnce,
+} from "../_shared/runpodQwen.ts";
+import {
   HYPER3D_BASE,
   HYPER3D_TASKS_PATH,
   executeHyper3D,
@@ -176,11 +180,13 @@ function getProviderForNodeType(
   if (nodeType === "urlAssetNode") return "url_asset";
 
   if (nodeType === "bananaProNode" || nodeType === "imageGenNode") {
+    if (m.startsWith("qwen-image")) return "runpod_qwen";
     if (m.startsWith("replicate-gpt-image") || m.startsWith("replicate-nano-banana")) return "replicate_image";
     if (m.startsWith("seedream")) return "seedream";
     if (m.startsWith("gpt-image") || m.startsWith("dall-e")) return "openai";
     return "banana";
   }
+  if (nodeType === "vfxQwenImageNode") return "runpod_qwen";
   if (nodeType === "klingVideoNode" || nodeType === "videoGenNode") {
     if (m.startsWith("replicate-veo")) return "replicate_veo";
     if (m.startsWith("replicate-kling")) return "replicate_video";
@@ -253,6 +259,7 @@ function workspaceProviderDef(
     p === "url_asset" ? "url_to_asset" :
     p === "openai" ? "generate_openai_image" :
     p === "replicate_image" ? "generate_openai_image" :
+    p === "runpod_qwen" ? "generate_qwen_image" :
     p === "seedream" ? "generate_seedream_image" :
     p === "banana" ? "generate_freepik_image" :
     p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" ? "generate_freepik_video" :
@@ -270,7 +277,7 @@ function workspaceProviderDef(
     provider: p,
     feature,
     output_type: output,
-    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "replicate_image" || p === "upscale_image" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio" || p === "elevenlabs_dubbing" || p === "auto_subtitle",
+    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "replicate_image" || p === "runpod_qwen" || p === "upscale_image" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio" || p === "elevenlabs_dubbing" || p === "auto_subtitle",
   };
 }
 
@@ -287,6 +294,7 @@ function workspaceMultiplierForProvider(
   switch (def.provider) {
     case "banana":
     case "openai":
+    case "runpod_qwen":
     case "seedream":
     case "remove_bg":
     case "upscale_image":
@@ -1171,6 +1179,7 @@ interface WorkspaceRunBody {
     | "poll_replicate_veo"
     | "poll_replicate_video"
     | "poll_replicate_image"
+    | "poll_runpod_qwen"
     | "poll_elevenlabs_dubbing"
     | "poll_freepik_veo"
     | "poll_freepik_video"
@@ -1828,6 +1837,8 @@ async function pollWorkspaceAsyncResult(args: {
         ? "poll_replicate_video"
       : provider === "replicate_image"
         ? "poll_replicate_image"
+      : provider === "runpod_qwen"
+        ? "poll_runpod_qwen"
       : provider === "elevenlabs_dubbing"
         ? "poll_elevenlabs_dubbing"
       : provider === "freepik_veo" || provider === "freepik_seedance"
@@ -1969,6 +1980,8 @@ async function pollWorkspaceAsyncResultOnce(args: {
         ? "poll_replicate_video"
       : provider === "replicate_image"
         ? "poll_replicate_image"
+      : provider === "runpod_qwen"
+        ? "poll_runpod_qwen"
       : provider === "elevenlabs_dubbing"
         ? "poll_elevenlabs_dubbing"
       : provider === "freepik_veo" || provider === "freepik_seedance"
@@ -2099,6 +2112,9 @@ function inferAsyncPollProvider(
     if (model.includes("gpt-image") || model.includes("nano-banana")) return "replicate_image";
     if (model.includes("veo")) return "replicate_veo";
     return "replicate_video";
+  }
+  if (endpoint.includes("api.runpod.ai") || endpoint.includes(".proxy.runpod.net")) {
+    return "runpod_qwen";
   }
   if (
     endpoint.includes("generativelanguage.googleapis.com") ||
@@ -4636,6 +4652,58 @@ serve(async (req) => {
      * exhausted. Magnific returns { data: { status, generated[] } }; on
      * terminal success we mirror the provider URL into Supabase storage so
      * the browser sees the same signed-URL shape as direct Veo. */
+    if (body.action === "poll_runpod_qwen") {
+      const taskId = String(body.task_id ?? "").trim();
+      const pollEndpoint = String(body.poll_endpoint ?? "").trim();
+      if (!taskId || !pollEndpoint) {
+        return new Response(
+          JSON.stringify({ error: "task_id and poll_endpoint required for poll_runpod_qwen" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let pollUrlOk = false;
+      try {
+        const u = new URL(pollEndpoint);
+        pollUrlOk =
+          u.protocol === "https:" &&
+          (
+            u.hostname === "api.runpod.ai" ||
+            u.hostname.endsWith(".proxy.runpod.net")
+          );
+      } catch {
+        pollUrlOk = false;
+      }
+      if (!pollUrlOk) {
+        return new Response(
+          JSON.stringify({ error: "poll_endpoint must be a Runpod Qwen endpoint" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let payload: Record<string, unknown>;
+      try {
+        payload = await pollRunpodQwenOnce({
+          taskId,
+          pollEndpoint,
+          supabase,
+          userId: user.id,
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        payload = {
+          status: "polling_error",
+          task_id: taskId,
+          message: msg.substring(0, 300),
+        };
+      }
+
+      return new Response(
+        JSON.stringify(payload),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
     if (body.action === "poll_replicate_veo" || body.action === "poll_replicate_video" || body.action === "poll_replicate_image") {
       const taskId = String(body.task_id ?? "").trim();
       const pollEndpoint = String(body.poll_endpoint ?? "").trim();
@@ -5999,7 +6067,7 @@ serve(async (req) => {
       })
       .filter((u): u is string => u !== null);
     if (provider !== "kling" && (mentionImageUrls.length > 0 || edgeImageUrls.length > 0)) {
-      if (provider === "banana" || provider === "openai" || provider === "replicate_image") {
+      if (provider === "banana" || provider === "openai" || provider === "replicate_image" || provider === "runpod_qwen") {
         const merged = Array.from(new Set([
           ...((params.mention_image_urls as string[] | undefined) ?? []),
           ...mentionImageUrls,
@@ -6118,6 +6186,9 @@ serve(async (req) => {
         break;
       case "replicate_image":
         result = await executeReplicateImage(params);
+        break;
+      case "runpod_qwen":
+        result = await executeRunpodQwen(params, supabase, user.id);
         break;
       case "video_understanding":
         result = await executeVideoToPrompt(params);

@@ -10,6 +10,7 @@
  * must surface as a user-facing 400 error.
  */
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { qwenRunpodPriceKeys } from "./runpodQwen.ts";
 
 /* ─── Custom error so callers can distinguish pricing gaps from bugs ─── */
 
@@ -27,6 +28,7 @@ export type ProviderKey =
   | "replicate_video"
   | "replicate_veo"
   | "replicate_image"
+  | "runpod_qwen"
   | "banana"
   | "openai"
   | "seedream"
@@ -58,6 +60,7 @@ export const NODE_TYPE_REGISTRY: Record<string, ProviderDef> = {
   videoGenNode:          { provider: "kling",     feature: "generate_freepik_video", output_type: "video_url", is_async: true },
   bananaProNode:         { provider: "banana",    feature: "generate_freepik_image", output_type: "image_url", is_async: false },
   imageGenNode:          { provider: "banana",    feature: "generate_freepik_image", output_type: "image_url", is_async: false },
+  vfxQwenImageNode:      { provider: "runpod_qwen", feature: "generate_qwen_image", output_type: "image_url", is_async: true },
   chatAiNode:            { provider: "chat_ai",   feature: "chat_ai",                output_type: "text",      is_async: false },
   removeBackgroundNode:  { provider: "remove_bg", feature: "remove_background",      output_type: "image_url", is_async: false },
   upscaleImageNode:      { provider: "upscale_image", feature: "upscale_image",      output_type: "image_url", is_async: true },
@@ -307,6 +310,10 @@ export async function lookupModelDiscountPercent(
     return maxDiscountByModelKeys(supabase, feature, keys);
   }
 
+  if (providerDef.provider === "runpod_qwen") {
+    return maxDiscountByModelKeys(supabase, "generate_qwen_image", qwenRunpodPriceKeys(params));
+  }
+
   if (providerDef.provider === "openai") {
     if (providerDef.feature === "upscale_image") {
       return maxDiscountByModelKeys(supabase, "upscale_image", openAiImageEnhancePriceKeys(params));
@@ -429,6 +436,19 @@ export async function lookupBaseCost(
     if (!match) {
       throw new PricingConfigError(
         `Pricing configuration missing for Replicate image model: ${keys[0]}`
+      );
+    }
+    return match.cost;
+  }
+
+  /* ── Image (Qwen on Runpod GPU) ── */
+  if (providerDef.provider === "runpod_qwen") {
+    const keys = qwenRunpodPriceKeys(params);
+    const match = await firstCostByModelKeys(supabase, "generate_qwen_image", keys);
+
+    if (!match) {
+      throw new PricingConfigError(
+        `Pricing configuration missing for Qwen image model: ${keys[0]}`
       );
     }
     return match.cost;
@@ -907,6 +927,7 @@ function getMultiplierForNode(nodeType: string, featureMultipliers?: FeatureMult
   switch (def.provider) {
     case "banana": return featureMultipliers.image;
     case "openai": return featureMultipliers.image;
+    case "runpod_qwen": return featureMultipliers.image;
     case "seedream": return featureMultipliers.image;
     case "kling": return featureMultipliers.video;
     case "seedance": return featureMultipliers.video;
