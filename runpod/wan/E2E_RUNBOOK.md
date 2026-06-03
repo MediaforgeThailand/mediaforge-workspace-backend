@@ -37,6 +37,35 @@ Full SSH example:
 Use `-LightInstall` instead of `-Install` only when ComfyUI already exists on `/workspace/ComfyUI`
 and only Wan/Qwen dependencies need refresh.
 
+If SSH is blocked or the Basic SSH username is not available, generate a self-contained Web Terminal
+bundle locally:
+
+```powershell
+cd C:\Users\taksi\Documents\GitHub2\mediaforge-workspace-backend
+.\runpod\wan\create_web_terminal_bundle.ps1
+```
+
+Then open the RunPod Pod **Connect** tab, start **Web Terminal**, upload or paste:
+
+```text
+runpod/wan/dist/mediaforge_wan_vace_web_terminal_bundle.sh
+```
+
+Run it inside the pod:
+
+```bash
+bash mediaforge_wan_vace_web_terminal_bundle.sh
+```
+
+The bundle auto-selects full install when `/workspace/ComfyUI/venv` does not exist and light install
+when an existing ComfyUI venv is present. Override when needed:
+
+```bash
+MEDIAFORGE_INSTALL_MODE=full bash mediaforge_wan_vace_web_terminal_bundle.sh
+MEDIAFORGE_INSTALL_MODE=light bash mediaforge_wan_vace_web_terminal_bundle.sh
+MEDIAFORGE_INSTALL_MODE=none bash mediaforge_wan_vace_web_terminal_bundle.sh
+```
+
 ## 2. Runtime gates
 
 The pod must pass all gates before MediaForge sends a paid/job request:
@@ -61,11 +90,14 @@ If the external `/diagnostics` URL returns `404`, the worker is not running on p
 Only after `/diagnostics`, `/preflight`, and `/qwen/preflight` pass:
 
 ```powershell
-npx supabase secrets set `
+supabase secrets set `
   RUNPOD_WAN_WORKER_URL="https://<pod-id>-8888.proxy.runpod.net" `
   RUNPOD_QWEN_ENDPOINT_URL="https://<pod-id>-8888.proxy.runpod.net/qwen" `
   --project-ref fymncypboeubdikpbmqc
 ```
+
+Use the global `supabase` CLI here. On this workstation `npx supabase` may use a separate cached CLI
+that is not logged in.
 
 Redeploy `workspace-run-node` only if the function code changed after the last deploy.
 
