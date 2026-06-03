@@ -390,6 +390,15 @@ def int_param(params: dict[str, Any], key: str, fallback: int, minimum: int = 1,
   return max(minimum, min(maximum, value))
 
 
+def float_param(params: dict[str, Any], key: str, fallback: float, minimum: float, maximum: float) -> float:
+  raw = params.get(key, fallback)
+  try:
+    value = float(raw)
+  except (TypeError, ValueError):
+    value = fallback
+  return max(minimum, min(maximum, value))
+
+
 def bool_param(params: dict[str, Any], key: str, fallback: bool = False) -> bool:
   value = params.get(key, fallback)
   if isinstance(value, bool):
@@ -572,9 +581,9 @@ def build_prompt(params: dict[str, Any], files: dict[str, str]) -> dict[str, Any
       "width": width,
       "height": height,
       "num_frames": num_frames,
-      "strength": float(params.get("vace_strength") or 1),
-      "vace_start_percent": float(params.get("vace_start_percent") or 0),
-      "vace_end_percent": float(params.get("vace_end_percent") or 1),
+      "strength": float_param(params, "vace_strength", 0.35, 0, 2),
+      "vace_start_percent": float_param(params, "vace_start_percent", 0, 0, 1),
+      "vace_end_percent": float_param(params, "vace_end_percent", 1, 0, 1),
       "tiled_vae": bool_param(params, "tiled_vae"),
     }),
     "16": node("WanVideoSampler", {

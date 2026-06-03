@@ -152,7 +152,9 @@ function buildInput(params: Record<string, unknown>): Record<string, unknown> {
       params.invert_mask === true ||
       String(params.invert_mask ?? "off").toLowerCase() === "on" ||
       String(params.mask_polarity ?? "").toLowerCase() === "black_edits",
-    vace_strength: clampNumber(params.vace_strength, 1, 0, 2),
+    vace_strength: clampNumber(params.vace_strength, 0.35, 0, 2),
+    vace_start_percent: clampNumber(params.vace_start_percent, 0, 0, 1),
+    vace_end_percent: clampNumber(params.vace_end_percent, 1, 0, 1),
     crf: Math.round(clampNumber(params.crf, 19, 10, 35)),
     output_prefix: String(params.output_prefix ?? "mediaforge_wan_vace"),
   };

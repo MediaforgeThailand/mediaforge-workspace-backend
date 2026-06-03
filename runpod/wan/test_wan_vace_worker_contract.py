@@ -91,8 +91,21 @@ def test_vace_inputs_are_source_mask_and_reference() -> None:
   assert prompt["18"]["class_type"] == "VHS_VideoCombine"
 
 
+def test_vace_strength_respects_zero_and_timing_controls() -> None:
+  prompt = build_prompt({
+    "vace_strength": 0,
+    "vace_start_percent": 0.25,
+    "vace_end_percent": 0.75,
+  })
+  vace_inputs = prompt["15"]["inputs"]
+  assert vace_inputs["strength"] == 0
+  assert vace_inputs["vace_start_percent"] == 0.25
+  assert vace_inputs["vace_end_percent"] == 0.75
+
+
 if __name__ == "__main__":
   test_false_string_does_not_invert_mask()
   test_true_string_inverts_mask()
   test_vace_inputs_are_source_mask_and_reference()
+  test_vace_strength_respects_zero_and_timing_controls()
   print("wan_vace_worker contract tests ok")
