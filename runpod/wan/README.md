@@ -65,6 +65,7 @@ Expected local endpoints inside the pod:
 ```bash
 curl http://127.0.0.1:8188/object_info
 curl http://127.0.0.1:8888/health
+curl http://127.0.0.1:8888/diagnostics
 curl http://127.0.0.1:8888/preflight
 curl http://127.0.0.1:8888/qwen/preflight
 ```
@@ -72,6 +73,10 @@ curl http://127.0.0.1:8888/qwen/preflight
 `/preflight` checks whether the ComfyUI Wan custom nodes are installed and whether the configured
 Wan base, VACE, T5, and VAE model selectors resolve to available model files. It returns HTTP `503`
 with details when the pod is not ready.
+
+`/diagnostics` is the first endpoint to check when E2E is blocked. It reports Comfy reachability,
+required node classes, configured Wan/Qwen model file paths, file existence, and both Wan and Qwen
+preflight summaries in one response.
 
 ## Cost control
 

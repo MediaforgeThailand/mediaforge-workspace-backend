@@ -236,6 +236,85 @@ def preflight_report() -> dict[str, Any]:
   }
 
 
+def model_file_status(base: str, configured_name: str) -> dict[str, Any]:
+  rel = configured_name.replace("\\", "/").strip("/")
+  path = COMFY_DIR / "models" / base / Path(rel)
+  return {
+    "configured": configured_name,
+    "path": str(path),
+    "exists": path.exists(),
+    "size_bytes": path.stat().st_size if path.exists() else None,
+  }
+
+
+def qwen_model_file_status() -> dict[str, Any] | None:
+  if qwen_worker is None:
+    return None
+  return {
+    "image_unet": model_file_status("unet/gguf", str(qwen_worker.QWEN_IMAGE_UNET)),
+    "image_clip": model_file_status("text_encoders", str(qwen_worker.QWEN_IMAGE_CLIP)),
+    "image_vae": model_file_status("vae", str(qwen_worker.QWEN_IMAGE_VAE)),
+    "image_lora": model_file_status("loras", str(qwen_worker.QWEN_IMAGE_LORA)),
+    "edit_unet": model_file_status("unet/gguf", str(qwen_worker.QWEN_EDIT_UNET)),
+    "edit_lora": model_file_status("loras", str(qwen_worker.QWEN_EDIT_LORA)),
+  }
+
+
+def runtime_diagnostics() -> dict[str, Any]:
+  try:
+    info = get_object_info()
+    comfy_error = None
+  except Exception as exc:
+    info = {}
+    comfy_error = str(exc)
+
+  try:
+    preflight = preflight_report() if info else None
+  except Exception as exc:
+    preflight = {"status": "not_ready", "error": str(exc)}
+
+  qwen_preflight: dict[str, Any] | None = None
+  if qwen_worker is not None:
+    try:
+      qwen_preflight = qwen_worker.preflight_report()
+    except Exception as exc:
+      qwen_preflight = {"status": "not_ready", "error": str(exc)}
+
+  return {
+    "status": "ok" if preflight and preflight.get("status") == "ok" else "not_ready",
+    "worker": {
+      "server_version": Handler.server_version,
+      "host": HOST,
+      "port": PORT,
+      "comfy_url": COMFY_URL,
+      "comfy_reachable": comfy_error is None,
+      "comfy_error": comfy_error,
+      "worker_token_enabled": bool(WORKER_TOKEN),
+    },
+    "paths": {
+      "comfy_dir": {"path": str(COMFY_DIR), "exists": COMFY_DIR.exists()},
+      "comfy_input_dir": {"path": str(COMFY_INPUT_DIR), "exists": COMFY_INPUT_DIR.exists()},
+      "output_dir": {"path": str(OUTPUT_DIR), "exists": OUTPUT_DIR.exists()},
+    },
+    "node_classes": {
+      class_type: class_type in info
+      for class_type in REQUIRED_WAN_CLASSES
+    },
+    "model_files": {
+      "wan_base": model_file_status("diffusion_models", WAN_BASE_MODEL),
+      "wan_vace": model_file_status("diffusion_models", WAN_VACE_MODEL),
+      "wan_t5": model_file_status("text_encoders", WAN_T5_MODEL),
+      "wan_vae": model_file_status("vae", WAN_VAE_MODEL),
+      "qwen": qwen_model_file_status(),
+    },
+    "preflight": preflight,
+    "qwen": {
+      "importable": qwen_worker is not None,
+      "preflight": qwen_preflight,
+    },
+  }
+
+
 def localize_media_file(source_url: str, prefix: str, fallback_ext: str) -> str:
   data, content_type = http_bytes(source_url)
   ext = mimetypes.guess_extension(content_type.split(";")[0]) or fallback_ext
@@ -309,6 +388,21 @@ def int_param(params: dict[str, Any], key: str, fallback: int, minimum: int = 1,
   except (TypeError, ValueError):
     value = fallback
   return max(minimum, min(maximum, value))
+
+
+def bool_param(params: dict[str, Any], key: str, fallback: bool = False) -> bool:
+  value = params.get(key, fallback)
+  if isinstance(value, bool):
+    return value
+  if isinstance(value, (int, float)):
+    return value != 0
+  if isinstance(value, str):
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled"}:
+      return True
+    if normalized in {"0", "false", "no", "off", "disabled", ""}:
+      return False
+  return fallback
 
 
 def write_segment_file(job_id: str, index: int, data: bytes, ext: str) -> Path:
@@ -401,7 +495,7 @@ def build_prompt(params: dict[str, Any], files: dict[str, str]) -> dict[str, Any
   prompt_text = str(params.get("prompt") or "").strip()
   negative_prompt = str(params.get("negative_prompt") or "bad quality, blurry, distorted, flicker").strip()
   mask_channel = str(params.get("mask_channel") or "red")
-  invert_mask = bool(params.get("invert_mask"))
+  invert_mask = bool_param(params, "invert_mask")
 
   vace_field, vace_model = choice_value("WanVideoVACEModelSelect", WAN_VACE_MODEL, ["vace_model", "model", "model_name"])
   base_field, base_model = choice_value("WanVideoModelLoader", WAN_BASE_MODEL, ["model", "model_name"])
@@ -481,7 +575,7 @@ def build_prompt(params: dict[str, Any], files: dict[str, str]) -> dict[str, Any
       "strength": float(params.get("vace_strength") or 1),
       "vace_start_percent": float(params.get("vace_start_percent") or 0),
       "vace_end_percent": float(params.get("vace_end_percent") or 1),
-      "tiled_vae": bool(params.get("tiled_vae") or False),
+      "tiled_vae": bool_param(params, "tiled_vae"),
     }),
     "16": node("WanVideoSampler", {
       "model": ["11", 0],
@@ -624,6 +718,24 @@ class Handler(BaseHTTPRequestHandler):
   def do_GET(self) -> None:  # noqa: N802
     if self.path == "/health":
       self._send_json({"status": "ok"})
+      return
+    if self.path == "/diagnostics":
+      if self._unauthorized():
+        return
+      try:
+        report = runtime_diagnostics()
+        self._send_json(report, status=200 if report.get("status") == "ok" else 503)
+      except Exception as exc:
+        self._send_json(
+          {
+            "status": "not_ready",
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "comfy_url": COMFY_URL,
+            "worker_port": PORT,
+          },
+          status=503,
+        )
       return
     if self.path == "/qwen/health":
       if qwen_worker is None:

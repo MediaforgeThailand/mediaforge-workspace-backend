@@ -78,12 +78,12 @@ download_if_missing \
   "models/loras/Qwen-Image-Lightning-8steps-V1.0.safetensors"
 
 download_if_missing \
-  "https://huggingface.co/unsloth/Qwen-Image-Edit-2511-GGUF/resolve/main/qwen-image-edit-2511-Q4_K_M.gguf" \
-  "models/unet/gguf/qwen-image-edit-2511-Q4_K_M.gguf"
+  "https://huggingface.co/unsloth/Qwen-Image-Edit-2511-GGUF/resolve/main/qwen-image-edit-2511-Q5_0.gguf" \
+  "models/unet/gguf/qwen-image-edit-2511-Q5_0.gguf"
 
 download_if_missing \
-  "https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors" \
-  "models/loras/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
+  "https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-fp32.safetensors" \
+  "models/loras/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-fp32.safetensors"
 
 cat > /workspace/start-comfy-qwen.sh <<'EOF'
 #!/usr/bin/env bash
