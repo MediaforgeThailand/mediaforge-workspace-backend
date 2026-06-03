@@ -18,6 +18,10 @@ RUNPOD_WAN_WORKER_URL=https://<pod-id>-8888.proxy.runpod.net
 RUNPOD_QWEN_ENDPOINT_URL=https://<pod-id>-8888.proxy.runpod.net/qwen
 ```
 
+When `RUNPOD_QWEN_ENDPOINT_URL` points at the pod proxy `/qwen` route, Qwen runs through the
+same direct worker as Wan VACE. A RunPod API key is only required when using a RunPod serverless
+endpoint (`api.runpod.ai`) instead of the pod proxy.
+
 ## Pod setup
 
 Copy these files to `/workspace` on the pod:

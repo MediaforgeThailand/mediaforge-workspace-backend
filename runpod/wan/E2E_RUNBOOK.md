@@ -109,6 +109,16 @@ If the external `/diagnostics` URL returns `404`, the worker is not running on p
 Only after `/diagnostics`, `/preflight`, and `/qwen/preflight` pass:
 
 ```powershell
+.\runpod\wan\check_vfx_worker_and_configure_supabase.ps1 `
+  -PodId <pod-id> `
+  -ProjectRef fymncypboeubdikpbmqc `
+  -ConfigureSecrets
+```
+
+The helper refuses to set secrets while the worker is still returning 404/503.
+Equivalent manual command:
+
+```powershell
 supabase secrets set `
   RUNPOD_WAN_WORKER_URL="https://<pod-id>-8888.proxy.runpod.net" `
   RUNPOD_QWEN_ENDPOINT_URL="https://<pod-id>-8888.proxy.runpod.net/qwen" `

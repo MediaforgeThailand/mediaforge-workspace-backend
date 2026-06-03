@@ -61,6 +61,32 @@ function runpodApiKey(): string {
   return key;
 }
 
+function workerToken(): string {
+  return (
+    Deno.env.get("RUNPOD_QWEN_WORKER_TOKEN")?.trim() ??
+    Deno.env.get("RUNPOD_WAN_WORKER_TOKEN")?.trim() ??
+    Deno.env.get("RUNPOD_WORKER_TOKEN")?.trim() ??
+    ""
+  );
+}
+
+function isRunpodApiUrl(rawUrl: string): boolean {
+  try {
+    return new URL(rawUrl).hostname === "api.runpod.ai";
+  } catch {
+    return false;
+  }
+}
+
+function endpointAuthHeaders(rawUrl: string): HeadersInit {
+  if (isRunpodApiUrl(rawUrl)) {
+    return { Authorization: `Bearer ${runpodApiKey()}` };
+  }
+
+  const token = workerToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 function asStringArray(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
@@ -247,7 +273,7 @@ export async function executeRunpodQwen(
   const response = await fetch(`${base}/run`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${runpodApiKey()}`,
+      ...endpointAuthHeaders(base),
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ input }),
@@ -304,7 +330,7 @@ export async function pollRunpodQwenOnce(args: {
   const url = alreadyHasTask ? endpoint : `${endpoint}/${encodeURIComponent(args.taskId)}`;
   const response = await fetch(url, {
     method: "GET",
-    headers: { Authorization: `Bearer ${runpodApiKey()}` },
+    headers: endpointAuthHeaders(url),
   });
   const text = await response.text();
   let payload: Record<string, unknown> = {};
