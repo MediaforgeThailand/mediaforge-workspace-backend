@@ -26,9 +26,21 @@ if [ ! -f "$WORKER_DIR/qwen_worker.py" ]; then
 fi
 
 COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:-}"
-if ! command -v nvidia-smi >/dev/null 2>&1 && [ -z "$COMFY_EXTRA_ARGS" ]; then
+HAS_CUDA=0
+TOTAL_VRAM_MB=0
+if command -v nvidia-smi >/dev/null 2>&1; then
+  HAS_CUDA=1
+  TOTAL_VRAM_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -d ' ' || echo 0)"
+elif "$COMFY_DIR/venv/bin/python" -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)" >/dev/null 2>&1; then
+  HAS_CUDA=1
+fi
+
+if [ "$HAS_CUDA" != "1" ] && [ -z "$COMFY_EXTRA_ARGS" ]; then
   COMFY_EXTRA_ARGS="--cpu"
-  echo "No NVIDIA driver detected; starting ComfyUI in CPU compatibility mode."
+  echo "No CUDA runtime detected; starting ComfyUI in CPU compatibility mode."
+elif [ "$HAS_CUDA" = "1" ] && [ -z "$COMFY_EXTRA_ARGS" ] && [ "${TOTAL_VRAM_MB:-0}" -gt 0 ] && [ "$TOTAL_VRAM_MB" -le 24576 ]; then
+  COMFY_EXTRA_ARGS="--lowvram"
+  echo "Detected ${TOTAL_VRAM_MB}MB VRAM; starting ComfyUI with --lowvram for Wan/Qwen stability."
 fi
 
 if ! pgrep -af "python main.py --listen 0.0.0.0 --port 8188" >/dev/null 2>&1; then

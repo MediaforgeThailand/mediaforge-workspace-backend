@@ -4,10 +4,22 @@ set -euo pipefail
 COMFY_DIR="${COMFY_DIR:-/workspace/ComfyUI}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y ffmpeg
+fi
+
 mkdir -p /workspace
 cd /workspace
 
 if [ ! -d "$COMFY_DIR/.git" ]; then
+  git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
+fi
+
+if [ ! -f "$COMFY_DIR/requirements.txt" ]; then
+  echo "ComfyUI checkout is incomplete; recreating $COMFY_DIR"
+  rm -rf "$COMFY_DIR"
   git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
 fi
 
@@ -20,10 +32,16 @@ fi
 
 source venv/bin/activate
 python -m pip install --upgrade pip wheel setuptools
-python -m pip install -r requirements.txt
+grep -vE '^(torch|torchvision|torchaudio)([<>= ].*)?$' requirements.txt > /tmp/comfy_requirements_no_torch.txt
 python -m pip install --force-reinstall --no-cache-dir \
   torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
   --index-url "${PYTORCH_CUDA_INDEX_URL:-https://download.pytorch.org/whl/cu124}"
+cat > /tmp/mediaforge_torch_constraints.txt <<'EOF'
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+EOF
+python -m pip install -c /tmp/mediaforge_torch_constraints.txt -r /tmp/comfy_requirements_no_torch.txt
 
 mkdir -p custom_nodes
 cd custom_nodes
@@ -59,12 +77,27 @@ python -m pip install --upgrade huggingface_hub accelerate safetensors imageio i
 
 mkdir -p models/diffusion_models/WanVideo models/text_encoders models/vae/wanvideo models/vae models/loras models/unet/gguf input output temp
 
+validate_download() {
+  local out_path="$1"
+  local min_bytes="${2:-10485760}"
+  local size
+  size=$(wc -c < "$out_path" 2>/dev/null || echo 0)
+  if [ "$size" -lt "$min_bytes" ]; then
+    echo "download failed or too small: $out_path ($size bytes, expected >= $min_bytes)" >&2
+    head -c 300 "$out_path" 2>/dev/null >&2 || true
+    echo >&2
+    return 1
+  fi
+}
+
 hf_download() {
   local repo="$1"
   local file="$2"
   local out_dir="$3"
+  local min_bytes="${4:-10485760}"
   if [ -s "$out_dir/$file" ]; then
     echo "exists: $out_dir/$file"
+    validate_download "$out_dir/$file" "$min_bytes"
     return 0
   fi
   echo "downloading: $repo/$file"
@@ -72,13 +105,16 @@ hf_download() {
   curl -L --retry 8 --retry-delay 5 --continue-at - \
     "https://huggingface.co/$repo/resolve/main/$file?download=true" \
     -o "$out_dir/$file"
+  validate_download "$out_dir/$file" "$min_bytes"
 }
 
 hf_download_url() {
   local url="$1"
   local out_path="$2"
+  local min_bytes="${3:-10485760}"
   if [ -s "$out_path" ]; then
     echo "exists: $out_path"
+    validate_download "$out_path" "$min_bytes"
     return 0
   fi
   echo "downloading: $out_path"
@@ -86,6 +122,7 @@ hf_download_url() {
   curl -L --retry 8 --retry-delay 5 --continue-at - \
     "$url" \
     -o "$out_path"
+  validate_download "$out_path" "$min_bytes"
 }
 
 hf_download Kijai/WanVideo_comfy Wan2_1-T2V-1_3B_bf16.safetensors models/diffusion_models/WanVideo

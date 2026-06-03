@@ -6,6 +6,8 @@ param(
 
   [int]$Port = 0,
 
+  [int]$WorkerPort = 8888,
+
   [switch]$Install,
 
   [switch]$LightInstall,
@@ -55,29 +57,19 @@ function Send-RemoteFile {
   $remoteDir = $normalizedRemotePath.Substring(0, $normalizedRemotePath.LastIndexOf("/"))
   Invoke-Remote "mkdir -p '$remoteDir'"
 
-  $args = Get-SshArgs "cat > '$normalizedRemotePath'"
-  $psi = [System.Diagnostics.ProcessStartInfo]::new()
-  $psi.FileName = "ssh"
-  foreach ($arg in $args) {
-    [void]$psi.ArgumentList.Add($arg)
+  $args = @(
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "ServerAliveInterval=30",
+    "-i", $IdentityPath.Path
+  )
+  if ($Port -gt 0) {
+    $args += @("-P", [string]$Port)
   }
-  $psi.RedirectStandardInput = $true
-  $psi.RedirectStandardOutput = $true
-  $psi.RedirectStandardError = $true
-  $psi.UseShellExecute = $false
-  $process = [System.Diagnostics.Process]::Start($psi)
-  try {
-    $bytes = [System.IO.File]::ReadAllBytes($resolved.Path)
-    $process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
-    $process.StandardInput.Close()
-    $stdout = $process.StandardOutput.ReadToEnd()
-    $stderr = $process.StandardError.ReadToEnd()
-    $process.WaitForExit()
-    if ($process.ExitCode -ne 0) {
-      throw "Upload failed: $normalizedRemotePath`n$stdout`n$stderr"
-    }
-  } finally {
-    $process.Dispose()
+  $args += @($resolved.Path, "${SshUserHost}:$normalizedRemotePath")
+
+  & scp @args
+  if ($LASTEXITCODE -ne 0) {
+    throw "Upload failed: $normalizedRemotePath"
   }
 }
 
@@ -113,11 +105,11 @@ if ($LightInstall) {
 
 if ($StartServices) {
   Write-Host "Starting ComfyUI and MediaForge Wan VACE worker..."
-  Invoke-Remote "/workspace/start_wan_vace_services.sh"
+  Invoke-Remote "WAN_WORKER_PORT=$WorkerPort /workspace/start_wan_vace_services.sh"
 }
 
 Write-Host "Checking worker endpoints if service is already running..."
-Invoke-Remote "curl -fsS http://127.0.0.1:8888/health || true"
-Invoke-Remote "curl -fsS http://127.0.0.1:8888/diagnostics || true"
+Invoke-Remote "curl -fsS http://127.0.0.1:$WorkerPort/health || true"
+Invoke-Remote "curl -fsS http://127.0.0.1:$WorkerPort/diagnostics || true"
 
 Write-Host "Done. If diagnostics is not ok, inspect /workspace/wan_vace_worker.log and /workspace/comfy_wan_vace.log on the pod."

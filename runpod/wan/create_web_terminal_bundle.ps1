@@ -90,7 +90,7 @@ foreach ($file in $files) {
 [void]$builder.AppendLine("")
 [void]$builder.AppendLine("/workspace/start_wan_vace_services.sh")
 [void]$builder.AppendLine("echo")
-[void]$builder.AppendLine("echo 'External checks should pass when RunPod exposes port 8888:'")
+[void]$builder.AppendLine('echo "External checks should pass when RunPod exposes port ${WAN_WORKER_PORT:-8888}:"')
 [void]$builder.AppendLine("echo '  /health'")
 [void]$builder.AppendLine("echo '  /diagnostics'")
 [void]$builder.AppendLine("echo '  /preflight'")

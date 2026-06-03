@@ -103,10 +103,10 @@ def http_bytes(url: str, timeout: int = 90) -> tuple[bytes, str]:
         return res.read(), res.headers.get_content_type() or "application/octet-stream"
 
 
-def get_object_info() -> dict[str, Any]:
+def get_object_info(force_refresh: bool = False) -> dict[str, Any]:
     global OBJECT_INFO
     with OBJECT_INFO_LOCK:
-        if OBJECT_INFO is None:
+        if force_refresh or OBJECT_INFO is None:
             OBJECT_INFO = http_json("GET", f"{COMFY_URL}/object_info", timeout=60)
         return OBJECT_INFO
 
@@ -158,8 +158,8 @@ def model_choice_report(class_type: str, field: str, preferred: str) -> dict[str
     }
 
 
-def preflight_report() -> dict[str, Any]:
-    info = get_object_info()
+def preflight_report(force_refresh: bool = True) -> dict[str, Any]:
+    info = get_object_info(force_refresh=force_refresh)
     loader_class = choose_unet_loader_class()
     missing_classes = [
         class_type

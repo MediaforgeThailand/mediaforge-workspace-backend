@@ -2,6 +2,7 @@ param(
   [string]$PodId = "ospyvnt7kg7m9x",
   [string]$ProjectRef = "fymncypboeubdikpbmqc",
   [string]$BaseUrl = "",
+  [int]$WorkerPort = 8888,
   [int]$TimeoutSec = 20,
   [switch]$ConfigureSecrets
 )
@@ -12,7 +13,7 @@ if (-not $BaseUrl) {
   if (-not $PodId) {
     throw "Pass -PodId or -BaseUrl."
   }
-  $BaseUrl = "https://$PodId-8888.proxy.runpod.net"
+  $BaseUrl = "https://$PodId-$WorkerPort.proxy.runpod.net"
 }
 $BaseUrl = $BaseUrl.TrimEnd("/")
 
@@ -24,13 +25,14 @@ function Invoke-WorkerJson {
   $url = "$BaseUrl$Path"
   try {
     $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec $TimeoutSec
+    $status = if ($response.status) { [string]$response.status } else { "ok" }
     [pscustomobject]@{
       Path = $Path
       Url = $url
-      Ok = $true
-      Status = if ($response.status) { [string]$response.status } else { "ok" }
+      Ok = ($status -eq "ok")
+      Status = $status
       Response = $response
-      Error = $null
+      Error = if ($status -eq "ok") { $null } else { "Unexpected status: $status" }
     }
   } catch {
     [pscustomobject]@{
@@ -59,7 +61,7 @@ foreach ($check in $checks) {
   }
 }
 
-$failed = $checks | Where-Object { -not $_.Ok }
+$failed = @($checks | Where-Object { -not $_.Ok })
 if ($failed.Count -gt 0) {
   Write-Host ""
   Write-Host "Worker is not ready. Do not configure Supabase secrets yet." -ForegroundColor Yellow

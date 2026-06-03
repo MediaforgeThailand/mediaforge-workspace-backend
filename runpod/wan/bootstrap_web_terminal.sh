@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REF="${MEDIAFORGE_BACKEND_REF:-b37f0f15feec4fda5984d2e24d773ba5fc6fbbde}"
+REF="${MEDIAFORGE_BACKEND_REF:-main}"
 RAW_BASE="${MEDIAFORGE_BACKEND_RAW_BASE:-https://raw.githubusercontent.com/MediaforgeThailand/mediaforge-workspace-backend/${REF}}"
 BUNDLE_URL="${RAW_BASE}/runpod/wan/dist/mediaforge_wan_vace_web_terminal_bundle.sh"
 BUNDLE_PATH="${MEDIAFORGE_BUNDLE_PATH:-/workspace/mediaforge_wan_vace_web_terminal_bundle.sh}"
