@@ -44,10 +44,17 @@ The easiest path is a one-line bootstrap from the pushed repo:
 curl -fsSL https://raw.githubusercontent.com/MediaforgeThailand/mediaforge-workspace-backend/main/runpod/wan/bootstrap_web_terminal.sh | bash
 ```
 
-The bootstrap downloads and runs the self-contained bundle from:
+The bootstrap pins its bundle download to the checked commit by default so GitHub raw/CDN cache cannot
+serve an older generated bundle. Override only when intentionally testing another branch/commit:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MediaforgeThailand/mediaforge-workspace-backend/main/runpod/wan/bootstrap_web_terminal.sh | MEDIAFORGE_BACKEND_REF=main bash
+```
+
+By default it downloads and runs the self-contained bundle from:
 
 ```text
-https://raw.githubusercontent.com/MediaforgeThailand/mediaforge-workspace-backend/main/runpod/wan/dist/mediaforge_wan_vace_web_terminal_bundle.sh
+https://raw.githubusercontent.com/MediaforgeThailand/mediaforge-workspace-backend/b37f0f15feec4fda5984d2e24d773ba5fc6fbbde/runpod/wan/dist/mediaforge_wan_vace_web_terminal_bundle.sh
 ```
 
 If raw GitHub download is blocked, generate the self-contained Web Terminal bundle locally:
