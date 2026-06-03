@@ -97,5 +97,6 @@ foreach ($file in $files) {
 [void]$builder.AppendLine("echo '  /qwen/preflight'")
 
 $bundle = $builder.ToString().Replace("`r`n", "`n")
-[System.IO.File]::WriteAllText($OutputFullPath, $bundle, [System.Text.Encoding]::UTF8)
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[System.IO.File]::WriteAllText($OutputFullPath, $bundle, $utf8NoBom)
 Write-Host "Wrote $OutputFullPath"
