@@ -62,6 +62,17 @@ export const HANDLE_SCHEMA: Record<string, Record<string, HandleDef>> = {
     mask_image:    { internal_key: "mask_image_url", data_type: "image" },
     mask:          { internal_key: "mask_image_url", data_type: "image" },
   },
+  runpod_wan_vace: {
+    input_video:   { internal_key: "source_video_url", data_type: "video" },
+    source_video:  { internal_key: "source_video_url", data_type: "video" },
+    video:         { internal_key: "source_video_url", data_type: "video" },
+    ref_video:     { internal_key: "source_video_url", data_type: "video" },
+    mask_video:    { internal_key: "mask_video_url",   data_type: "video" },
+    src_mask:      { internal_key: "mask_video_url",   data_type: "video" },
+    ref_image:     { internal_key: "ref_image_url",    data_type: "image" },
+    start_image:   { internal_key: "ref_image_url",    data_type: "image" },
+    image:         { internal_key: "ref_image_url",    data_type: "image" },
+  },
   seedream: {
     ref_image:     { internal_key: "image_url",      data_type: "image" },
     image_input:   { internal_key: "image_url",      data_type: "image" },

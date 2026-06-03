@@ -283,6 +283,21 @@ function comparableTranscriptText(value?: string | null): string {
     .replace(/[\s"'`.,;:!?…。，、！？()[\]{}<>|\/\\\-–—_*+=~@#$%^&]+/g, "");
 }
 
+function orderedCharacterCoverageRatio(source: string, candidate: string): number {
+  if (!source) return 1;
+  if (!candidate) return 0;
+
+  let matched = 0;
+  let cursor = 0;
+  for (const char of source) {
+    const index = candidate.indexOf(char, cursor);
+    if (index < 0) continue;
+    matched += 1;
+    cursor = index + char.length;
+  }
+  return matched / Array.from(source).length;
+}
+
 function extractAsciiTerms(value?: string | null): string[] {
   const terms = new Set<string>();
   const matches = (value ?? "").match(/[A-Za-z][A-Za-z0-9+._-]*/g) ?? [];
@@ -320,6 +335,14 @@ function normalizerPreservesTranscript(
     resultComparable.length < sourceComparable.length * 0.72
   ) {
     return false;
+  }
+
+  if (textLooksThai(sourceText) && sourceComparable.length >= 16) {
+    const sourceCoverage = orderedCharacterCoverageRatio(
+      sourceComparable,
+      resultComparable,
+    );
+    if (sourceCoverage < 0.88) return false;
   }
 
   const resultSurface = comparableTranscriptText(

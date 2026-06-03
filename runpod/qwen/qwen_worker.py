@@ -37,12 +37,46 @@ QWEN_IMAGE_UNET = os.environ.get("QWEN_IMAGE_UNET", "qwen-image-Q4_K_M.gguf")
 QWEN_IMAGE_CLIP = os.environ.get("QWEN_IMAGE_CLIP", "qwen_2.5_vl_7b_fp8_scaled.safetensors")
 QWEN_IMAGE_VAE = os.environ.get("QWEN_IMAGE_VAE", "qwen_image_vae.safetensors")
 QWEN_IMAGE_LORA = os.environ.get("QWEN_IMAGE_LORA", "Qwen-Image-Lightning-8steps-V1.0.safetensors")
-QWEN_EDIT_UNET = os.environ.get("QWEN_EDIT_UNET", "qwen-image-edit-2511-Q4_K_M.gguf")
-QWEN_EDIT_LORA = os.environ.get("QWEN_EDIT_LORA", "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
+QWEN_EDIT_UNET = os.environ.get("QWEN_EDIT_UNET", "qwen-image-edit-2511-Q5_0.gguf")
+QWEN_EDIT_LORA = os.environ.get("QWEN_EDIT_LORA", "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-fp32.safetensors")
+
+REQUIRED_QWEN_CLASSES = (
+    "CLIPLoader",
+    "VAELoader",
+    "KSampler",
+    "VAEDecode",
+    "SaveImage",
+    "TextEncodeQwenImageEditPlus",
+    "FluxKontextImageScale",
+    "FluxKontextMultiReferenceLatentMethod",
+    "VAEEncode",
+    "ModelSamplingAuraFlow",
+    "CFGNorm",
+)
 
 JOBS: dict[str, dict[str, Any]] = {}
 OBJECT_INFO: dict[str, Any] | None = None
 OBJECT_INFO_LOCK = threading.Lock()
+
+
+def choose_unet_loader_class() -> str:
+    """Support both ComfyUI-GGUF node names seen in community workflows."""
+    info = get_object_info()
+    if "LoaderGGUF" in info:
+        return "LoaderGGUF"
+    if "UnetLoaderGGUF" in info:
+        return "UnetLoaderGGUF"
+    return "UNETLoader"
+
+
+def uses_gguf_loader(loader_class: str) -> bool:
+    return loader_class in {"LoaderGGUF", "UnetLoaderGGUF"}
+
+
+def flag_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
 def http_json(method: str, url: str, payload: Any | None = None, timeout: int = 30) -> Any:
@@ -100,6 +134,73 @@ def model_choice(class_type: str, field: str, preferred: str) -> str:
         if preferred_tail in str(choice).replace("\\", "/").lower():
             return str(choice)
     raise RuntimeError(f"Model not found for {class_type}.{field}: {preferred}")
+
+
+def model_choice_report(class_type: str, field: str, preferred: str) -> dict[str, Any]:
+    info = get_object_info().get(class_type, {})
+    required = info.get("input", {}).get("required", {})
+    choices_raw = required.get(field, [None])[0]
+    choices = [str(v) for v in choices_raw] if isinstance(choices_raw, list) else []
+    try:
+        selected = model_choice(class_type, field, preferred)
+        error_msg = ""
+    except Exception as exc:
+        selected = preferred
+        error_msg = str(exc)
+    return {
+        "class_type": class_type,
+        "field": field,
+        "requested": preferred,
+        "selected": selected,
+        "available": selected in choices if choices else None,
+        "choices_count": len(choices),
+        "error": error_msg or None,
+    }
+
+
+def preflight_report() -> dict[str, Any]:
+    info = get_object_info()
+    loader_class = choose_unet_loader_class()
+    missing_classes = [
+        class_type
+        for class_type in REQUIRED_QWEN_CLASSES
+        if class_type not in info
+    ]
+    if loader_class not in info:
+        missing_classes.append(loader_class)
+    if "LoraLoaderModelOnly" not in info:
+        missing_classes.append("LoraLoaderModelOnly")
+
+    image_unet = QWEN_IMAGE_UNET if uses_gguf_loader(loader_class) else "qwen_image_fp8_e4m3fn.safetensors"
+    edit_unet = QWEN_EDIT_UNET if uses_gguf_loader(loader_class) else "qwen_image_edit_2511_bf16.safetensors"
+    models = {
+        "image_unet": model_choice_report(loader_class, "unet_name", image_unet)
+        if loader_class in info else None,
+        "edit_unet": model_choice_report(loader_class, "unet_name", edit_unet)
+        if loader_class in info else None,
+        "clip": model_choice_report("CLIPLoader", "clip_name", QWEN_IMAGE_CLIP)
+        if "CLIPLoader" in info else None,
+        "vae": model_choice_report("VAELoader", "vae_name", QWEN_IMAGE_VAE)
+        if "VAELoader" in info else None,
+        "image_lora": model_choice_report("LoraLoaderModelOnly", "lora_name", QWEN_IMAGE_LORA)
+        if "LoraLoaderModelOnly" in info else None,
+        "edit_lora": model_choice_report("LoraLoaderModelOnly", "lora_name", QWEN_EDIT_LORA)
+        if "LoraLoaderModelOnly" in info else None,
+    }
+    unavailable_models = [
+        key
+        for key, row in models.items()
+        if isinstance(row, dict) and row.get("available") is False
+    ]
+    status = "ok" if not missing_classes and not unavailable_models else "not_ready"
+    return {
+        "status": status,
+        "comfy_url": COMFY_URL,
+        "worker_port": PORT,
+        "loader_class": loader_class,
+        "missing_classes": missing_classes,
+        "models": models,
+    }
 
 
 def upload_to_comfy(source_url: str, prefix: str) -> str:
@@ -212,11 +313,11 @@ def composite_with_mask(
 
 
 def build_qwen_image_prompt(params: dict[str, Any]) -> dict[str, Any]:
-    loader_class = "UnetLoaderGGUF" if "UnetLoaderGGUF" in get_object_info() else "UNETLoader"
+    loader_class = choose_unet_loader_class()
     require_class("CLIPLoader")
     require_class("VAELoader")
     require_class("KSampler")
-    preferred_unet = QWEN_IMAGE_UNET if loader_class == "UnetLoaderGGUF" else "qwen_image_fp8_e4m3fn.safetensors"
+    preferred_unet = QWEN_IMAGE_UNET if uses_gguf_loader(loader_class) else "qwen_image_fp8_e4m3fn.safetensors"
     unet_name = model_choice(loader_class, "unet_name", preferred_unet)
     clip_name = model_choice("CLIPLoader", "clip_name", QWEN_IMAGE_CLIP)
     vae_name = model_choice("VAELoader", "vae_name", QWEN_IMAGE_VAE)
@@ -232,7 +333,7 @@ def build_qwen_image_prompt(params: dict[str, Any]) -> dict[str, Any]:
     scheduler = str(params.get("scheduler") or "simple")
     denoise = float(params.get("denoise") if params.get("denoise") is not None else 1)
     batch_size = int(params.get("batch_size") or 1)
-    lightning = bool(params.get("lightning_lora"))
+    lightning = flag_enabled(params.get("lightning_lora"))
     if lightning:
         steps = min(steps, 8)
         cfg = min(cfg, 1.0)
@@ -287,9 +388,9 @@ def build_qwen_edit_prompt(params: dict[str, Any]) -> dict[str, Any]:
     require_class("FluxKontextImageScale")
     require_class("FluxKontextMultiReferenceLatentMethod")
     require_class("KSampler")
-    loader_class = "UnetLoaderGGUF" if "UnetLoaderGGUF" in get_object_info() else "UNETLoader"
+    loader_class = choose_unet_loader_class()
     unet_field = "unet_name"
-    preferred_unet = QWEN_EDIT_UNET if loader_class == "UnetLoaderGGUF" else "qwen_image_edit_2511_bf16.safetensors"
+    preferred_unet = QWEN_EDIT_UNET if uses_gguf_loader(loader_class) else "qwen_image_edit_2511_bf16.safetensors"
     unet_name = model_choice(loader_class, unet_field, preferred_unet)
     clip_name = model_choice("CLIPLoader", "clip_name", QWEN_IMAGE_CLIP)
     vae_name = model_choice("VAELoader", "vae_name", QWEN_IMAGE_VAE)
@@ -309,7 +410,7 @@ def build_qwen_edit_prompt(params: dict[str, Any]) -> dict[str, Any]:
     sampler = str(params.get("sampler_name") or "euler")
     scheduler = str(params.get("scheduler") or "simple")
     denoise = float(params.get("denoise") if params.get("denoise") is not None else 1)
-    lightning = bool(params.get("lightning_lora"))
+    lightning = flag_enabled(params.get("lightning_lora"))
     if lightning:
         steps = min(steps, 4)
         cfg = min(cfg, 1.0)
@@ -461,6 +562,7 @@ class Handler(BaseHTTPRequestHandler):
                         "comfy_url": COMFY_URL,
                         "nodes": {
                             "UNETLoader": "UNETLoader" in info,
+                            "LoaderGGUF": "LoaderGGUF" in info,
                             "UnetLoaderGGUF": "UnetLoaderGGUF" in info,
                             "TextEncodeQwenImageEditPlus": "TextEncodeQwenImageEditPlus" in info,
                         },
@@ -468,6 +570,25 @@ class Handler(BaseHTTPRequestHandler):
                 )
             except Exception as exc:
                 self._json(503, {"status": "error", "error": str(exc)})
+            return
+        if self.path == "/preflight":
+            if not self._auth_ok():
+                self._json(401, {"error": "unauthorized"})
+                return
+            try:
+                report = preflight_report()
+                self._json(200 if report.get("status") == "ok" else 503, report)
+            except Exception as exc:
+                self._json(
+                    503,
+                    {
+                        "status": "not_ready",
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                        "comfy_url": COMFY_URL,
+                        "worker_port": PORT,
+                    },
+                )
             return
         if self.path.startswith("/status/"):
             if not self._auth_ok():

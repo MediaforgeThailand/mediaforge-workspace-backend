@@ -343,6 +343,23 @@ const VEO_ROWS: CreditCostWriteRow[] = ([
   notes: `Replicate google/veo-3.1 ${row.audio ? "with_audio" : "without_audio"} rate ${row.usdPerSecond} USD/sec -> ${USD_TO_THB} THB/USD -> ${WORKSPACE_CREDITS_PER_THB} credits/THB. Gemini API does not expose a no-audio parameter, so no-audio jobs are routed through fallback wrappers when available.`,
 }));
 
+const WAN_VACE_ROWS: CreditCostWriteRow[] = [
+  {
+    feature: "generate_freepik_video",
+    model: "wan2.1-vace-1.3b-runpod",
+    label: "Wan 2.1 VACE 1.3B on RunPod",
+    cost: 900,
+    pricing_type: "fixed",
+    provider: "runpod",
+    price_key: "wan2.1-vace-1.3b-runpod",
+    resolution: "480p",
+    source: "official_docs",
+    source_url: "https://github.com/Wan-Video/Wan2.1",
+    provider_unit: "per short VACE video job",
+    notes: "Initial fixed MVP price for source video + mask video + reference image Wan VACE jobs on RTX 4000 Ada. Defaults target 480p and 49 frames; tune after runtime telemetry.",
+  },
+];
+
 const ELEVENLABS_TTS_ROWS: CreditCostWriteRow[] = [
   {
     model: "elevenlabs-multilingual-v2",
@@ -439,6 +456,7 @@ const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   ...KLING_REPLICATE_PARITY_ROWS,
   ...SEEDANCE_ROWS,
   ...VEO_ROWS,
+  ...WAN_VACE_ROWS,
   { feature: "generate_seedream_image", model: "seedream-5-0-260128", label: "Seedream 5.0", cost: 60, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-5-0-260128", source: "master_pricing_sheet", source_url: "https://www.byteplus.com/en/product/modelark", provider_unit: "per image", notes: "Master Pricing Sheet: $0.035/image -> approx 60 credits/image at Workspace ratio." },
   { feature: "generate_seedream_image", model: "seedream-5-0", label: "Seedream 5.0 alias", cost: 60, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-5-0-260128", source: "master_pricing_sheet", source_url: "https://www.byteplus.com/en/product/modelark", provider_unit: "per image", notes: "Runtime alias for Seedream 5.0." },
   { feature: "generate_seedream_image", model: "seedream-5-0-lite-260128", label: "Seedream 5.0 Lite", cost: 60, pricing_type: "per_operation", provider: "byteplus", price_key: "seedream-5-0-lite-260128", source: "master_pricing_sheet", source_url: "https://www.byteplus.com/en/product/modelark", provider_unit: "per image", notes: "Master Pricing Sheet: Seedream 5.0 Lite official $0.035/image -> 60 credits/image." },
@@ -470,13 +488,12 @@ const RECOMMENDED_WORKSPACE_PRICING: CreditCostWriteRow[] = [
   { feature: "model_3d", model: "tripo3d-turbo", label: "Tripo3D Turbo", cost: 500, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-turbo", quality: "fast", source: "master_pricing_sheet", source_url: "https://www.tripo3d.ai/", provider_unit: "per model", notes: "Master Pricing Sheet: Turbo approx 500 credits/model." },
   { feature: "model_3d", model: "tripo3d-v3.0", label: "Tripo3D v3.0", cost: 500, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v3.0", source: "needs_provider_invoice", provider_unit: "per model", notes: "Emergency pricing floor: previous placeholder was 1 credit and could undercharge. Use the Turbo floor until the provider invoice/SKU rate is confirmed." },
   { feature: "model_3d", model: "tripo3d-v2.5", label: "Tripo3D v2.5", cost: 500, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v2.5", source: "needs_provider_invoice", provider_unit: "per model", notes: "Emergency pricing floor: previous placeholder was 1 credit and could undercharge. Use the Turbo floor until the provider invoice/SKU rate is confirmed." },
+  { feature: "model_3d", model: "hyper3d-gen2-260112", label: "Hyper3D Gen 2", cost: 900, pricing_type: "per_operation", provider: "hyper3d", price_key: "hyper3d-gen2-260112", source: "needs_provider_invoice", provider_unit: "per model", notes: "Emergency pricing floor: UI exposes Hyper3D Gen 2 in Workspace 3D. Keep aligned with the detailed 3D floor until provider invoice/SKU data is reconciled." },
   { feature: "model_3d", model: "tripo3d-v2.0", label: "Tripo3D v2.0", cost: 500, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v2.0", source: "needs_provider_invoice", provider_unit: "per model", notes: "Emergency pricing floor: previous placeholder was 1 credit and could undercharge. Use the Turbo floor until the provider invoice/SKU rate is confirmed." },
   { feature: "model_3d", model: "tripo3d-v1.4", label: "Tripo3D v1.4", cost: 500, pricing_type: "per_operation", provider: "tripo3d", price_key: "tripo3d-v1.4", source: "needs_provider_invoice", provider_unit: "per model", notes: "Emergency pricing floor: previous placeholder was 1 credit and could undercharge. Use the Turbo floor until the provider invoice/SKU rate is confirmed." },
   { feature: "remove_background", model: "freepik-remove-bg", label: "Remove Background (Freepik/Magnific)", cost: 20, pricing_type: "per_operation", provider: "freepik", price_key: "freepik-remove-bg", source: "official_docs", source_url: "https://docs.freepik.com/api-reference/remove-background/overview", provider_unit: "per image", notes: "Workspace remove_bg now calls Freepik/Magnific remove-background. Legacy saved nodes using replicate-birefnet are normalized at runtime and still priced through this row." },
-  { feature: "upscale_image", model: "magnific-upscale-precision-v2", label: "Upscale Image (Magnific Precision V2)", cost: 5, pricing_type: "per_operation", provider: "magnific", price_key: "magnific-upscale-precision-v2", source: "legacy_workspace_pricing", source_url: "https://docs.magnific.com/api-reference/image-upscaler-precision-v2/post-image-upscaler-precision-v2", provider_unit: "per image", notes: "Keeps the legacy workspace upscale_image baseline (5 credits/op) while routing runtime to Magnific Precision V2. Update after provider invoice/SKU review." },
   { feature: "merge_audio_video", model: "shotstack", label: "Merge Audio + Video (Shotstack short clip)", cost: 100, pricing_type: "per_operation", provider: "shotstack", price_key: "shotstack:short-op", source: "master_pricing_sheet", provider_unit: "per short operation", notes: "Master Pricing Sheet: use 100 credits/op for short clips <=10s until runtime tracks media duration per minute." },
   { feature: "merge_audio_video", model: "shotstack:per-minute", label: "Merge Audio + Video (Shotstack per minute)", cost: 500, pricing_type: "per_minute", provider: "shotstack", price_key: "shotstack:per-minute", source: "master_pricing_sheet", provider_unit: "per minute", notes: "Master Pricing Sheet: Shotstack PAYG/subscription blended recommendation = 500 credits/minute." },
-  { feature: "mp3_input", model: "mp3-input", label: "MP3 Input", cost: 1, pricing_type: "per_operation", provider: "internal", price_key: "mp3-input", source: "internal_metering", provider_unit: "per file", notes: "Infrastructure-only operation. No external generation API call." },
 ];
 
 function pricingRowKey(row: Pick<CreditCostWriteRow, "feature" | "model" | "duration_seconds" | "has_audio">): string {
@@ -1251,6 +1268,15 @@ async function cleanupLegacyPricingRows(client: SupabaseClient): Promise<number>
       .delete()
       .eq("feature", "generate_freepik_video")
       .like("model", "seedance-1-0%"),
+    client
+      .from("credit_costs")
+      .delete()
+      .eq("feature", "upscale_image")
+      .eq("model", "magnific-upscale-precision-v2"),
+    client
+      .from("credit_costs")
+      .delete()
+      .eq("feature", "mp3_input"),
   ];
   for (const deleteQuery of staleDeletes) {
     const { count, error } = await deleteQuery.select("id", { count: "exact", head: true });

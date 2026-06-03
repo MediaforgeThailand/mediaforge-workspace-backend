@@ -36,6 +36,10 @@ import {
   pollRunpodQwenOnce,
 } from "../_shared/runpodQwen.ts";
 import {
+  executeRunpodWanVace,
+  pollRunpodWanVaceOnce,
+} from "../_shared/runpodWan.ts";
+import {
   HYPER3D_BASE,
   HYPER3D_TASKS_PATH,
   executeHyper3D,
@@ -72,7 +76,6 @@ import {
 import { executeRemoveBg } from "../_shared/removeBg.ts";
 import {
   executeMagnificUpscale,
-  MAGNIFIC_UPSCALE_MODEL,
   MAGNIFIC_UPSCALE_PATH,
   MAGNIFIC_VIDEO_UPSCALE_PATH,
 } from "../_shared/magnificUpscale.ts";
@@ -187,6 +190,7 @@ function getProviderForNodeType(
     return "banana";
   }
   if (nodeType === "vfxQwenImageNode") return "runpod_qwen";
+  if (nodeType === "vfxWanVaceNode") return "runpod_wan_vace";
   if (nodeType === "klingVideoNode" || nodeType === "videoGenNode") {
     if (m.startsWith("replicate-veo")) return "replicate_veo";
     if (m.startsWith("replicate-kling")) return "replicate_video";
@@ -198,10 +202,7 @@ function getProviderForNodeType(
   if (nodeType === "seedDreamNode") return "seedream";
   if (nodeType === "seedDanceNode") return m.startsWith("replicate-seedance") ? "replicate_video" : "seedance";
   if (nodeType === "removeBackgroundNode") return "remove_bg";
-  if (nodeType === "upscaleImageNode") {
-    if (m.startsWith("gpt-image-2-enhance") || m === "gpt-image-2") return "openai";
-    return "upscale_image";
-  }
+  if (nodeType === "upscaleImageNode") return "openai";
   if (nodeType === "mergeAudioNode") return "merge_audio";
   if (nodeType === "voiceTranslateNode") return "elevenlabs_dubbing";
   if (nodeType === "autoSubtitleNode") return "auto_subtitle";
@@ -244,7 +245,7 @@ function workspaceProviderDef(
 ): ProviderDef {
   const p = provider as ProviderKey;
   const output: ProviderDef["output_type"] =
-    p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "merge_audio" || p === "elevenlabs_dubbing" || p === "auto_subtitle"
+    p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "runpod_wan_vace" || p === "merge_audio" || p === "elevenlabs_dubbing" || p === "auto_subtitle"
       ? "video_url"
       : p === "tripo3d" || p === "hyper3d"
         ? "model_3d"
@@ -260,6 +261,7 @@ function workspaceProviderDef(
     p === "openai" ? "generate_openai_image" :
     p === "replicate_image" ? "generate_openai_image" :
     p === "runpod_qwen" ? "generate_qwen_image" :
+    p === "runpod_wan_vace" ? "generate_freepik_video" :
     p === "seedream" ? "generate_seedream_image" :
     p === "banana" ? "generate_freepik_image" :
     p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" ? "generate_freepik_video" :
@@ -277,7 +279,7 @@ function workspaceProviderDef(
     provider: p,
     feature,
     output_type: output,
-    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "replicate_image" || p === "runpod_qwen" || p === "upscale_image" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio" || p === "elevenlabs_dubbing" || p === "auto_subtitle",
+    is_async: p === "kling" || p === "seedance" || p === "veo" || p === "replicate_veo" || p === "replicate_video" || p === "replicate_image" || p === "runpod_qwen" || p === "runpod_wan_vace" || p === "upscale_image" || p === "tripo3d" || p === "hyper3d" || p === "merge_audio" || p === "elevenlabs_dubbing" || p === "auto_subtitle",
   };
 }
 
@@ -306,6 +308,7 @@ function workspaceMultiplierForProvider(
     case "veo":
     case "replicate_veo":
     case "replicate_video":
+    case "runpod_wan_vace":
     case "merge_audio":
       return multipliers.video;
     case "replicate_image":
@@ -1180,6 +1183,7 @@ interface WorkspaceRunBody {
     | "poll_replicate_video"
     | "poll_replicate_image"
     | "poll_runpod_qwen"
+    | "poll_runpod_wan_vace"
     | "poll_elevenlabs_dubbing"
     | "poll_freepik_veo"
     | "poll_freepik_video"
@@ -1342,13 +1346,20 @@ function workspaceJobMaxAttempts(provider: string): number {
 }
 
 const REMOVE_BG_MODEL = "freepik-remove-bg";
+const OPENAI_UPSCALE_MODEL = "gpt-image-2-enhance";
 
-function normalizeWorkspaceProviderModel(provider: string, params: Record<string, unknown>): string | null {
+function normalizeWorkspaceProviderModel(
+  provider: string,
+  params: Record<string, unknown>,
+  nodeType?: string,
+): string | null {
   const normalized =
     provider === "remove_bg"
       ? REMOVE_BG_MODEL
-      : provider === "upscale_image"
-        ? MAGNIFIC_UPSCALE_MODEL
+      : nodeType === "upscaleImageNode" && provider === "openai"
+        ? OPENAI_UPSCALE_MODEL
+        : provider === "upscale_image"
+          ? OPENAI_UPSCALE_MODEL
         : null;
   if (!normalized) return null;
   params.model_name = normalized;
@@ -1839,6 +1850,8 @@ async function pollWorkspaceAsyncResult(args: {
         ? "poll_replicate_image"
       : provider === "runpod_qwen"
         ? "poll_runpod_qwen"
+      : provider === "runpod_wan_vace"
+        ? "poll_runpod_wan_vace"
       : provider === "elevenlabs_dubbing"
         ? "poll_elevenlabs_dubbing"
       : provider === "freepik_veo" || provider === "freepik_seedance"
@@ -1982,6 +1995,8 @@ async function pollWorkspaceAsyncResultOnce(args: {
         ? "poll_replicate_image"
       : provider === "runpod_qwen"
         ? "poll_runpod_qwen"
+      : provider === "runpod_wan_vace"
+        ? "poll_runpod_wan_vace"
       : provider === "elevenlabs_dubbing"
         ? "poll_elevenlabs_dubbing"
       : provider === "freepik_veo" || provider === "freepik_seedance"
@@ -2114,6 +2129,8 @@ function inferAsyncPollProvider(
     return "replicate_video";
   }
   if (endpoint.includes("api.runpod.ai") || endpoint.includes(".proxy.runpod.net")) {
+    const model = String(providerMeta.model ?? providerMeta.provider_model_id ?? "").toLowerCase();
+    if (model.includes("wan") || model.includes("vace")) return "runpod_wan_vace";
     return "runpod_qwen";
   }
   if (
@@ -4045,7 +4062,7 @@ serve(async (req) => {
         runRequest.params?.model_name as string | undefined,
       );
       if (!runRequest.params) runRequest.params = {};
-      normalizeWorkspaceProviderModel(provider, runRequest.params);
+      normalizeWorkspaceProviderModel(provider, runRequest.params, nodeType);
       const model = String(
         runRequest.params?.model_name ??
           runRequest.params?.model ??
@@ -4684,6 +4701,61 @@ serve(async (req) => {
       let payload: Record<string, unknown>;
       try {
         payload = await pollRunpodQwenOnce({
+          taskId,
+          pollEndpoint,
+          supabase,
+          userId: user.id,
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        payload = {
+          status: "polling_error",
+          task_id: taskId,
+          message: msg.substring(0, 300),
+        };
+      }
+
+      return new Response(
+        JSON.stringify(payload),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    if (body.action === "poll_runpod_wan_vace") {
+      const taskId = String(body.task_id ?? "").trim();
+      const pollEndpoint = String(body.poll_endpoint ?? "").trim();
+      if (!taskId || !pollEndpoint) {
+        return new Response(
+          JSON.stringify({ error: "task_id and poll_endpoint required for poll_runpod_wan_vace" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let pollUrlOk = false;
+      try {
+        const u = new URL(pollEndpoint);
+        const configuredBase = Deno.env.get("RUNPOD_WAN_WORKER_URL")?.trim();
+        const configuredHost = configuredBase ? new URL(configuredBase).hostname : "";
+        pollUrlOk =
+          u.protocol === "https:" &&
+          (
+            u.hostname === "api.runpod.ai" ||
+            u.hostname.endsWith(".proxy.runpod.net") ||
+            (!!configuredHost && u.hostname === configuredHost)
+          );
+      } catch {
+        pollUrlOk = false;
+      }
+      if (!pollUrlOk) {
+        return new Response(
+          JSON.stringify({ error: "poll_endpoint must be a Runpod Wan VACE endpoint" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+        );
+      }
+
+      let payload: Record<string, unknown>;
+      try {
+        payload = await pollRunpodWanVaceOnce({
           taskId,
           pollEndpoint,
           supabase,
@@ -5927,7 +5999,7 @@ serve(async (req) => {
     // (mapped through HANDLE_SCHEMA so e.g. ref_image → image_url)
     // and mention URLs as a fallback ref_image / mention_image_urls.
     const params: Record<string, unknown> = { ...rawParams };
-    normalizeWorkspaceProviderModel(provider, params);
+    normalizeWorkspaceProviderModel(provider, params, nodeType);
 
     // Did the caller provide a text prompt via an upstream Text edge?
     // Used to populate the response's prompt_source field.
@@ -6189,6 +6261,9 @@ serve(async (req) => {
         break;
       case "runpod_qwen":
         result = await executeRunpodQwen(params, supabase, user.id);
+        break;
+      case "runpod_wan_vace":
+        result = await executeRunpodWanVace(params, supabase, user.id);
         break;
       case "video_understanding":
         result = await executeVideoToPrompt(params);

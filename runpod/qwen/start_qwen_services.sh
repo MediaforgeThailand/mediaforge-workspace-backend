@@ -5,6 +5,8 @@ COMFY_DIR="${COMFY_DIR:-/workspace/ComfyUI}"
 WORKER_DIR="${WORKER_DIR:-/workspace}"
 COMFY_LOG="${COMFY_LOG:-/workspace/comfy_qwen.log}"
 WORKER_LOG="${WORKER_LOG:-/workspace/qwen_worker.log}"
+QWEN_WORKER_PORT="${QWEN_WORKER_PORT:-8000}"
+export QWEN_WORKER_PORT
 
 if [ ! -d "$COMFY_DIR/venv" ]; then
   echo "ComfyUI venv not found. Run /workspace/install_comfy_qwen.sh first." >&2
@@ -12,6 +14,11 @@ if [ ! -d "$COMFY_DIR/venv" ]; then
 fi
 
 mkdir -p "$WORKER_DIR"
+
+if [ ! -f "$WORKER_DIR/qwen_worker.py" ]; then
+  echo "qwen_worker.py not found in $WORKER_DIR. Copy the worker files to /workspace first." >&2
+  exit 1
+fi
 
 if ! pgrep -af "python main.py --listen 0.0.0.0 --port 8188" >/dev/null 2>&1; then
   (
@@ -44,6 +51,25 @@ fi
   nohup python qwen_worker.py > "$WORKER_LOG" 2>&1 &
 )
 
+echo "Waiting for Qwen worker..."
+for i in $(seq 1 60); do
+  if curl -fsS "http://127.0.0.1:${QWEN_WORKER_PORT}/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  if [ "$i" -eq 60 ]; then
+    echo "Qwen worker did not become ready. Tail $WORKER_LOG for details." >&2
+    exit 1
+  fi
+done
+
+echo "Running Qwen preflight..."
+if ! curl -fsS "http://127.0.0.1:${QWEN_WORKER_PORT}/preflight"; then
+  echo "" >&2
+  echo "Qwen preflight failed. Tail $WORKER_LOG and $COMFY_LOG for details." >&2
+  exit 1
+fi
+
 echo "Qwen services started."
 echo "ComfyUI: http://127.0.0.1:8188"
-echo "Worker:  http://127.0.0.1:${QWEN_WORKER_PORT:-8000}"
+echo "Worker:  http://127.0.0.1:${QWEN_WORKER_PORT}"

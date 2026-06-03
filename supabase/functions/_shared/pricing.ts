@@ -11,6 +11,7 @@
  */
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { qwenRunpodPriceKeys } from "./runpodQwen.ts";
+import { wanRunpodPriceKeys } from "./runpodWan.ts";
 
 /* ─── Custom error so callers can distinguish pricing gaps from bugs ─── */
 
@@ -29,6 +30,7 @@ export type ProviderKey =
   | "replicate_veo"
   | "replicate_image"
   | "runpod_qwen"
+  | "runpod_wan_vace"
   | "banana"
   | "openai"
   | "seedream"
@@ -61,9 +63,10 @@ export const NODE_TYPE_REGISTRY: Record<string, ProviderDef> = {
   bananaProNode:         { provider: "banana",    feature: "generate_freepik_image", output_type: "image_url", is_async: false },
   imageGenNode:          { provider: "banana",    feature: "generate_freepik_image", output_type: "image_url", is_async: false },
   vfxQwenImageNode:      { provider: "runpod_qwen", feature: "generate_qwen_image", output_type: "image_url", is_async: true },
+  vfxWanVaceNode:        { provider: "runpod_wan_vace", feature: "generate_freepik_video", output_type: "video_url", is_async: true },
   chatAiNode:            { provider: "chat_ai",   feature: "chat_ai",                output_type: "text",      is_async: false },
   removeBackgroundNode:  { provider: "remove_bg", feature: "remove_background",      output_type: "image_url", is_async: false },
-  upscaleImageNode:      { provider: "upscale_image", feature: "upscale_image",      output_type: "image_url", is_async: true },
+  upscaleImageNode:      { provider: "openai", feature: "upscale_image",             output_type: "image_url", is_async: true },
   mergeAudioNode:        { provider: "merge_audio", feature: "merge_audio_video",    output_type: "video_url", is_async: true },
   voiceTranslateNode:    { provider: "elevenlabs_dubbing", feature: "voice_translate", output_type: "audio_url", is_async: true },
   autoSubtitleNode:      { provider: "auto_subtitle", feature: "auto_subtitle", output_type: "video_url", is_async: true },
@@ -71,6 +74,8 @@ export const NODE_TYPE_REGISTRY: Record<string, ProviderDef> = {
   urlAssetNode:          { provider: "url_asset", feature: "url_to_asset",           output_type: "image_url", is_async: false },
   audioGenNode:          { provider: "google_tts", feature: "text_to_speech",         output_type: "audio_url", is_async: false },
   imageTo3dNode:         { provider: "tripo3d",    feature: "model_3d",               output_type: "model_3d", is_async: true },
+  seedDreamNode:         { provider: "seedream",   feature: "generate_seedream_image", output_type: "image_url", is_async: true },
+  seedDanceNode:         { provider: "seedance",   feature: "generate_freepik_video", output_type: "video_url", is_async: true },
   tripoImportModelNode:  { provider: "tripo3d",    feature: "model_3d",               output_type: "model_3d", is_async: true },
   tripoPreRigCheckNode:  { provider: "tripo3d",    feature: "model_3d",               output_type: "model_3d", is_async: true },
   tripoRigNode:          { provider: "tripo3d",    feature: "model_3d",               output_type: "model_3d", is_async: true },
@@ -129,7 +134,9 @@ function openAiImagePriceKeys(params: Record<string, unknown>): string[] {
 
 function openAiImageEnhancePriceKeys(params: Record<string, unknown>): string[] {
   const rawModel = String(params.model_name ?? params.model ?? "gpt-image-2-enhance").toLowerCase();
-  const baseModel = rawModel === "gpt-image-2" ? "gpt-image-2-enhance" : rawModel;
+  const baseModel = rawModel === "gpt-image-2" || !rawModel.startsWith("gpt-image-2-enhance")
+    ? "gpt-image-2-enhance"
+    : rawModel;
   const rawQuality = String(params.quality ?? "medium").toLowerCase();
   const quality = ["low", "medium", "high", "auto"].includes(rawQuality) ? rawQuality : "medium";
   const rawSize = String(params.size ?? "1024x1024").toLowerCase();
@@ -314,6 +321,10 @@ export async function lookupModelDiscountPercent(
     return maxDiscountByModelKeys(supabase, "generate_qwen_image", qwenRunpodPriceKeys(params));
   }
 
+  if (providerDef.provider === "runpod_wan_vace") {
+    return maxDiscountByModelKeys(supabase, "generate_freepik_video", wanRunpodPriceKeys(params));
+  }
+
   if (providerDef.provider === "openai") {
     if (providerDef.feature === "upscale_image") {
       return maxDiscountByModelKeys(supabase, "upscale_image", openAiImageEnhancePriceKeys(params));
@@ -450,6 +461,19 @@ export async function lookupBaseCost(
       throw new PricingConfigError(
         `Pricing configuration missing for Qwen image model: ${keys[0]}`
       );
+    }
+    return match.cost;
+  }
+
+  /* Video (Wan VACE on Runpod GPU) */
+  if (providerDef.provider === "runpod_wan_vace") {
+    const keys = wanRunpodPriceKeys(params);
+    const match = await firstCostByModelKeys(supabase, "generate_freepik_video", keys);
+
+    if (!match) {
+      // Keep the VFX MVP runnable if the pricing migration has not reached the
+      // remote DB yet. The migration/admin catalog still owns the canonical row.
+      return 900;
     }
     return match.cost;
   }
@@ -681,11 +705,16 @@ export async function lookupBaseCost(
   // For Omni models, duration comes from the slider (3-15s).
   // For standard models, use the explicit duration param.
   const parsedDuration = isMotion
-    ? (parseInt(String(params.ref_video_duration ?? "0"), 10) || 0)
+    ? (parseInt(String(params.ref_video_duration ?? params._ref_video_duration ?? "0"), 10) || 0)
     : (parseInt(String(params.duration ?? "5"), 10) || 5);
   const duration = model.startsWith("replicate-seedance") && parsedDuration <= 0
     ? 5
     : parsedDuration;
+  if (isMotion && duration <= 0) {
+    throw new PricingConfigError(
+      `Motion video pricing requires ref_video_duration for model: ${model}`,
+    );
+  }
 
   const hasAudio =
     params.has_audio === true ||
@@ -762,8 +791,7 @@ export async function lookupBaseCost(
       .limit(1).maybeSingle();
 
     if (resolutionExact) {
-      const effectiveDuration = isMotion && duration <= 0 ? 5 : duration;
-      return Math.ceil(resolutionExact.cost * effectiveDuration);
+      return Math.ceil(resolutionExact.cost * duration);
     }
 
     if (hasAudio) {
@@ -775,8 +803,7 @@ export async function lookupBaseCost(
         .eq("has_audio", false)
         .limit(1).maybeSingle();
       if (noAudioResolution) {
-        const effectiveDuration = isMotion && duration <= 0 ? 5 : duration;
-        return Math.ceil(noAudioResolution.cost * effectiveDuration);
+        return Math.ceil(noAudioResolution.cost * duration);
       }
     }
   }
@@ -790,8 +817,7 @@ export async function lookupBaseCost(
     .limit(1).maybeSingle();
 
   if (perSecondExact) {
-    const effectiveDuration = isMotion && duration <= 0 ? 5 : duration;
-    return Math.ceil(perSecondExact.cost * effectiveDuration);
+    return Math.ceil(perSecondExact.cost * duration);
   }
 
   const { data: exactMatchLate } = await supabase
@@ -829,11 +855,7 @@ export async function lookupBaseCost(
 
   /* ── CRITICAL: per_second billing multiplier ── */
   if (data.pricing_type === "per_second") {
-    // For motion models without an uploaded ref_video yet (quote-time),
-    // fall back to a default 5s estimate. Execution-time pricing will
-    // recalculate using the actual ref_video_duration.
-    const effectiveDuration = isMotion && duration <= 0 ? 5 : duration;
-    return Math.ceil(data.cost * effectiveDuration);
+    return Math.ceil(data.cost * duration);
   }
 
   /* ── Fixed pricing: try exact duration+audio match first ── */
@@ -920,14 +942,143 @@ export interface FeatureMultipliers {
   audio?: number;
 }
 
-function getMultiplierForNode(nodeType: string, featureMultipliers?: FeatureMultipliers): number {
+function providerDefForPricing(provider: ProviderKey, nodeType: string): ProviderDef {
+  const output_type: OutputType =
+    provider === "kling" ||
+    provider === "seedance" ||
+    provider === "veo" ||
+    provider === "replicate_video" ||
+    provider === "replicate_veo" ||
+    provider === "runpod_wan_vace" ||
+    provider === "merge_audio" ||
+    provider === "elevenlabs_dubbing" ||
+    provider === "auto_subtitle"
+      ? "video_url"
+      : provider === "tripo3d" || provider === "hyper3d"
+        ? "model_3d"
+        : provider === "chat_ai" || provider === "video_understanding"
+          ? "text"
+          : provider === "google_tts" ||
+              provider === "gemini_tts" ||
+              provider === "elevenlabs_tts" ||
+              provider === "mp3_input"
+            ? "audio_url"
+            : "image_url";
+
+  const feature =
+    provider === "openai" && nodeType === "upscaleImageNode" ? "upscale_image" :
+    provider === "openai" ? "generate_openai_image" :
+    provider === "replicate_image" ? "generate_openai_image" :
+    provider === "runpod_qwen" ? "generate_qwen_image" :
+    provider === "runpod_wan_vace" ? "generate_freepik_video" :
+    provider === "seedream" ? "generate_seedream_image" :
+    provider === "banana" ? "generate_freepik_image" :
+    provider === "kling" ||
+      provider === "seedance" ||
+      provider === "veo" ||
+      provider === "replicate_veo" ||
+      provider === "replicate_video" ? "generate_freepik_video" :
+    provider === "remove_bg" ? "remove_background" :
+    provider === "upscale_image" ? "upscale_image" :
+    provider === "merge_audio" ? "merge_audio_video" :
+    provider === "elevenlabs_dubbing" ? "voice_translate" :
+    provider === "auto_subtitle" ? "auto_subtitle" :
+    provider === "chat_ai" ? "chat_ai" :
+    provider === "tripo3d" || provider === "hyper3d" ? "model_3d" :
+    provider === "google_tts" || provider === "gemini_tts" || provider === "elevenlabs_tts" ? "text_to_speech" :
+    provider === "video_understanding" ? "video_to_prompt" :
+    provider === "mp3_input" ? "mp3_input" :
+    provider === "url_asset" ? "url_to_asset" :
+    nodeType;
+
+  return {
+    provider,
+    feature,
+    output_type,
+    is_async:
+      provider === "kling" ||
+      provider === "seedance" ||
+      provider === "veo" ||
+      provider === "replicate_veo" ||
+      provider === "replicate_video" ||
+      provider === "replicate_image" ||
+      provider === "runpod_qwen" ||
+      provider === "runpod_wan_vace" ||
+      (provider === "openai" && nodeType === "upscaleImageNode") ||
+      provider === "upscale_image" ||
+      provider === "tripo3d" ||
+      provider === "hyper3d" ||
+      provider === "merge_audio" ||
+      provider === "elevenlabs_dubbing" ||
+      provider === "auto_subtitle",
+  };
+}
+
+function resolveProviderDefForPricing(
+  nodeType: string,
+  params: Record<string, unknown> = {},
+): ProviderDef | null {
+  const model = String(params.model_name ?? params.model ?? "").toLowerCase();
+
+  if (nodeType === "bananaProNode" || nodeType === "imageGenNode") {
+    if (model.startsWith("qwen-image")) return providerDefForPricing("runpod_qwen", nodeType);
+    if (model.startsWith("replicate-gpt-image") || model.startsWith("replicate-nano-banana")) {
+      return providerDefForPricing("replicate_image", nodeType);
+    }
+    if (model.startsWith("seedream")) return providerDefForPricing("seedream", nodeType);
+    if (model.startsWith("gpt-image") || model.startsWith("dall-e")) {
+      return providerDefForPricing("openai", nodeType);
+    }
+    return providerDefForPricing("banana", nodeType);
+  }
+
+  if (nodeType === "klingVideoNode" || nodeType === "videoGenNode") {
+    if (model.startsWith("replicate-veo")) return providerDefForPricing("replicate_veo", nodeType);
+    if (model.startsWith("replicate-kling") || model.startsWith("replicate-seedance")) {
+      return providerDefForPricing("replicate_video", nodeType);
+    }
+    if (model.startsWith("seedance") || model.startsWith("dreamina-seedance")) {
+      return providerDefForPricing("seedance", nodeType);
+    }
+    if (model.startsWith("veo-")) return providerDefForPricing("veo", nodeType);
+    return providerDefForPricing("kling", nodeType);
+  }
+
+  if (nodeType === "seedDreamNode") return providerDefForPricing("seedream", nodeType);
+  if (nodeType === "seedDanceNode") {
+    return model.startsWith("replicate-seedance")
+      ? providerDefForPricing("replicate_video", nodeType)
+      : providerDefForPricing("seedance", nodeType);
+  }
+
+  if (nodeType === "upscaleImageNode") {
+    return providerDefForPricing("openai", nodeType);
+  }
+
+  if (nodeType === "imageTo3dNode") {
+    return model.startsWith("hyper3d")
+      ? providerDefForPricing("hyper3d", nodeType)
+      : providerDefForPricing("tripo3d", nodeType);
+  }
+
+  if (nodeType === "audioGenNode") {
+    if (model.startsWith("gemini-")) return providerDefForPricing("gemini_tts", nodeType);
+    if (model.startsWith("elevenlabs-") || model.startsWith("eleven_")) {
+      return providerDefForPricing("elevenlabs_tts", nodeType);
+    }
+    return providerDefForPricing("google_tts", nodeType);
+  }
+
+  return NODE_TYPE_REGISTRY[nodeType] ?? null;
+}
+
+function getMultiplierForProvider(providerDef: ProviderDef, featureMultipliers?: FeatureMultipliers): number {
   if (!featureMultipliers) return DEFAULT_WORKSPACE_MULTIPLIER;
-  const def = NODE_TYPE_REGISTRY[nodeType];
-  if (!def) return DEFAULT_WORKSPACE_MULTIPLIER;
-  switch (def.provider) {
+  switch (providerDef.provider) {
     case "banana": return featureMultipliers.image;
     case "openai": return featureMultipliers.image;
     case "runpod_qwen": return featureMultipliers.image;
+    case "runpod_wan_vace": return featureMultipliers.video;
     case "seedream": return featureMultipliers.image;
     case "kling": return featureMultipliers.video;
     case "seedance": return featureMultipliers.video;
@@ -994,12 +1145,12 @@ export async function quoteFlowCost(
   const perNodeCosts: Array<{ node_id: string; node_type: string; cost: number; markup: number }> = [];
 
   for (const node of actionNodes) {
-    const providerDef = NODE_TYPE_REGISTRY[node.type];
-    if (!providerDef) continue;
     const nodeParams = allNodeParams?.[node.id] ?? (node.data?.params as Record<string, unknown> ?? {});
+    const providerDef = resolveProviderDefForPricing(node.type, nodeParams);
+    if (!providerDef) continue;
     const nodeCost = await lookupBaseCost(supabase, providerDef, nodeParams);
     const nodeMultiplier = featureMultipliers
-      ? getMultiplierForNode(node.type, featureMultipliers)
+      ? getMultiplierForProvider(providerDef, featureMultipliers)
       : markupMultiplier;
     totalBaseCost += nodeCost;
     totalWeightedPrice += Math.ceil(nodeCost * nodeMultiplier);
