@@ -37,8 +37,20 @@ Full SSH example:
 Use `-LightInstall` instead of `-Install` only when ComfyUI already exists on `/workspace/ComfyUI`
 and only Wan/Qwen dependencies need refresh.
 
-If SSH is blocked or the Basic SSH username is not available, generate a self-contained Web Terminal
-bundle locally:
+If SSH is blocked or the Basic SSH username is not available, use the RunPod **Web Terminal**.
+The easiest path is a one-line bootstrap from the pushed repo:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MediaforgeThailand/mediaforge-workspace-backend/main/runpod/wan/bootstrap_web_terminal.sh | bash
+```
+
+The bootstrap downloads and runs the self-contained bundle from:
+
+```text
+https://raw.githubusercontent.com/MediaforgeThailand/mediaforge-workspace-backend/main/runpod/wan/dist/mediaforge_wan_vace_web_terminal_bundle.sh
+```
+
+If raw GitHub download is blocked, generate the self-contained Web Terminal bundle locally:
 
 ```powershell
 cd C:\Users\taksi\Documents\GitHub2\mediaforge-workspace-backend
